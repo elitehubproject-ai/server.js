@@ -2,10 +2,18 @@ const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-const wss = new WebSocket.Server({ port: PORT });
+
+// ВАЖНО: слушаем на 0.0.0.0, чтобы было доступно извне
+const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT });
 const rooms = new Map();
 
-console.log(`✅ WebSocket server running on ws://localhost:${PORT}`);
+console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
+
+// Для проверки, что сервер жив (опционально)
+const express = require('express');
+const app = express();
+app.get('/', (req, res) => res.send('WebSocket server is running'));
+app.listen(PORT + 1, '0.0.0.0', () => console.log(`Health check on port ${PORT + 1}`));
 
 wss.on('connection', (ws) => {
     const clientId = uuidv4();
@@ -33,7 +41,7 @@ wss.on('connection', (ws) => {
                         }
                         rooms.set(currentRoom, {
                             id: currentRoom,
-                            participants: new Map() // clientId -> { ws, userName, video, audio, screen }
+                            participants: new Map()
                         });
                     }
 
@@ -48,7 +56,6 @@ wss.on('connection', (ws) => {
                         isAdmin: isCreating
                     };
                     
-                    // Уведомляем существующих участников о новом госте
                     room.participants.forEach((p, id) => {
                         p.ws.send(JSON.stringify({
                             type: 'guest-joined',
@@ -59,7 +66,6 @@ wss.on('connection', (ws) => {
                             guestAudio: participantInfo.audio
                         }));
                         
-                        // Отправляем новому участнику инфо о существующих
                         ws.send(JSON.stringify({
                             type: 'creator-info',
                             creatorName: p.userName,
@@ -68,9 +74,8 @@ wss.on('connection', (ws) => {
                             creatorVideo: p.video,
                             creatorAudio: p.audio,
                             isAdmin: p.isAdmin,
-                            myId: clientId // Сообщаем новому участнику его ID
+                            myId: clientId
                         }));
-
                     });
 
                     room.participants.set(clientId, participantInfo);
@@ -78,7 +83,6 @@ wss.on('connection', (ws) => {
                     if (isCreating) {
                         ws.send(JSON.stringify({ type: 'created', roomId: currentRoom, myId: clientId }));
                     }
-
 
                     console.log(`🏠 User ${userName} ${isCreating ? 'created' : 'joined'} room: ${currentRoom}`);
                     break;
@@ -90,7 +94,6 @@ wss.on('connection', (ws) => {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
                         
-                        // Если указан target, шлем только ему, иначе всем остальным
                         if (data.target) {
                             const target = room.participants.get(data.target);
                             if (target) {
@@ -163,7 +166,6 @@ wss.on('connection', (ws) => {
 
                         room.participants.forEach((p, id) => {
                             if (id !== clientId) {
-                                // Для простоты пока шлем всем, но в идеале нужно targetId
                                 p.ws.send(JSON.stringify({ 
                                     ...data, 
                                     from: userName, 
@@ -213,4 +215,3 @@ function handleDisconnect(clientId, roomId) {
         });
     }
 }
-
