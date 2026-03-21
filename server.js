@@ -2,7 +2,7 @@ const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 10000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT });
@@ -35,7 +35,6 @@ function serializeParticipant(id, participant) {
         video: !!participant.video,
         audio: !!participant.audio,
         screen: !!participant.screen,
-        watch: !!participant.watch,
         isAdmin: !!participant.isAdmin
     };
 }
@@ -56,7 +55,8 @@ function broadcastRoomState(room) {
             roomId: room.id,
             myId: id,
             ownerId: room.ownerId,
-            participants
+            participants,
+            watchParty: room.watchParty || null
         });
     });
 }
@@ -106,7 +106,7 @@ wss.on('connection', (ws) => {
                     }
 
                     if (!rooms.has(currentRoom)) {
-                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), ownerId: null });
+                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), ownerId: null, watchParty: null });
                     }
                     const room = rooms.get(currentRoom);
                     if (isCreating && room.participants.size > 0) {
@@ -120,8 +120,6 @@ wss.on('connection', (ws) => {
                         video: false,
                         audio: true,
                         screen: false,
-                        watch: false,
-                        watchUrl: '',
                         isAdmin: false
                     };
 
@@ -188,8 +186,6 @@ wss.on('connection', (ws) => {
                 case 'toggle-video':
                 case 'toggle-audio':
                 case 'speaking':
-                case 'start-watch':
-                case 'stop-watch':
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
@@ -200,31 +196,16 @@ wss.on('connection', (ws) => {
                         if (data.type === 'stop-screen') p.screen = false;
                         if (data.type === 'toggle-video') p.video = data.enabled;
                         if (data.type === 'toggle-audio') p.audio = data.enabled;
-                        if (data.type === 'start-watch') { p.watch = true; p.watchUrl = data.url || ''; }
-                        if (data.type === 'stop-watch') { p.watch = false; p.watchUrl = ''; }
 
-                        if (data.type === 'start-watch' || data.type === 'stop-watch') {
-                            room.participants.forEach((participant, id) => {
-                                if (id !== clientId) {
-                                    safeSend(participant.ws, {
-                                        type: data.type === 'start-watch' ? 'watch-started' : 'watch-stopped',
-                                        url: data.url,
-                                        from: userName,
-                                        fromId: clientId
-                                    });
-                                }
-                            });
-                        } else {
-                            room.participants.forEach((participant, id) => {
-                                if (id !== clientId) {
-                                    safeSend(participant.ws, {
-                                        ...data,
-                                        from: userName,
-                                        fromId: clientId
-                                    });
-                                }
-                            });
-                        }
+                        room.participants.forEach((participant, id) => {
+                            if (id !== clientId) {
+                                safeSend(participant.ws, {
+                                    ...data,
+                                    from: userName,
+                                    fromId: clientId
+                                });
+                            }
+                        });
 
                         room.participants.forEach((participant, id) => {
                             if (id === clientId) return;
@@ -235,8 +216,7 @@ wss.on('connection', (ws) => {
                                 changes: {
                                     video: p.video,
                                     audio: p.audio,
-                                    screen: p.screen,
-                                    watch: p.watch
+                                    screen: p.screen
                                 }
                             });
                         });
@@ -247,8 +227,6 @@ wss.on('connection', (ws) => {
                 case 'request-audio':
                 case 'force-video-off':
                 case 'force-audio-off':
-                case 'force-screen-off':
-                case 'force-watch-off':
                 case 'make-admin':
                 case 'remove-admin':
                 case 'kick':
@@ -311,68 +289,67 @@ wss.on('connection', (ws) => {
                             return;
                         }
 
-                        if (data.type === 'force-watch-off') {
-                            target.watch = false;
-                            target.watchUrl = '';
-                            safeSend(target.ws, {
-                                type: 'force-watch-off',
-                                targetId,
-                                from: userName,
-                                fromId: clientId
-                            });
-                            room.participants.forEach((participant, id) => {
-                                if (id !== targetId) {
-                                    safeSend(participant.ws, {
-                                        type: 'watch-stopped',
-                                        from: target.userName,
-                                        fromId: targetId
-                                    });
-                                }
-                            });
-                            room.participants.forEach((participant) => {
-                                safeSend(participant.ws, {
-                                    type: 'participant-updated',
-                                    participantId: targetId,
-                                    ownerId: room.ownerId,
-                                    changes: { watch: false }
-                                });
-                            });
-                            return;
-                        }
-
-                        if (data.type === 'force-screen-off') {
-                            target.screen = false;
-                            safeSend(target.ws, {
-                                type: 'force-screen-off',
-                                targetId,
-                                from: userName,
-                                fromId: clientId
-                            });
-                            room.participants.forEach((participant, id) => {
-                                if (id !== targetId) {
-                                    safeSend(participant.ws, {
-                                        type: 'screen-stopped',
-                                        from: target.userName,
-                                        fromId: targetId
-                                    });
-                                }
-                            });
-                            room.participants.forEach((participant) => {
-                                safeSend(participant.ws, {
-                                    type: 'participant-updated',
-                                    participantId: targetId,
-                                    ownerId: room.ownerId,
-                                    changes: { screen: false }
-                                });
-                            });
-                            return;
-                        }
-
                         safeSend(target.ws, {
                             ...data,
                             targetId,
                             from: userName,
                             fromId: clientId
+                        });
+                    }
+                    break;
+
+                case 'start-watch':
+                case 'stop-watch':
+                    {
+                        const room = rooms.get(currentRoom);
+                        if (!room) return;
+                        const sender = room.participants.get(clientId);
+                        if (!sender) return;
+
+                        const senderIsOwner = room.ownerId === clientId;
+                        const senderIsAdmin = !!sender.isAdmin;
+
+                        if (data.type === 'start-watch') {
+                            const url = String(data.url || '').trim();
+                            if (!url) return;
+
+                            const active = room.watchParty;
+                            const canStart = !active || active.ownerId === clientId || senderIsOwner || senderIsAdmin;
+                            if (!canStart) return;
+
+                            room.watchParty = {
+                                url,
+                                ownerId: clientId,
+                                ownerName: userName,
+                                startedAt: Date.now()
+                            };
+
+                            room.participants.forEach((participant) => {
+                                safeSend(participant.ws, {
+                                    type: 'watch-started',
+                                    watchParty: room.watchParty,
+                                    from: userName,
+                                    fromId: clientId,
+                                    ownerId: room.ownerId
+                                });
+                            });
+                            return;
+                        }
+
+                        if (!room.watchParty) return;
+                        const canStop = room.watchParty.ownerId === clientId || senderIsOwner || senderIsAdmin;
+                        if (!canStop) return;
+
+                        const previousWatch = room.watchParty;
+                        room.watchParty = null;
+                        room.participants.forEach((participant) => {
+                            safeSend(participant.ws, {
+                                type: 'watch-stopped',
+                                previousWatch,
+                                from: userName,
+                                fromId: clientId,
+                                ownerId: room.ownerId
+                            });
                         });
                     }
                     break;
@@ -408,6 +385,10 @@ function handleDisconnect(clientId, roomId) {
     console.log(`❌ User left: ${participant.userName} from room ${roomId}`);
     
     room.participants.delete(clientId);
+    const shouldStopWatch = room.watchParty && room.watchParty.ownerId === clientId;
+    if (shouldStopWatch) {
+        room.watchParty = null;
+    }
     
     if (room.participants.size === 0) {
         rooms.delete(roomId);
@@ -427,6 +408,15 @@ function handleDisconnect(clientId, roomId) {
                 fromId: clientId,
                 ownerId: room.ownerId
             });
+            if (shouldStopWatch) {
+                safeSend(p.ws, {
+                    type: 'watch-stopped',
+                    previousWatch: null,
+                    from: participant.userName,
+                    fromId: clientId,
+                    ownerId: room.ownerId
+                });
+            }
         });
         broadcastRoomState(room);
     }
