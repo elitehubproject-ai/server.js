@@ -2,6 +2,9 @@
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const BOT_USERNAME = 'seych_call_bot';
 const APP_URL = 'https://seych-call.gt.tc';
+const fs = require('fs');
+const path = require('path');
+const USERS_FILE = path.join(__dirname, 'telegram_users.json');
 
 if (!TELEGRAM_TOKEN) {
     console.error('❌ TELEGRAM_TOKEN не задан! Добавьте его в Environment Variables на Render');
@@ -11,6 +14,45 @@ if (!TELEGRAM_TOKEN) {
 console.log('🤖 Telegram bot starting...');
 
 let lastUpdateId = 0;
+
+function loadUsers() {
+    try {
+        if (!fs.existsSync(USERS_FILE)) return [];
+        const raw = fs.readFileSync(USERS_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+        return [];
+    }
+}
+
+function saveUsers(users) {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+function upsertTelegramUser(user) {
+    const id = String(user?.id || '').trim();
+    if (!id) return;
+    const usernameRaw = String(user?.username || '').trim();
+    const username = usernameRaw ? `@${usernameRaw.replace(/^@+/, '')}` : '';
+    const firstName = String(user?.first_name || '').trim();
+    const lastName = String(user?.last_name || '').trim();
+    const fullName = `${firstName} ${lastName}`.trim() || String(user?.name || 'Telegram User');
+    const users = loadUsers();
+    const idx = users.findIndex((u) => String(u?.id || '') === id);
+    const next = {
+        id,
+        username,
+        name: fullName,
+        last_seen: Math.floor(Date.now() / 1000)
+    };
+    if (idx >= 0) {
+        users[idx] = { ...users[idx], ...next };
+    } else {
+        users.push(next);
+    }
+    saveUsers(users);
+}
 
 async function sendMessageWithKeyboard(chatId, text, keyboard) {
     try {
@@ -79,7 +121,7 @@ async function processMessage(chatId, text, firstName, userId) {
                 let contactsText = '👥 Ваши контакты:\n\n';
                 data.data.contacts.forEach(contact => {
                     contactsText += '• ' + contact.name;
-                    if (contact.username) contactsText += ' (@' + contact.username + ')';
+                    if (contact.username) contactsText += ' (' + contact.username + ')';
                     contactsText += '\n';
                 });
                 await sendMessageWithKeyboard(chatId, contactsText, { inline_keyboard: [] });
@@ -136,6 +178,7 @@ async function pollTelegram() {
                     const text = update.message.text.trim();
                     const firstName = update.message.chat.first_name || 'Пользователь';
                     const userId = update.message.from?.id || '';
+                    upsertTelegramUser(update.message.from || {});
                     console.log(`📩 ${new Date().toLocaleTimeString()} - ${firstName}: ${text}`);
                     await processMessage(chatId, text, firstName, userId);
                 }
