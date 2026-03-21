@@ -222,3 +222,30 @@ function handleDisconnect(clientId, roomId) {
         });
     }
 }
+
+// ============ АВТО-ПИНГ ДЛЯ ПРЕДОТВРАЩЕНИЯ ЗАСЫПАНИЯ ============
+// Каждые 4 минуты пингуем сам себя, чтобы Render не уснул
+const keepAlive = () => {
+    const http = require('http');
+    const options = {
+        hostname: 'localhost',
+        port: PORT,
+        path: '/',
+        method: 'GET',
+        timeout: 5000
+    };
+    
+    const req = http.request(options, (res) => {
+        console.log(`🏓 Self-ping at ${new Date().toLocaleTimeString()} - Status: ${res.statusCode}`);
+    });
+    
+    req.on('error', (err) => {
+        // Тишина, просто не пишем ошибки
+    });
+    
+    req.end();
+};
+
+// Запускаем авто-пинг каждые 4 минуты
+setInterval(keepAlive, 4 * 60 * 1000);
+console.log('✅ Keep-alive enabled (ping every 4 minutes)');
