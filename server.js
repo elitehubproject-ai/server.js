@@ -264,18 +264,17 @@ wss.on('connection', (ws) => {
                                 return;
                             }
                             target.isAdmin = false;
-                            room.participants.forEach((participant, id) => {
-                                if (id !== clientId) {
-                                    safeSend(participant.ws, {
-                                        type: 'participant-updated',
-                                        participantId: targetId,
-                                        ownerId: room.ownerId,
-                                        changes: { isAdmin: false },
-                                        from: userName,
-                                        fromId: clientId
-                                    });
-                                }
+                            room.participants.forEach((participant) => {
+                                safeSend(participant.ws, {
+                                    type: 'participant-updated',
+                                    participantId: targetId,
+                                    ownerId: room.ownerId,
+                                    changes: { isAdmin: false },
+                                    from: userName,
+                                    fromId: clientId
+                                });
                             });
+                            broadcastRoomState(room);
                             return;
                         }
 
