@@ -4,16 +4,21 @@ const http = require('http');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
-const wss = new WebSocket.Server({ host: '127.0.0.1', port: PORT });
+// ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
+const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT });
 const rooms = new Map();
 
-console.log(`✅ WebSocket server running on ws://127.0.0.1:${PORT}`);
+console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
+// Health check сервер - тоже слушаем на 0.0.0.0
 const healthServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('WebSocket server is running');
 });
-healthServer.listen(PORT + 1, '127.0.0.1', () => console.log(`Health check on http://127.0.0.1:${PORT + 1}`));
+
+// Используем другой порт для health check
+const HEALTH_PORT = parseInt(PORT) + 1;
+healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
 
 wss.on('connection', (ws) => {
     const clientId = uuidv4();
@@ -56,6 +61,7 @@ wss.on('connection', (ws) => {
                         isAdmin: isCreating
                     };
                     
+                    // Уведомляем существующих участников о новом госте
                     room.participants.forEach((p, id) => {
                         p.ws.send(JSON.stringify({
                             type: 'guest-joined',
@@ -66,6 +72,7 @@ wss.on('connection', (ws) => {
                             guestAudio: participantInfo.audio
                         }));
                         
+                        // Отправляем новому участнику инфо о существующих
                         ws.send(JSON.stringify({
                             type: 'creator-info',
                             creatorName: p.userName,
