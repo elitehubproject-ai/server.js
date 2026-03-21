@@ -1,19 +1,19 @@
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const http = require('http');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
-// ВАЖНО: слушаем на 0.0.0.0, чтобы было доступно извне
-const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT });
+const wss = new WebSocket.Server({ host: '127.0.0.1', port: PORT });
 const rooms = new Map();
 
-console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
+console.log(`✅ WebSocket server running on ws://127.0.0.1:${PORT}`);
 
-// Для проверки, что сервер жив (опционально)
-const express = require('express');
-const app = express();
-app.get('/', (req, res) => res.send('WebSocket server is running'));
-app.listen(PORT + 1, '0.0.0.0', () => console.log(`Health check on port ${PORT + 1}`));
+const healthServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('WebSocket server is running');
+});
+healthServer.listen(PORT + 1, '127.0.0.1', () => console.log(`Health check on http://127.0.0.1:${PORT + 1}`));
 
 wss.on('connection', (ws) => {
     const clientId = uuidv4();
