@@ -35,6 +35,7 @@ function serializeParticipant(id, participant) {
         video: !!participant.video,
         audio: !!participant.audio,
         screen: !!participant.screen,
+        watch: !!participant.watch,
         isAdmin: !!participant.isAdmin
     };
 }
@@ -119,6 +120,8 @@ wss.on('connection', (ws) => {
                         video: false,
                         audio: true,
                         screen: false,
+                        watch: false,
+                        watchUrl: '',
                         isAdmin: false
                     };
 
@@ -185,6 +188,8 @@ wss.on('connection', (ws) => {
                 case 'toggle-video':
                 case 'toggle-audio':
                 case 'speaking':
+                case 'start-watch':
+                case 'stop-watch':
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
@@ -195,11 +200,14 @@ wss.on('connection', (ws) => {
                         if (data.type === 'stop-screen') p.screen = false;
                         if (data.type === 'toggle-video') p.video = data.enabled;
                         if (data.type === 'toggle-audio') p.audio = data.enabled;
+                        if (data.type === 'start-watch') { p.watch = true; p.watchUrl = data.url || ''; }
+                        if (data.type === 'stop-watch') { p.watch = false; p.watchUrl = ''; }
 
                         room.participants.forEach((participant, id) => {
                             if (id !== clientId) {
                                 safeSend(participant.ws, {
                                     ...data,
+                                    url: data.url,
                                     from: userName,
                                     fromId: clientId
                                 });
@@ -215,7 +223,8 @@ wss.on('connection', (ws) => {
                                 changes: {
                                     video: p.video,
                                     audio: p.audio,
-                                    screen: p.screen
+                                    screen: p.screen,
+                                    watch: p.watch
                                 }
                             });
                         });
@@ -226,6 +235,8 @@ wss.on('connection', (ws) => {
                 case 'request-audio':
                 case 'force-video-off':
                 case 'force-audio-off':
+                case 'force-screen-off':
+                case 'force-watch-off':
                 case 'make-admin':
                 case 'remove-admin':
                 case 'kick':
@@ -285,6 +296,63 @@ wss.on('connection', (ws) => {
                                 fromId: clientId
                             });
                             try { target.ws.close(); } catch (_) {}
+                            return;
+                        }
+
+                        if (data.type === 'force-watch-off') {
+                            target.watch = false;
+                            target.watchUrl = '';
+                            safeSend(target.ws, {
+                                type: 'force-watch-off',
+                                targetId,
+                                from: userName,
+                                fromId: clientId
+                            });
+                            room.participants.forEach((participant, id) => {
+                                if (id !== targetId) {
+                                    safeSend(participant.ws, {
+                                        type: 'watch-stopped',
+                                        from: target.userName,
+                                        fromId: targetId
+                                    });
+                                }
+                            });
+                            room.participants.forEach((participant) => {
+                                safeSend(participant.ws, {
+                                    type: 'participant-updated',
+                                    participantId: targetId,
+                                    ownerId: room.ownerId,
+                                    changes: { watch: false }
+                                });
+                            });
+                            return;
+                        }
+
+                        if (data.type === 'force-screen-off') {
+                            target.screen = false;
+                            safeSend(target.ws, {
+                                type: 'force-screen-off',
+                                targetId,
+                                from: userName,
+                                fromId: clientId
+                            });
+                            room.participants.forEach((participant, id) => {
+                                if (id !== targetId) {
+                                    safeSend(participant.ws, {
+                                        type: 'screen-stopped',
+                                        from: target.userName,
+                                        fromId: targetId
+                                    });
+                                }
+                            });
+                            room.participants.forEach((participant) => {
+                                safeSend(participant.ws, {
+                                    type: 'participant-updated',
+                                    participantId: targetId,
+                                    ownerId: room.ownerId,
+                                    changes: { screen: false }
+                                });
+                            });
                             return;
                         }
 
