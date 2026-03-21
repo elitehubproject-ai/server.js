@@ -1,40 +1,28 @@
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Токен берем из переменных окружения Render
+// Telegram Bot - токен из переменных окружения Render
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const BOT_USERNAME = 'seych_call_bot';
 const APP_URL = 'https://seych-call.gt.tc';
 
-let lastUpdateId = 0;
-
-async function fetchWithTimeout(url, options = {}, timeout = 15000) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-    try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(timeoutId);
-        return response;
-    } catch (error) {
-        clearTimeout(timeoutId);
-        throw error;
-    }
+if (!TELEGRAM_TOKEN) {
+    console.error('❌ TELEGRAM_TOKEN не задан! Добавьте его в Environment Variables на Render');
+    process.exit(1);
 }
 
+console.log('🤖 Telegram bot starting...');
+
+let lastUpdateId = 0;
+
 async function sendMessageWithKeyboard(chatId, text, keyboard) {
-    if (!TELEGRAM_TOKEN) return;
-    const data = {
-        chat_id: chatId,
-        text: text,
-        reply_markup: JSON.stringify(keyboard),
-        disable_web_page_preview: true
-    };
     try {
-        await fetchWithTimeout(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data)
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: text,
+                reply_markup: JSON.stringify(keyboard),
+                disable_web_page_preview: true
+            })
         });
     } catch (err) {
         console.error('Send error:', err.message);
@@ -42,21 +30,19 @@ async function sendMessageWithKeyboard(chatId, text, keyboard) {
 }
 
 async function sendMiniAppMessage(chatId, url, text) {
-    const keyboard = {
+    await sendMessageWithKeyboard(chatId, text, {
         inline_keyboard: [[{ text: '🚀 Открыть Seych Calls', web_app: { url: url } }]]
-    };
-    await sendMessageWithKeyboard(chatId, text, keyboard);
+    });
 }
 
 async function sendMainMenu(chatId) {
-    const keyboard = {
+    await sendMessageWithKeyboard(chatId, '🎥 Seych Calls\n\nВыберите действие:', {
         inline_keyboard: [
             [{ text: '🎥 Создать комнату', web_app: { url: APP_URL + '/' } }],
             [{ text: '🔗 Подключиться', web_app: { url: APP_URL + '/' } }],
             [{ text: '👥 Позвонить контактам', web_app: { url: APP_URL + '/' } }]
         ]
-    };
-    await sendMessageWithKeyboard(chatId, '🎥 Seych Calls\n\nВыберите действие:', keyboard);
+    });
 }
 
 async function processMessage(chatId, text, firstName, userId) {
@@ -132,18 +118,14 @@ async function processMessage(chatId, text, firstName, userId) {
     
     await sendMessageWithKeyboard(chatId, 
         '❓ Неизвестная команда\n\nДоступные команды:\n/start - главное меню\n/join ID - подключиться к комнате\n/contacts - список контактов\n/help - помощь',
-        { inline_keyboard: [] });
+        { inline_keyboard: [] }
+    );
 }
 
 async function pollTelegram() {
-    if (!TELEGRAM_TOKEN) {
-        console.log('⚠️ TELEGRAM_TOKEN не задан!');
-        return;
-    }
-    
     try {
         const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?timeout=30&offset=${lastUpdateId + 1}`;
-        const response = await fetchWithTimeout(url, {}, 35000);
+        const response = await fetch(url);
         const data = await response.json();
         
         if (data.ok && data.result && data.result.length > 0) {
@@ -165,31 +147,6 @@ async function pollTelegram() {
     setTimeout(pollTelegram, 1000);
 }
 
-app.get('/', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Seych Calls Bot</title>
-            <style>
-                body { background:#0a0a1a; color:white; text-align:center; padding:50px; font-family:sans-serif; }
-                h1 { color:#667eea; }
-                a { color:#667eea; }
-                .status { color:#2ecc71; }
-            </style>
-        </head>
-        <body>
-            <h1>🤖 Seych Calls Bot</h1>
-            <p class="status">✅ Бот активен и работает 24/7</p>
-            <p><a href="https://t.me/seych_call_bot" target="_blank">@seych_call_bot</a></p>
-            <p>Версия: 1.0</p>
-        </body>
-        </html>
-    `);
-});
-
-app.listen(PORT, () => {
-    console.log(`✅ Bot server running on port ${PORT}`);
-    console.log(`🤖 Telegram bot starting...`);
-    pollTelegram();
-});
+// Запуск
+pollTelegram();
+console.log('✅ Telegram bot started');
