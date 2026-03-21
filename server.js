@@ -20,6 +20,64 @@ const healthServer = http.createServer((req, res) => {
 const HEALTH_PORT = parseInt(PORT) + 1;
 healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
 
+function safeSend(ws, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+        ws.send(JSON.stringify(payload));
+    } catch (_) {}
+}
+
+function serializeParticipant(id, participant) {
+    return {
+        id,
+        userName: participant.userName,
+        userAvatar: participant.userAvatar || '',
+        video: !!participant.video,
+        audio: !!participant.audio,
+        screen: !!participant.screen,
+        isAdmin: !!participant.isAdmin
+    };
+}
+
+function syncOwnerFlags(room) {
+    room.participants.forEach((participant, id) => {
+        participant.isAdmin = id === room.ownerId;
+    });
+}
+
+function broadcastRoomState(room) {
+    const participants = Array.from(room.participants.entries()).map(([id, participant]) => serializeParticipant(id, participant));
+    room.participants.forEach((participant, id) => {
+        safeSend(participant.ws, {
+            type: 'room-state',
+            roomId: room.id,
+            myId: id,
+            ownerId: room.ownerId,
+            participants
+        });
+    });
+}
+
+function assignOwner(room, preferredOwnerId = null) {
+    const prevOwnerId = room.ownerId || null;
+    if (preferredOwnerId && room.participants.has(preferredOwnerId)) {
+        room.ownerId = preferredOwnerId;
+    } else {
+        const first = room.participants.keys().next();
+        room.ownerId = first.done ? null : first.value;
+    }
+    syncOwnerFlags(room);
+    if (prevOwnerId !== room.ownerId && room.ownerId) {
+        room.participants.forEach((participant) => {
+            safeSend(participant.ws, {
+                type: 'owner-changed',
+                ownerId: room.ownerId,
+                previousOwnerId: prevOwnerId
+            });
+        });
+    }
+}
+
 wss.on('connection', (ws) => {
     const clientId = uuidv4();
     console.log(`📱 Client connected: ${clientId.substring(0, 8)}`);
@@ -39,17 +97,24 @@ wss.on('connection', (ws) => {
                     const userAvatar = data.userAvatar || '';
                     const isCreating = data.type === 'create';
 
-                    if (!rooms.has(currentRoom)) {
-                        if (!isCreating) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'Комната не найдена' }));
-                            return;
-                        }
-                        rooms.set(currentRoom, {
-                            id: currentRoom,
-                            participants: new Map()
-                        });
+                    if (!currentRoom || typeof currentRoom !== 'string') {
+                        safeSend(ws, { type: 'error', message: 'Некорректный идентификатор комнаты' });
+                        return;
                     }
 
+                    if (isCreating && rooms.has(currentRoom)) {
+                        safeSend(ws, { type: 'error', message: 'Комната уже существует' });
+                        return;
+                    }
+
+                    if (!isCreating && !rooms.has(currentRoom)) {
+                        safeSend(ws, { type: 'error', message: 'Комната не найдена' });
+                        return;
+                    }
+
+                    if (!rooms.has(currentRoom)) {
+                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), ownerId: null });
+                    }
                     const room = rooms.get(currentRoom);
                     const participantInfo = {
                         ws: ws,
@@ -58,38 +123,32 @@ wss.on('connection', (ws) => {
                         video: false,
                         audio: true,
                         screen: false,
-                        isAdmin: isCreating
+                        isAdmin: false
                     };
-                    
-                    // Уведомляем существующих участников о новом госте
-                    room.participants.forEach((p, id) => {
-                        p.ws.send(JSON.stringify({
-                            type: 'guest-joined',
-                            guestName: userName,
-                            guestAvatar: userAvatar,
-                            guestId: clientId,
-                            guestVideo: participantInfo.video,
-                            guestAudio: participantInfo.audio
-                        }));
-                        
-                        // Отправляем новому участнику инфо о существующих
-                        ws.send(JSON.stringify({
-                            type: 'creator-info',
-                            creatorName: p.userName,
-                            creatorAvatar: p.userAvatar || '',
-                            creatorId: id,
-                            creatorVideo: p.video,
-                            creatorAudio: p.audio,
-                            isAdmin: p.isAdmin,
-                            myId: clientId
-                        }));
-                    });
 
                     room.participants.set(clientId, participantInfo);
-                    
-                    if (isCreating) {
-                        ws.send(JSON.stringify({ type: 'created', roomId: currentRoom, myId: clientId }));
+                    if (!room.ownerId) {
+                        room.ownerId = clientId;
                     }
+                    syncOwnerFlags(room);
+
+                    room.participants.forEach((participant, id) => {
+                        if (id === clientId) return;
+                        safeSend(participant.ws, {
+                            type: 'guest-joined',
+                            guest: serializeParticipant(clientId, participantInfo),
+                            ownerId: room.ownerId
+                        });
+                    });
+
+                    safeSend(ws, {
+                        type: isCreating ? 'created' : 'joined',
+                        roomId: currentRoom,
+                        myId: clientId,
+                        ownerId: room.ownerId
+                    });
+
+                    broadcastRoomState(room);
 
                     console.log(`🏠 User ${userName} ${isCreating ? 'created' : 'joined'} room: ${currentRoom}`);
                     break;
@@ -101,23 +160,24 @@ wss.on('connection', (ws) => {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
                         
-                        if (data.target) {
-                            const target = room.participants.get(data.target);
+                        const targetId = data.targetId || data.target;
+                        if (targetId) {
+                            const target = room.participants.get(targetId);
                             if (target) {
-                                target.ws.send(JSON.stringify({ 
+                                safeSend(target.ws, { 
                                     ...data, 
                                     from: userName, 
                                     fromId: clientId 
-                                }));
+                                });
                             }
                         } else {
                             room.participants.forEach((p, id) => {
                                 if (id !== clientId) {
-                                    p.ws.send(JSON.stringify({ 
+                                    safeSend(p.ws, { 
                                         ...data, 
                                         from: userName, 
                                         fromId: clientId 
-                                    }));
+                                    });
                                 }
                             });
                         }
@@ -140,20 +200,28 @@ wss.on('connection', (ws) => {
                         if (data.type === 'toggle-video') p.video = data.enabled;
                         if (data.type === 'toggle-audio') p.audio = data.enabled;
 
-                        const msgType = data.type === 'start-screen' ? 'screen-started' :
-                                      data.type === 'stop-screen' ? 'screen-stopped' :
-                                      data.type === 'toggle-video' ? 'video-toggle' :
-                                      data.type === 'toggle-audio' ? 'audio-toggle' : data.type;
-
                         room.participants.forEach((participant, id) => {
                             if (id !== clientId) {
-                                participant.ws.send(JSON.stringify({ 
+                                safeSend(participant.ws, {
                                     ...data,
-                                    type: msgType,
-                                    from: userName, 
-                                    fromId: clientId 
-                                }));
+                                    from: userName,
+                                    fromId: clientId
+                                });
                             }
+                        });
+
+                        room.participants.forEach((participant, id) => {
+                            if (id === clientId) return;
+                            safeSend(participant.ws, {
+                                type: 'participant-updated',
+                                participantId: clientId,
+                                ownerId: room.ownerId,
+                                changes: {
+                                    video: p.video,
+                                    audio: p.audio,
+                                    screen: p.screen
+                                }
+                            });
                         });
                     }
                     break;
@@ -170,21 +238,81 @@ wss.on('connection', (ws) => {
                         if (!room) return;
                         const sender = room.participants.get(clientId);
                         if (!sender) return;
+                        const targetId = data.targetId || data.target;
 
-                        room.participants.forEach((p, id) => {
-                            if (id !== clientId) {
-                                p.ws.send(JSON.stringify({ 
-                                    ...data, 
-                                    from: userName, 
-                                    fromId: clientId 
-                                }));
+                        if (!targetId) return;
+                        const target = room.participants.get(targetId);
+                        if (!target) return;
+
+                        if ((data.type === 'make-admin' || data.type === 'remove-admin' || data.type === 'kick') && !sender.isAdmin) {
+                            return;
+                        }
+
+                        if (data.type === 'make-admin') {
+                            room.participants.forEach((participant) => {
+                                participant.isAdmin = false;
+                            });
+                            target.isAdmin = true;
+                            room.ownerId = targetId;
+                            room.participants.forEach((participant) => {
+                                safeSend(participant.ws, {
+                                    type: 'owner-changed',
+                                    ownerId: room.ownerId,
+                                    previousOwnerId: clientId
+                                });
+                            });
+                            broadcastRoomState(room);
+                            return;
+                        }
+
+                        if (data.type === 'remove-admin') {
+                            if (targetId === room.ownerId) {
+                                target.isAdmin = false;
+                                assignOwner(room, clientId);
+                                broadcastRoomState(room);
+                            } else {
+                                target.isAdmin = false;
+                                room.participants.forEach((participant, id) => {
+                                    if (id !== clientId) {
+                                        safeSend(participant.ws, {
+                                            type: 'participant-updated',
+                                            participantId: targetId,
+                                            ownerId: room.ownerId,
+                                            changes: { isAdmin: false },
+                                            from: userName,
+                                            fromId: clientId
+                                        });
+                                    }
+                                });
                             }
+                            return;
+                        }
+
+                        if (data.type === 'kick') {
+                            safeSend(target.ws, {
+                                type: 'kicked',
+                                from: userName,
+                                fromId: clientId
+                            });
+                            try { target.ws.close(); } catch (_) {}
+                            return;
+                        }
+
+                        safeSend(target.ws, {
+                            ...data,
+                            targetId,
+                            from: userName,
+                            fromId: clientId
                         });
                     }
                     break;
 
                 case 'leave':
-                    handleDisconnect(clientId, currentRoom);
+                    {
+                        const roomToLeave = currentRoom;
+                        currentRoom = null;
+                        handleDisconnect(clientId, roomToLeave);
+                    }
                     break;
             }
         } catch (error) {
@@ -193,7 +321,9 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        handleDisconnect(clientId, currentRoom);
+        const roomToLeave = currentRoom;
+        currentRoom = null;
+        handleDisconnect(clientId, roomToLeave);
     });
 });
 
@@ -213,13 +343,22 @@ function handleDisconnect(clientId, roomId) {
         rooms.delete(roomId);
         console.log(`🏠 Room closed: ${roomId}`);
     } else {
+        const ownerLeft = room.ownerId === clientId || !room.participants.has(room.ownerId);
+        if (ownerLeft) {
+            assignOwner(room);
+        } else {
+            syncOwnerFlags(room);
+        }
+
         room.participants.forEach((p) => {
-            p.ws.send(JSON.stringify({ 
+            safeSend(p.ws, { 
                 type: 'guest-left', 
                 from: participant.userName,
-                fromId: clientId 
-            }));
+                fromId: clientId,
+                ownerId: room.ownerId
+            });
         });
+        broadcastRoomState(room);
     }
 }
 
