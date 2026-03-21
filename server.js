@@ -203,16 +203,28 @@ wss.on('connection', (ws) => {
                         if (data.type === 'start-watch') { p.watch = true; p.watchUrl = data.url || ''; }
                         if (data.type === 'stop-watch') { p.watch = false; p.watchUrl = ''; }
 
-                        room.participants.forEach((participant, id) => {
-                            if (id !== clientId) {
-                                safeSend(participant.ws, {
-                                    ...data,
-                                    url: data.url,
-                                    from: userName,
-                                    fromId: clientId
-                                });
-                            }
-                        });
+                        if (data.type === 'start-watch' || data.type === 'stop-watch') {
+                            room.participants.forEach((participant, id) => {
+                                if (id !== clientId) {
+                                    safeSend(participant.ws, {
+                                        type: data.type === 'start-watch' ? 'watch-started' : 'watch-stopped',
+                                        url: data.url,
+                                        from: userName,
+                                        fromId: clientId
+                                    });
+                                }
+                            });
+                        } else {
+                            room.participants.forEach((participant, id) => {
+                                if (id !== clientId) {
+                                    safeSend(participant.ws, {
+                                        ...data,
+                                        from: userName,
+                                        fromId: clientId
+                                    });
+                                }
+                            });
+                        }
 
                         room.participants.forEach((participant, id) => {
                             if (id === clientId) return;
