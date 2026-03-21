@@ -39,9 +39,11 @@ function serializeParticipant(id, participant) {
     };
 }
 
-function syncOwnerFlags(room) {
+function ensureOwnerAdmin(room) {
     room.participants.forEach((participant, id) => {
-        participant.isAdmin = id === room.ownerId;
+        if (id === room.ownerId) {
+            participant.isAdmin = true;
+        }
     });
 }
 
@@ -66,7 +68,7 @@ function assignOwner(room, preferredOwnerId = null) {
         const first = room.participants.keys().next();
         room.ownerId = first.done ? null : first.value;
     }
-    syncOwnerFlags(room);
+    ensureOwnerAdmin(room);
     if (prevOwnerId !== room.ownerId && room.ownerId) {
         room.participants.forEach((participant) => {
             safeSend(participant.ws, {
@@ -102,20 +104,14 @@ wss.on('connection', (ws) => {
                         return;
                     }
 
-                    if (isCreating && rooms.has(currentRoom)) {
-                        safeSend(ws, { type: 'error', message: 'Комната уже существует' });
-                        return;
-                    }
-
-                    if (!isCreating && !rooms.has(currentRoom)) {
-                        safeSend(ws, { type: 'error', message: 'Комната не найдена' });
-                        return;
-                    }
-
                     if (!rooms.has(currentRoom)) {
                         rooms.set(currentRoom, { id: currentRoom, participants: new Map(), ownerId: null });
                     }
                     const room = rooms.get(currentRoom);
+                    if (isCreating && room.participants.size > 0) {
+                        safeSend(ws, { type: 'error', message: 'Комната уже используется' });
+                        return;
+                    }
                     const participantInfo = {
                         ws: ws,
                         userName: userName,
@@ -130,7 +126,7 @@ wss.on('connection', (ws) => {
                     if (!room.ownerId) {
                         room.ownerId = clientId;
                     }
-                    syncOwnerFlags(room);
+                    ensureOwnerAdmin(room);
 
                     room.participants.forEach((participant, id) => {
                         if (id === clientId) return;
@@ -244,21 +240,19 @@ wss.on('connection', (ws) => {
                         const target = room.participants.get(targetId);
                         if (!target) return;
 
-                        if ((data.type === 'make-admin' || data.type === 'remove-admin' || data.type === 'kick') && !sender.isAdmin) {
+                        const senderIsOwner = room.ownerId === clientId;
+                        if ((data.type === 'make-admin' || data.type === 'remove-admin' || data.type === 'kick') && !senderIsOwner) {
                             return;
                         }
 
                         if (data.type === 'make-admin') {
-                            room.participants.forEach((participant) => {
-                                participant.isAdmin = false;
-                            });
                             target.isAdmin = true;
-                            room.ownerId = targetId;
                             room.participants.forEach((participant) => {
                                 safeSend(participant.ws, {
-                                    type: 'owner-changed',
+                                    type: 'participant-updated',
+                                    participantId: targetId,
                                     ownerId: room.ownerId,
-                                    previousOwnerId: clientId
+                                    changes: { isAdmin: true }
                                 });
                             });
                             broadcastRoomState(room);
@@ -267,24 +261,21 @@ wss.on('connection', (ws) => {
 
                         if (data.type === 'remove-admin') {
                             if (targetId === room.ownerId) {
-                                target.isAdmin = false;
-                                assignOwner(room, clientId);
-                                broadcastRoomState(room);
-                            } else {
-                                target.isAdmin = false;
-                                room.participants.forEach((participant, id) => {
-                                    if (id !== clientId) {
-                                        safeSend(participant.ws, {
-                                            type: 'participant-updated',
-                                            participantId: targetId,
-                                            ownerId: room.ownerId,
-                                            changes: { isAdmin: false },
-                                            from: userName,
-                                            fromId: clientId
-                                        });
-                                    }
-                                });
+                                return;
                             }
+                            target.isAdmin = false;
+                            room.participants.forEach((participant, id) => {
+                                if (id !== clientId) {
+                                    safeSend(participant.ws, {
+                                        type: 'participant-updated',
+                                        participantId: targetId,
+                                        ownerId: room.ownerId,
+                                        changes: { isAdmin: false },
+                                        from: userName,
+                                        fromId: clientId
+                                    });
+                                }
+                            });
                             return;
                         }
 
@@ -347,7 +338,7 @@ function handleDisconnect(clientId, roomId) {
         if (ownerLeft) {
             assignOwner(room);
         } else {
-            syncOwnerFlags(room);
+            ensureOwnerAdmin(room);
         }
 
         room.participants.forEach((p) => {
