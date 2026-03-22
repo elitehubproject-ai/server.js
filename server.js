@@ -5,7 +5,7 @@ const http = require('http');
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
-const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT });
+const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 512 * 1024 });
 const rooms = new Map();
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
