@@ -94,7 +94,9 @@ function serializeParticipant(id, participant) {
         video: !!participant.video,
         audio: !!participant.audio,
         screen: !!participant.screen,
-        isAdmin: !!participant.isAdmin
+        speaking: !!participant.speaking,
+        isAdmin: !!participant.isAdmin,
+        cameraFacingMode: participant.cameraFacingMode === 'environment' ? 'environment' : 'user'
     };
 }
 
@@ -309,7 +311,9 @@ wss.on('connection', (ws) => {
                         video: false,
                         audio: true,
                         screen: false,
+                        speaking: false,
                         isAdmin: false,
+                        cameraFacingMode: 'user',
                         reconnectKey
                     };
 
@@ -380,6 +384,7 @@ wss.on('connection', (ws) => {
                 case 'toggle-video':
                 case 'toggle-audio':
                 case 'speaking':
+                case 'camera-facing':
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
@@ -390,6 +395,8 @@ wss.on('connection', (ws) => {
                         if (data.type === 'stop-screen') p.screen = false;
                         if (data.type === 'toggle-video') p.video = data.enabled;
                         if (data.type === 'toggle-audio') p.audio = data.enabled;
+                        if (data.type === 'speaking') p.speaking = !!data.isSpeaking;
+                        if (data.type === 'camera-facing') p.cameraFacingMode = data.mode === 'environment' ? 'environment' : 'user';
 
                         room.participants.forEach((participant, id) => {
                             if (id !== senderId) {
@@ -410,7 +417,9 @@ wss.on('connection', (ws) => {
                                 changes: {
                                     video: p.video,
                                     audio: p.audio,
-                                    screen: p.screen
+                                    screen: p.screen,
+                                    speaking: !!p.speaking,
+                                    cameraFacingMode: p.cameraFacingMode === 'environment' ? 'environment' : 'user'
                                 }
                             });
                         });
@@ -486,7 +495,9 @@ wss.on('connection', (ws) => {
                                 video: false,
                                 audio: true,
                                 screen: false,
+                                speaking: false,
                                 isAdmin: false,
+                                cameraFacingMode: 'user',
                                 reconnectKey: request.reconnectKey || ''
                             };
                             room.participants.set(requestId, participantInfo);
