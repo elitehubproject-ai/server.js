@@ -562,7 +562,15 @@ function handleDisconnect(clientId, roomId) {
             requestId: clientId,
             byModerator: false
         });
-        if (room.participants.size === 0 && room.joinRequests.size === 0) {
+        if (room.participants.size === 0) {
+            room.joinRequests.forEach((request) => {
+                safeSend(request.ws, {
+                    type: 'room-closed',
+                    roomId
+                });
+                try { request.ws.close(); } catch (_) {}
+            });
+            room.joinRequests.clear();
             rooms.delete(roomId);
             console.log(`🏠 Room closed: ${roomId}`);
         }
