@@ -39,6 +39,15 @@ function serializeParticipant(id, participant) {
     };
 }
 
+function serializeJoinRequest(request) {
+    return {
+        id: request.id,
+        userName: request.userName,
+        userAvatar: request.userAvatar || '',
+        requestedAt: request.requestedAt || Date.now()
+    };
+}
+
 function ensureOwnerAdmin(room) {
     room.participants.forEach((participant, id) => {
         if (id === room.ownerId) {
@@ -47,16 +56,36 @@ function ensureOwnerAdmin(room) {
     });
 }
 
+function isModerator(room, participantId) {
+    if (!room || !participantId) return false;
+    if (room.ownerId === participantId) return true;
+    const participant = room.participants.get(participantId);
+    return !!participant?.isAdmin;
+}
+
+function broadcastJoinRequestToModerators(room, payload) {
+    room.participants.forEach((participant, id) => {
+        if (!isModerator(room, id)) return;
+        safeSend(participant.ws, payload);
+    });
+}
+
 function broadcastRoomState(room) {
     const participants = Array.from(room.participants.entries()).map(([id, participant]) => serializeParticipant(id, participant));
     room.participants.forEach((participant, id) => {
+        const canModerate = isModerator(room, id);
+        const pendingJoinRequests = canModerate
+            ? Array.from(room.joinRequests.values()).map(serializeJoinRequest)
+            : [];
         safeSend(participant.ws, {
             type: 'room-state',
             roomId: room.id,
             myId: id,
             ownerId: room.ownerId,
             participants,
-            watchParty: room.watchParty || null
+            watchParty: room.watchParty || null,
+            isPrivate: !!room.isPrivate,
+            pendingJoinRequests
         });
     });
 }
@@ -79,6 +108,36 @@ function assignOwner(room, preferredOwnerId = null) {
             });
         });
     }
+}
+
+function closeRoom(room, closedById = null, closedByName = '') {
+    if (!room) return;
+    const roomId = room.id;
+    const participants = Array.from(room.participants.values());
+    const pending = Array.from(room.joinRequests.values());
+    rooms.delete(roomId);
+    participants.forEach((participant) => {
+        safeSend(participant.ws, {
+            type: 'room-closed',
+            roomId,
+            byId: closedById,
+            byName: closedByName || ''
+        });
+    });
+    pending.forEach((request) => {
+        safeSend(request.ws, {
+            type: 'room-closed',
+            roomId,
+            byId: closedById,
+            byName: closedByName || ''
+        });
+    });
+    participants.forEach((participant) => {
+        try { participant.ws.close(); } catch (_) {}
+    });
+    pending.forEach((request) => {
+        try { request.ws.close(); } catch (_) {}
+    });
 }
 
 wss.on('connection', (ws) => {
@@ -106,13 +165,34 @@ wss.on('connection', (ws) => {
                     }
 
                     if (!rooms.has(currentRoom)) {
-                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), ownerId: null, watchParty: null });
+                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), joinRequests: new Map(), ownerId: null, watchParty: null, isPrivate: false });
                     }
                     const room = rooms.get(currentRoom);
                     if (isCreating && room.participants.size > 0) {
                         safeSend(ws, { type: 'error', message: 'Комната уже используется' });
                         return;
                     }
+                    if (!isCreating && room.isPrivate && room.participants.size > 0) {
+                        const request = {
+                            id: clientId,
+                            ws,
+                            userName,
+                            userAvatar,
+                            requestedAt: Date.now()
+                        };
+                        room.joinRequests.set(clientId, request);
+                        safeSend(ws, {
+                            type: 'join-pending',
+                            roomId: currentRoom
+                        });
+                        broadcastJoinRequestToModerators(room, {
+                            type: 'join-request',
+                            roomId: currentRoom,
+                            request: serializeJoinRequest(request)
+                        });
+                        return;
+                    }
+
                     const participantInfo = {
                         ws: ws,
                         userName: userName,
@@ -124,6 +204,7 @@ wss.on('connection', (ws) => {
                     };
 
                     room.participants.set(clientId, participantInfo);
+                    room.joinRequests.delete(clientId);
                     if (!room.ownerId) {
                         room.ownerId = clientId;
                     }
@@ -230,18 +311,99 @@ wss.on('connection', (ws) => {
                 case 'make-admin':
                 case 'remove-admin':
                 case 'kick':
+                case 'approve-join-request':
+                case 'reject-join-request':
+                case 'set-room-private':
+                case 'close-room':
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
                         const sender = room.participants.get(clientId);
                         if (!sender) return;
+                        const senderIsOwner = room.ownerId === clientId;
+                        const senderIsAdmin = !!sender.isAdmin;
+
+                        if (data.type === 'set-room-private') {
+                            if (!senderIsOwner && !senderIsAdmin) return;
+                            room.isPrivate = !!data.enabled;
+                            room.participants.forEach((participant) => {
+                                safeSend(participant.ws, {
+                                    type: 'room-privacy-updated',
+                                    enabled: room.isPrivate,
+                                    fromId: clientId,
+                                    from: userName
+                                });
+                            });
+                            broadcastRoomState(room);
+                            return;
+                        }
+
+                        if (data.type === 'close-room') {
+                            if (!senderIsOwner && !senderIsAdmin) return;
+                            closeRoom(room, clientId, userName);
+                            return;
+                        }
+
+                        if (data.type === 'approve-join-request' || data.type === 'reject-join-request') {
+                            if (!senderIsOwner && !senderIsAdmin) return;
+                            const requestId = data.requestId || data.targetId || data.target;
+                            if (!requestId) return;
+                            const request = room.joinRequests.get(requestId);
+                            if (!request) return;
+                            room.joinRequests.delete(requestId);
+                            broadcastJoinRequestToModerators(room, {
+                                type: 'join-request-cancelled',
+                                requestId,
+                                byModerator: true
+                            });
+                            if (data.type === 'reject-join-request') {
+                                safeSend(request.ws, {
+                                    type: 'join-rejected',
+                                    roomId: room.id,
+                                    byId: clientId,
+                                    byName: userName
+                                });
+                                return;
+                            }
+
+                            const participantInfo = {
+                                ws: request.ws,
+                                userName: request.userName,
+                                userAvatar: request.userAvatar || '',
+                                video: false,
+                                audio: true,
+                                screen: false,
+                                isAdmin: false
+                            };
+                            room.participants.set(requestId, participantInfo);
+                            if (!room.ownerId) {
+                                room.ownerId = requestId;
+                            }
+                            ensureOwnerAdmin(room);
+                            room.participants.forEach((participant, id) => {
+                                if (id === requestId) return;
+                                safeSend(participant.ws, {
+                                    type: 'guest-joined',
+                                    guest: serializeParticipant(requestId, participantInfo),
+                                    ownerId: room.ownerId
+                                });
+                            });
+                            safeSend(request.ws, {
+                                type: 'joined',
+                                roomId: room.id,
+                                myId: requestId,
+                                ownerId: room.ownerId
+                            });
+                            broadcastRoomState(room);
+                            return;
+                        }
+
                         const targetId = data.targetId || data.target;
 
                         if (!targetId) return;
                         const target = room.participants.get(targetId);
                         if (!target) return;
 
-                        const senderIsOwner = room.ownerId === clientId;
                         if ((data.type === 'make-admin' || data.type === 'remove-admin' || data.type === 'kick') && !senderIsOwner) {
                             return;
                         }
@@ -294,6 +456,20 @@ wss.on('connection', (ws) => {
                             targetId,
                             from: userName,
                             fromId: clientId
+                        });
+                    }
+                    break;
+
+                case 'cancel-join-request':
+                    {
+                        const room = rooms.get(currentRoom);
+                        if (!room) return;
+                        if (!room.joinRequests.has(clientId)) return;
+                        room.joinRequests.delete(clientId);
+                        broadcastJoinRequestToModerators(room, {
+                            type: 'join-request-cancelled',
+                            requestId: clientId,
+                            byModerator: false
                         });
                     }
                     break;
@@ -379,6 +555,20 @@ function handleDisconnect(clientId, roomId) {
     const room = rooms.get(roomId);
     if (!room) return;
 
+    if (room.joinRequests.has(clientId)) {
+        room.joinRequests.delete(clientId);
+        broadcastJoinRequestToModerators(room, {
+            type: 'join-request-cancelled',
+            requestId: clientId,
+            byModerator: false
+        });
+        if (room.participants.size === 0 && room.joinRequests.size === 0) {
+            rooms.delete(roomId);
+            console.log(`🏠 Room closed: ${roomId}`);
+        }
+        return;
+    }
+
     const participant = room.participants.get(clientId);
     if (!participant) return;
 
@@ -391,6 +581,14 @@ function handleDisconnect(clientId, roomId) {
     }
     
     if (room.participants.size === 0) {
+        room.joinRequests.forEach((request) => {
+            safeSend(request.ws, {
+                type: 'room-closed',
+                roomId
+            });
+            try { request.ws.close(); } catch (_) {}
+        });
+        room.joinRequests.clear();
         rooms.delete(roomId);
         console.log(`🏠 Room closed: ${roomId}`);
     } else {
