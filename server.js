@@ -150,6 +150,16 @@ function broadcastRoomState(room) {
     });
 }
 
+function findParticipantIdByReconnectKey(room, reconnectKey) {
+    if (!room || !reconnectKey) return null;
+    for (const [id, participant] of room.participants.entries()) {
+        if (participant?.reconnectKey === reconnectKey) {
+            return id;
+        }
+    }
+    return null;
+}
+
 function assignOwner(room, preferredOwnerId = null) {
     const prevOwnerId = room.ownerId || null;
     if (preferredOwnerId && room.participants.has(preferredOwnerId)) {
@@ -210,14 +220,20 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
+            const senderId = ws.__participantId || clientId;
 
             switch (data.type) {
+                case 'ping':
+                    safeSend(ws, { type: 'pong', ts: Date.now() });
+                    break;
+
                 case 'create':
                 case 'join':
                     currentRoom = data.roomId;
                     userName = data.userName;
                     const userAvatar = data.userAvatar || '';
                     const isCreating = data.type === 'create';
+                    const reconnectKey = typeof data.reconnectKey === 'string' ? data.reconnectKey.trim().slice(0, 160) : '';
 
                     if (!currentRoom || typeof currentRoom !== 'string') {
                         safeSend(ws, { type: 'error', message: 'Некорректный идентификатор комнаты' });
@@ -228,16 +244,18 @@ wss.on('connection', (ws) => {
                         rooms.set(currentRoom, { id: currentRoom, participants: new Map(), joinRequests: new Map(), ownerId: null, watchParty: null, isPrivate: false });
                     }
                     const room = rooms.get(currentRoom);
-                    if (isCreating && room.participants.size > 0) {
+                    const reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
+                    if (isCreating && room.participants.size > 0 && !reconnectTargetId) {
                         safeSend(ws, { type: 'error', message: 'Комната уже используется' });
                         return;
                     }
-                    if (!isCreating && room.isPrivate && room.participants.size > 0) {
+                    if (!isCreating && room.isPrivate && room.participants.size > 0 && !reconnectTargetId) {
                         const request = {
                             id: clientId,
                             ws,
                             userName,
                             userAvatar,
+                            reconnectKey,
                             requestedAt: Date.now()
                         };
                         room.joinRequests.set(clientId, request);
@@ -253,17 +271,50 @@ wss.on('connection', (ws) => {
                         return;
                     }
 
+                    if (reconnectTargetId && room.participants.has(reconnectTargetId)) {
+                        const existing = room.participants.get(reconnectTargetId);
+                        const oldWs = existing?.ws;
+                        const participantInfo = {
+                            ...existing,
+                            ws,
+                            userName,
+                            userAvatar,
+                            reconnectKey: reconnectKey || existing?.reconnectKey || ''
+                        };
+                        room.participants.set(reconnectTargetId, participantInfo);
+                        ws.__participantId = reconnectTargetId;
+                        room.joinRequests.delete(clientId);
+                        room.joinRequests.delete(reconnectTargetId);
+                        ensureOwnerAdmin(room);
+                        safeSend(ws, {
+                            type: isCreating ? 'created' : 'joined',
+                            roomId: currentRoom,
+                            myId: reconnectTargetId,
+                            ownerId: room.ownerId,
+                            iceServers: ACTIVE_ICE_SERVERS
+                        });
+                        broadcastRoomState(room);
+                        if (oldWs && oldWs !== ws) {
+                            oldWs.__superseded = true;
+                            try { oldWs.close(); } catch (_) {}
+                        }
+                        console.log(`🔁 User ${userName} reconnected in room: ${currentRoom}`);
+                        break;
+                    }
+
                     const participantInfo = {
-                        ws: ws,
-                        userName: userName,
-                        userAvatar: userAvatar,
+                        ws,
+                        userName,
+                        userAvatar,
                         video: false,
                         audio: true,
                         screen: false,
-                        isAdmin: false
+                        isAdmin: false,
+                        reconnectKey
                     };
 
                     room.participants.set(clientId, participantInfo);
+                    ws.__participantId = clientId;
                     room.joinRequests.delete(clientId);
                     if (!room.ownerId) {
                         room.ownerId = clientId;
@@ -307,16 +358,16 @@ wss.on('connection', (ws) => {
                                 safeSend(target.ws, { 
                                     ...data, 
                                     from: userName, 
-                                    fromId: clientId 
+                                    fromId: senderId 
                                 });
                             }
                         } else {
                             room.participants.forEach((p, id) => {
-                                if (id !== clientId) {
+                                if (id !== senderId) {
                                     safeSend(p.ws, { 
                                         ...data, 
                                         from: userName, 
-                                        fromId: clientId 
+                                        fromId: senderId 
                                     });
                                 }
                             });
@@ -332,7 +383,7 @@ wss.on('connection', (ws) => {
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
-                        const p = room.participants.get(clientId);
+                        const p = room.participants.get(senderId);
                         if (!p) return;
 
                         if (data.type === 'start-screen') p.screen = true;
@@ -341,11 +392,11 @@ wss.on('connection', (ws) => {
                         if (data.type === 'toggle-audio') p.audio = data.enabled;
 
                         room.participants.forEach((participant, id) => {
-                            if (id !== clientId) {
+                            if (id !== senderId) {
                                 safeSend(participant.ws, {
                                     ...data,
                                     from: userName,
-                                    fromId: clientId
+                                    fromId: senderId
                                 });
                             }
                         });
@@ -354,7 +405,7 @@ wss.on('connection', (ws) => {
                             if (id === clientId) return;
                             safeSend(participant.ws, {
                                 type: 'participant-updated',
-                                participantId: clientId,
+                                participantId: senderId,
                                 ownerId: room.ownerId,
                                 changes: {
                                     video: p.video,
@@ -380,9 +431,9 @@ wss.on('connection', (ws) => {
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
-                        const sender = room.participants.get(clientId);
+                        const sender = room.participants.get(senderId);
                         if (!sender) return;
-                        const senderIsOwner = room.ownerId === clientId;
+                        const senderIsOwner = room.ownerId === senderId;
                         const senderIsAdmin = !!sender.isAdmin;
 
                         if (data.type === 'set-room-private') {
@@ -392,7 +443,7 @@ wss.on('connection', (ws) => {
                                 safeSend(participant.ws, {
                                     type: 'room-privacy-updated',
                                     enabled: room.isPrivate,
-                                    fromId: clientId,
+                                    fromId: senderId,
                                     from: userName
                                 });
                             });
@@ -402,7 +453,7 @@ wss.on('connection', (ws) => {
 
                         if (data.type === 'close-room') {
                             if (!senderIsOwner && !senderIsAdmin) return;
-                            closeRoom(room, clientId, userName);
+                            closeRoom(room, senderId, userName);
                             return;
                         }
 
@@ -422,7 +473,7 @@ wss.on('connection', (ws) => {
                                 safeSend(request.ws, {
                                     type: 'join-rejected',
                                     roomId: room.id,
-                                    byId: clientId,
+                                    byId: senderId,
                                     byName: userName
                                 });
                                 return;
@@ -435,7 +486,8 @@ wss.on('connection', (ws) => {
                                 video: false,
                                 audio: true,
                                 screen: false,
-                                isAdmin: false
+                                isAdmin: false,
+                                reconnectKey: request.reconnectKey || ''
                             };
                             room.participants.set(requestId, participantInfo);
                             if (!room.ownerId) {
@@ -498,7 +550,7 @@ wss.on('connection', (ws) => {
                                     ownerId: room.ownerId,
                                     changes: { isAdmin: false },
                                     from: userName,
-                                    fromId: clientId
+                                    fromId: senderId
                                 });
                             });
                             broadcastRoomState(room);
@@ -509,7 +561,7 @@ wss.on('connection', (ws) => {
                             safeSend(target.ws, {
                                 type: 'kicked',
                                 from: userName,
-                                fromId: clientId
+                                fromId: senderId
                             });
                             try { target.ws.close(); } catch (_) {}
                             return;
@@ -519,7 +571,7 @@ wss.on('connection', (ws) => {
                             ...data,
                             targetId,
                             from: userName,
-                            fromId: clientId
+                            fromId: senderId
                         });
                     }
                     break;
@@ -528,11 +580,11 @@ wss.on('connection', (ws) => {
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
-                        if (!room.joinRequests.has(clientId)) return;
-                        room.joinRequests.delete(clientId);
+                        if (!room.joinRequests.has(senderId)) return;
+                        room.joinRequests.delete(senderId);
                         broadcastJoinRequestToModerators(room, {
                             type: 'join-request-cancelled',
-                            requestId: clientId,
+                            requestId: senderId,
                             byModerator: false
                         });
                     }
@@ -543,10 +595,10 @@ wss.on('connection', (ws) => {
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
-                        const sender = room.participants.get(clientId);
+                        const sender = room.participants.get(senderId);
                         if (!sender) return;
 
-                        const senderIsOwner = room.ownerId === clientId;
+                        const senderIsOwner = room.ownerId === senderId;
                         const senderIsAdmin = !!sender.isAdmin;
 
                         if (data.type === 'start-watch') {
@@ -554,12 +606,12 @@ wss.on('connection', (ws) => {
                             if (!url) return;
 
                             const active = room.watchParty;
-                            const canStart = !active || active.ownerId === clientId || senderIsOwner || senderIsAdmin;
+                            const canStart = !active || active.ownerId === senderId || senderIsOwner || senderIsAdmin;
                             if (!canStart) return;
 
                             room.watchParty = {
                                 url,
-                                ownerId: clientId,
+                                ownerId: senderId,
                                 ownerName: userName,
                                 startedAt: Date.now()
                             };
@@ -569,7 +621,7 @@ wss.on('connection', (ws) => {
                                     type: 'watch-started',
                                     watchParty: room.watchParty,
                                     from: userName,
-                                    fromId: clientId,
+                                    fromId: senderId,
                                     ownerId: room.ownerId
                                 });
                             });
@@ -577,7 +629,7 @@ wss.on('connection', (ws) => {
                         }
 
                         if (!room.watchParty) return;
-                        const canStop = room.watchParty.ownerId === clientId || senderIsOwner || senderIsAdmin;
+                        const canStop = room.watchParty.ownerId === senderId || senderIsOwner || senderIsAdmin;
                         if (!canStop) return;
 
                         const previousWatch = room.watchParty;
@@ -587,7 +639,7 @@ wss.on('connection', (ws) => {
                                 type: 'watch-stopped',
                                 previousWatch,
                                 from: userName,
-                                fromId: clientId,
+                                fromId: senderId,
                                 ownerId: room.ownerId
                             });
                         });
@@ -598,7 +650,7 @@ wss.on('connection', (ws) => {
                     {
                         const roomToLeave = currentRoom;
                         currentRoom = null;
-                        handleDisconnect(clientId, roomToLeave);
+                        handleDisconnect(senderId, roomToLeave);
                     }
                     break;
             }
@@ -608,9 +660,11 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
+        if (ws.__superseded) return;
         const roomToLeave = currentRoom;
         currentRoom = null;
-        handleDisconnect(clientId, roomToLeave);
+        const participantId = ws.__participantId || clientId;
+        handleDisconnect(participantId, roomToLeave);
     });
 });
 
