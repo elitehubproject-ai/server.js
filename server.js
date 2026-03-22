@@ -3,6 +3,17 @@ const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
+const DEFAULT_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+];
 
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 512 * 1024 });
@@ -26,6 +37,54 @@ function safeSend(ws, payload) {
         ws.send(JSON.stringify(payload));
     } catch (_) {}
 }
+
+function sanitizeIceServer(item) {
+    if (!item || typeof item !== 'object') return null;
+    const urls = item.urls;
+    const normalizedUrls = Array.isArray(urls)
+        ? urls.filter((u) => typeof u === 'string' && u.trim())
+        : typeof urls === 'string' && urls.trim()
+            ? urls.trim()
+            : null;
+    if (!normalizedUrls) return null;
+    const out = { urls: normalizedUrls };
+    if (typeof item.username === 'string' && item.username) out.username = item.username;
+    if (typeof item.credential === 'string' && item.credential) out.credential = item.credential;
+    return out;
+}
+
+function buildIceServers() {
+    const merged = [];
+    const add = (item) => {
+        const server = sanitizeIceServer(item);
+        if (!server) return;
+        const key = JSON.stringify(server);
+        if (!merged.some((entry) => JSON.stringify(entry) === key)) {
+            merged.push(server);
+        }
+    };
+    DEFAULT_ICE_SERVERS.forEach(add);
+
+    if (process.env.WEBRTC_ICE_SERVERS_JSON) {
+        try {
+            const parsed = JSON.parse(process.env.WEBRTC_ICE_SERVERS_JSON);
+            if (Array.isArray(parsed)) parsed.forEach(add);
+        } catch (_) {}
+    }
+
+    const turnUser = process.env.TURN_USERNAME || '';
+    const turnCredential = process.env.TURN_CREDENTIAL || '';
+    const turnUrls = String(process.env.TURN_URLS || '')
+        .split(',')
+        .map((u) => u.trim())
+        .filter(Boolean);
+    if (turnUrls.length && turnUser && turnCredential) {
+        add({ urls: turnUrls, username: turnUser, credential: turnCredential });
+    }
+    return merged;
+}
+
+const ACTIVE_ICE_SERVERS = buildIceServers();
 
 function serializeParticipant(id, participant) {
     return {
@@ -85,7 +144,8 @@ function broadcastRoomState(room) {
             participants,
             watchParty: room.watchParty || null,
             isPrivate: !!room.isPrivate,
-            pendingJoinRequests
+            pendingJoinRequests,
+            iceServers: ACTIVE_ICE_SERVERS
         });
     });
 }
@@ -215,7 +275,8 @@ wss.on('connection', (ws) => {
                         safeSend(participant.ws, {
                             type: 'guest-joined',
                             guest: serializeParticipant(clientId, participantInfo),
-                            ownerId: room.ownerId
+                            ownerId: room.ownerId,
+                            iceServers: ACTIVE_ICE_SERVERS
                         });
                     });
 
@@ -223,7 +284,8 @@ wss.on('connection', (ws) => {
                         type: isCreating ? 'created' : 'joined',
                         roomId: currentRoom,
                         myId: clientId,
-                        ownerId: room.ownerId
+                        ownerId: room.ownerId,
+                        iceServers: ACTIVE_ICE_SERVERS
                     });
 
                     broadcastRoomState(room);
@@ -385,14 +447,16 @@ wss.on('connection', (ws) => {
                                 safeSend(participant.ws, {
                                     type: 'guest-joined',
                                     guest: serializeParticipant(requestId, participantInfo),
-                                    ownerId: room.ownerId
+                                    ownerId: room.ownerId,
+                                    iceServers: ACTIVE_ICE_SERVERS
                                 });
                             });
                             safeSend(request.ws, {
                                 type: 'joined',
                                 roomId: room.id,
                                 myId: requestId,
-                                ownerId: room.ownerId
+                                ownerId: room.ownerId,
+                                iceServers: ACTIVE_ICE_SERVERS
                             });
                             broadcastRoomState(room);
                             return;
