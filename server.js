@@ -18,6 +18,8 @@ const DEFAULT_ICE_SERVERS = [
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 512 * 1024 });
 const rooms = new Map();
+const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
+const pendingDisconnects = new Map();
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
@@ -194,6 +196,7 @@ function assignOwner(room, preferredOwnerId = null) {
 function closeRoom(room, closedById = null, closedByName = '') {
     if (!room) return;
     const roomId = room.id;
+    clearRoomPendingDisconnects(roomId);
     const participants = Array.from(room.participants.values());
     const pending = Array.from(room.joinRequests.values());
     rooms.delete(roomId);
@@ -219,6 +222,91 @@ function closeRoom(room, closedById = null, closedByName = '') {
     pending.forEach((request) => {
         try { request.ws.close(); } catch (_) {}
     });
+}
+
+function getPendingDisconnectKey(roomId, participantId) {
+    return `${roomId}::${participantId}`;
+}
+
+function clearPendingDisconnect(roomId, participantId) {
+    if (!roomId || !participantId) return;
+    const key = getPendingDisconnectKey(roomId, participantId);
+    const timerId = pendingDisconnects.get(key);
+    if (!timerId) return;
+    clearTimeout(timerId);
+    pendingDisconnects.delete(key);
+}
+
+function clearRoomPendingDisconnects(roomId) {
+    if (!roomId) return;
+    const prefix = `${roomId}::`;
+    Array.from(pendingDisconnects.entries()).forEach(([key, timerId]) => {
+        if (!key.startsWith(prefix)) return;
+        clearTimeout(timerId);
+        pendingDisconnects.delete(key);
+    });
+}
+
+function finalizeParticipantDisconnect(clientId, roomId) {
+    if (!roomId) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const participant = room.participants.get(clientId);
+    if (!participant) return;
+
+    clearPendingDisconnect(roomId, clientId);
+    console.log(`❌ User left: ${participant.userName} from room ${roomId}`);
+    
+    room.participants.delete(clientId);
+    const shouldStopWatch = room.watchParty && room.watchParty.ownerId === clientId;
+    if (shouldStopWatch) {
+        room.watchParty = null;
+    }
+    if (room.isFriendCall) {
+        closeRoom(room, clientId, participant.userName || '');
+        return;
+    }
+    
+    if (room.participants.size === 0) {
+        room.joinRequests.forEach((request) => {
+            safeSend(request.ws, {
+                type: 'room-closed',
+                roomId
+            });
+            try { request.ws.close(); } catch (_) {}
+        });
+        room.joinRequests.clear();
+        clearRoomPendingDisconnects(roomId);
+        rooms.delete(roomId);
+        console.log(`🏠 Room closed: ${roomId}`);
+    } else {
+        const ownerLeft = room.ownerId === clientId || !room.participants.has(room.ownerId);
+        if (ownerLeft) {
+            assignOwner(room);
+        } else {
+            ensureOwnerAdmin(room);
+        }
+
+        room.participants.forEach((p) => {
+            safeSend(p.ws, { 
+                type: 'guest-left', 
+                from: participant.userName,
+                fromId: clientId,
+                ownerId: room.ownerId
+            });
+            if (shouldStopWatch) {
+                safeSend(p.ws, {
+                    type: 'watch-stopped',
+                    previousWatch: null,
+                    from: participant.userName,
+                    fromId: clientId,
+                    ownerId: room.ownerId
+                });
+            }
+        });
+        broadcastRoomState(room);
+    }
 }
 
 wss.on('connection', (ws) => {
@@ -311,6 +399,7 @@ wss.on('connection', (ws) => {
                     if (reconnectTargetId && room.participants.has(reconnectTargetId)) {
                         const existing = room.participants.get(reconnectTargetId);
                         const oldWs = existing?.ws;
+                        clearPendingDisconnect(currentRoom, reconnectTargetId);
                         const participantInfo = {
                             ...existing,
                             ws,
@@ -700,7 +789,7 @@ wss.on('connection', (ws) => {
                     {
                         const roomToLeave = currentRoom;
                         currentRoom = null;
-                        handleDisconnect(senderId, roomToLeave);
+                        handleDisconnect(senderId, roomToLeave, { allowGrace: false });
                     }
                     break;
             }
@@ -714,11 +803,11 @@ wss.on('connection', (ws) => {
         const roomToLeave = currentRoom;
         currentRoom = null;
         const participantId = ws.__participantId || clientId;
-        handleDisconnect(participantId, roomToLeave);
+        handleDisconnect(participantId, roomToLeave, { allowGrace: true });
     });
 });
 
-function handleDisconnect(clientId, roomId) {
+function handleDisconnect(clientId, roomId, options = {}) {
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room) return;
@@ -739,6 +828,7 @@ function handleDisconnect(clientId, roomId) {
                 try { request.ws.close(); } catch (_) {}
             });
             room.joinRequests.clear();
+            clearRoomPendingDisconnects(roomId);
             rooms.delete(roomId);
             console.log(`🏠 Room closed: ${roomId}`);
         }
@@ -747,57 +837,18 @@ function handleDisconnect(clientId, roomId) {
 
     const participant = room.participants.get(clientId);
     if (!participant) return;
-
-    console.log(`❌ User left: ${participant.userName} from room ${roomId}`);
-    
-    room.participants.delete(clientId);
-    const shouldStopWatch = room.watchParty && room.watchParty.ownerId === clientId;
-    if (shouldStopWatch) {
-        room.watchParty = null;
-    }
-    if (room.isFriendCall) {
-        closeRoom(room, clientId, participant.userName || '');
+    clearPendingDisconnect(roomId, clientId);
+    const allowGrace = !!options.allowGrace;
+    if (allowGrace) {
+        const key = getPendingDisconnectKey(roomId, clientId);
+        const timerId = setTimeout(() => {
+            pendingDisconnects.delete(key);
+            finalizeParticipantDisconnect(clientId, roomId);
+        }, Math.max(1000, RECONNECT_GRACE_MS));
+        pendingDisconnects.set(key, timerId);
         return;
     }
-    
-    if (room.participants.size === 0) {
-        room.joinRequests.forEach((request) => {
-            safeSend(request.ws, {
-                type: 'room-closed',
-                roomId
-            });
-            try { request.ws.close(); } catch (_) {}
-        });
-        room.joinRequests.clear();
-        rooms.delete(roomId);
-        console.log(`🏠 Room closed: ${roomId}`);
-    } else {
-        const ownerLeft = room.ownerId === clientId || !room.participants.has(room.ownerId);
-        if (ownerLeft) {
-            assignOwner(room);
-        } else {
-            ensureOwnerAdmin(room);
-        }
-
-        room.participants.forEach((p) => {
-            safeSend(p.ws, { 
-                type: 'guest-left', 
-                from: participant.userName,
-                fromId: clientId,
-                ownerId: room.ownerId
-            });
-            if (shouldStopWatch) {
-                safeSend(p.ws, {
-                    type: 'watch-stopped',
-                    previousWatch: null,
-                    from: participant.userName,
-                    fromId: clientId,
-                    ownerId: room.ownerId
-                });
-            }
-        });
-        broadcastRoomState(room);
-    }
+    finalizeParticipantDisconnect(clientId, roomId);
 }
 
 // ============ АВТО-ПИНГ ДЛЯ ПРЕДОТВРАЩЕНИЯ ЗАСЫПАНИЯ ============
