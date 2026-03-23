@@ -20,10 +20,6 @@ const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflat
 const rooms = new Map();
 const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
 const pendingDisconnects = new Map();
-const messengerClients = new Map();
-const messengerProfiles = new Map();
-const messengerThreads = new Map();
-const MAX_THREAD_MESSAGES = 200;
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
@@ -42,160 +38,6 @@ function safeSend(ws, payload) {
     try {
         ws.send(JSON.stringify(payload));
     } catch (_) {}
-}
-
-function sanitizeChatText(value) {
-    return String(value || '').trim().slice(0, 4000);
-}
-
-function normalizeMessengerId(value, max = 120) {
-    return String(value || '').trim().slice(0, max);
-}
-
-function getMessengerThreadId(first, second) {
-    const a = normalizeMessengerId(first);
-    const b = normalizeMessengerId(second);
-    if (!a || !b) return '';
-    return a.localeCompare(b) <= 0 ? `${a}::${b}` : `${b}::${a}`;
-}
-
-function upsertMessengerProfile(appUserId, userName = '', userAvatar = '', username = '') {
-    const id = normalizeMessengerId(appUserId);
-    if (!id) return null;
-    const existing = messengerProfiles.get(id) || {};
-    const next = {
-        appUserId: id,
-        userName: normalizeMessengerId(userName, 120) || existing.userName || 'Пользователь',
-        userAvatar: normalizeMessengerId(userAvatar, 500) || existing.userAvatar || '',
-        username: normalizeMessengerId(username, 80) || existing.username || '',
-        lastSeenAt: Date.now()
-    };
-    messengerProfiles.set(id, next);
-    return next;
-}
-
-function getMessengerPresence(appUserId) {
-    const id = normalizeMessengerId(appUserId);
-    if (!id) return { online: false, lastSeenAt: 0 };
-    const sockets = messengerClients.get(id);
-    const profile = messengerProfiles.get(id);
-    if (sockets && sockets.size > 0) {
-        return { online: true, lastSeenAt: Date.now() };
-    }
-    return { online: false, lastSeenAt: profile?.lastSeenAt || 0 };
-}
-
-function getMessengerThreadMessages(currentUserId, peerUserId) {
-    const threadId = getMessengerThreadId(currentUserId, peerUserId);
-    if (!threadId) return [];
-    const thread = messengerThreads.get(threadId);
-    if (!thread) return [];
-    return thread.messages.slice(-MAX_THREAD_MESSAGES).map((message) => ({ ...message }));
-}
-
-function buildMessengerChatSummaries(currentUserId) {
-    const appUserId = normalizeMessengerId(currentUserId);
-    if (!appUserId) return [];
-    const summaries = [];
-    messengerThreads.forEach((thread, threadId) => {
-        if (!threadId.includes('::')) return;
-        const parts = threadId.split('::');
-        if (parts.length !== 2) return;
-        const [first, second] = parts;
-        if (first !== appUserId && second !== appUserId) return;
-        const peerAppUserId = first === appUserId ? second : first;
-        const peerProfile = messengerProfiles.get(peerAppUserId) || {};
-        const lastMessage = thread.messages.length ? thread.messages[thread.messages.length - 1] : null;
-        const presence = getMessengerPresence(peerAppUserId);
-        summaries.push({
-            peerAppUserId,
-            peerUserName: peerProfile.userName || peerAppUserId,
-            peerAvatar: peerProfile.userAvatar || '',
-            peerUsername: peerProfile.username || '',
-            online: presence.online,
-            lastSeenAt: presence.lastSeenAt,
-            lastMessage: lastMessage ? { ...lastMessage } : null,
-            updatedAt: Number(thread.updatedAt || 0)
-        });
-    });
-    summaries.sort((a, b) => {
-        const timeA = Number(a.updatedAt || a.lastMessage?.createdAt || 0);
-        const timeB = Number(b.updatedAt || b.lastMessage?.createdAt || 0);
-        return timeB - timeA;
-    });
-    return summaries.slice(0, 150);
-}
-
-function safeSendToMessengerUser(appUserId, payload, excludeWs = null) {
-    const id = normalizeMessengerId(appUserId);
-    if (!id) return;
-    const sockets = messengerClients.get(id);
-    if (!sockets || sockets.size === 0) return;
-    sockets.forEach((socket) => {
-        if (excludeWs && socket === excludeWs) return;
-        safeSend(socket, payload);
-    });
-}
-
-function broadcastMessengerPresence(appUserId) {
-    const id = normalizeMessengerId(appUserId);
-    if (!id) return;
-    const profile = messengerProfiles.get(id) || {};
-    const presence = getMessengerPresence(id);
-    const payload = {
-        type: 'messenger-presence',
-        appUserId: id,
-        online: presence.online,
-        lastSeenAt: presence.lastSeenAt,
-        userName: profile.userName || '',
-        userAvatar: profile.userAvatar || '',
-        username: profile.username || ''
-    };
-    messengerClients.forEach((sockets) => {
-        sockets.forEach((socket) => safeSend(socket, payload));
-    });
-}
-
-function registerMessengerSocket(ws, appUserId, userName = '', userAvatar = '', username = '') {
-    const id = normalizeMessengerId(appUserId);
-    if (!id) return null;
-    const profile = upsertMessengerProfile(id, userName, userAvatar, username);
-    ws.__messengerAppUserId = id;
-    if (!messengerClients.has(id)) {
-        messengerClients.set(id, new Set());
-    }
-    messengerClients.get(id).add(ws);
-    broadcastMessengerPresence(id);
-    return profile;
-}
-
-function unregisterMessengerSocket(ws) {
-    const appUserId = normalizeMessengerId(ws?.__messengerAppUserId || '');
-    if (!appUserId) return;
-    const sockets = messengerClients.get(appUserId);
-    if (sockets) {
-        sockets.delete(ws);
-        if (sockets.size === 0) {
-            messengerClients.delete(appUserId);
-            const profile = messengerProfiles.get(appUserId);
-            if (profile) {
-                profile.lastSeenAt = Date.now();
-                messengerProfiles.set(appUserId, profile);
-            }
-        }
-    }
-    ws.__messengerAppUserId = '';
-    broadcastMessengerPresence(appUserId);
-}
-
-function sendMessengerBootstrap(ws, appUserId) {
-    const id = normalizeMessengerId(appUserId);
-    if (!id) return;
-    safeSend(ws, {
-        type: 'messenger-ready',
-        appUserId: id,
-        chats: buildMessengerChatSummaries(id)
-    });
 }
 
 function sanitizeIceServer(item) {
@@ -484,117 +326,12 @@ wss.on('connection', (ws) => {
                     safeSend(ws, { type: 'pong', ts: Date.now() });
                     break;
 
-                case 'messenger-auth':
-                    {
-                        const appUserId = normalizeMessengerId(data.appUserId, 120);
-                        if (!appUserId) {
-                            safeSend(ws, { type: 'error', message: 'appUserId required' });
-                            return;
-                        }
-                        const profile = registerMessengerSocket(
-                            ws,
-                            appUserId,
-                            normalizeMessengerId(data.userName, 120),
-                            normalizeMessengerId(data.userAvatar, 500),
-                            normalizeMessengerId(data.username, 80)
-                        );
-                        if (!profile) {
-                            safeSend(ws, { type: 'error', message: 'Неверный профиль мессенджера' });
-                            return;
-                        }
-                        sendMessengerBootstrap(ws, appUserId);
-                    }
-                    break;
-
-                case 'messenger-refresh':
-                    {
-                        const appUserId = normalizeMessengerId(data.appUserId || ws.__messengerAppUserId, 120);
-                        if (!appUserId) return;
-                        sendMessengerBootstrap(ws, appUserId);
-                    }
-                    break;
-
-                case 'chat-open':
-                    {
-                        const appUserId = normalizeMessengerId(data.appUserId || ws.__messengerAppUserId, 120);
-                        const peerAppUserId = normalizeMessengerId(data.peerAppUserId, 120);
-                        if (!appUserId || !peerAppUserId || appUserId === peerAppUserId) return;
-                        const peerProfile = messengerProfiles.get(peerAppUserId) || {};
-                        const presence = getMessengerPresence(peerAppUserId);
-                        safeSend(ws, {
-                            type: 'chat-history',
-                            peerAppUserId,
-                            peerProfile: {
-                                appUserId: peerAppUserId,
-                                userName: peerProfile.userName || peerAppUserId,
-                                userAvatar: peerProfile.userAvatar || '',
-                                username: peerProfile.username || ''
-                            },
-                            online: presence.online,
-                            lastSeenAt: presence.lastSeenAt,
-                            messages: getMessengerThreadMessages(appUserId, peerAppUserId)
-                        });
-                    }
-                    break;
-
-                case 'chat-message':
-                    {
-                        const fromAppUserId = normalizeMessengerId(data.appUserId || ws.__messengerAppUserId, 120);
-                        const toAppUserId = normalizeMessengerId(data.toAppUserId, 120);
-                        const text = sanitizeChatText(data.text);
-                        const clientMsgId = normalizeMessengerId(data.clientMsgId, 120);
-                        if (!fromAppUserId || !toAppUserId || fromAppUserId === toAppUserId || !text) return;
-                        const threadId = getMessengerThreadId(fromAppUserId, toAppUserId);
-                        if (!threadId) return;
-                        const messageItem = {
-                            id: uuidv4(),
-                            clientMsgId: clientMsgId || '',
-                            threadId,
-                            fromAppUserId,
-                            toAppUserId,
-                            text,
-                            createdAt: Date.now()
-                        };
-                        if (!messengerThreads.has(threadId)) {
-                            messengerThreads.set(threadId, { messages: [], updatedAt: Date.now() });
-                        }
-                        const thread = messengerThreads.get(threadId);
-                        thread.messages.push(messageItem);
-                        if (thread.messages.length > MAX_THREAD_MESSAGES) {
-                            thread.messages.splice(0, thread.messages.length - MAX_THREAD_MESSAGES);
-                        }
-                        thread.updatedAt = Date.now();
-                        messengerThreads.set(threadId, thread);
-                        safeSend(ws, { type: 'chat-message-sent', message: messageItem });
-                        safeSendToMessengerUser(toAppUserId, { type: 'chat-message', message: messageItem }, ws);
-                        safeSendToMessengerUser(fromAppUserId, { type: 'chat-list-updated', chats: buildMessengerChatSummaries(fromAppUserId) });
-                        safeSendToMessengerUser(toAppUserId, { type: 'chat-list-updated', chats: buildMessengerChatSummaries(toAppUserId) });
-                    }
-                    break;
-
-                case 'chat-typing':
-                    {
-                        const fromAppUserId = normalizeMessengerId(data.appUserId || ws.__messengerAppUserId, 120);
-                        const toAppUserId = normalizeMessengerId(data.toAppUserId, 120);
-                        if (!fromAppUserId || !toAppUserId || fromAppUserId === toAppUserId) return;
-                        safeSendToMessengerUser(toAppUserId, {
-                            type: 'chat-typing',
-                            fromAppUserId,
-                            isTyping: !!data.isTyping,
-                            createdAt: Date.now()
-                        }, ws);
-                    }
-                    break;
-
                 case 'create':
                 case 'join':
                     currentRoom = data.roomId;
                     userName = data.userName;
                     const userAvatar = data.userAvatar || '';
                     const appUserId = typeof data.appUserId === 'string' ? data.appUserId.trim().slice(0, 80) : '';
-                    if (appUserId) {
-                        upsertMessengerProfile(appUserId, userName, userAvatar, '');
-                    }
                     const isCreating = data.type === 'create';
                     const privateRoomRequested = !!data.privateRoom;
                     const friendCallModeRequested = !!data.friendCallMode;
@@ -1063,7 +800,6 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         if (ws.__superseded) return;
-        unregisterMessengerSocket(ws);
         const roomToLeave = currentRoom;
         currentRoom = null;
         const participantId = ws.__participantId || clientId;
