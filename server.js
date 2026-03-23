@@ -163,6 +163,14 @@ function findParticipantIdByReconnectKey(room, reconnectKey) {
     return null;
 }
 
+function isInvitedFriendForRoom(room, appUserId) {
+    if (!room || !room.isFriendCall) return false;
+    const invited = typeof room.friendTargetAppUserId === 'string' ? room.friendTargetAppUserId.trim() : '';
+    const current = typeof appUserId === 'string' ? appUserId.trim() : '';
+    if (!invited || !current) return false;
+    return invited === current;
+}
+
 function assignOwner(room, preferredOwnerId = null) {
     const prevOwnerId = room.ownerId || null;
     if (preferredOwnerId && room.participants.has(preferredOwnerId)) {
@@ -238,6 +246,8 @@ wss.on('connection', (ws) => {
                     const appUserId = typeof data.appUserId === 'string' ? data.appUserId.trim().slice(0, 80) : '';
                     const isCreating = data.type === 'create';
                     const privateRoomRequested = !!data.privateRoom;
+                    const friendCallModeRequested = !!data.friendCallMode;
+                    const friendTargetAppUserId = typeof data.friendTargetAppUserId === 'string' ? data.friendTargetAppUserId.trim().slice(0, 80) : '';
                     const reconnectKey = typeof data.reconnectKey === 'string' ? data.reconnectKey.trim().slice(0, 160) : '';
 
                     if (!currentRoom || typeof currentRoom !== 'string') {
@@ -246,7 +256,20 @@ wss.on('connection', (ws) => {
                     }
 
                     if (!rooms.has(currentRoom)) {
-                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), joinRequests: new Map(), ownerId: null, watchParty: null, isPrivate: privateRoomRequested });
+                        if (!isCreating) {
+                            safeSend(ws, { type: 'error', message: 'Такой комнаты не существует' });
+                            return;
+                        }
+                        rooms.set(currentRoom, {
+                            id: currentRoom,
+                            participants: new Map(),
+                            joinRequests: new Map(),
+                            ownerId: null,
+                            watchParty: null,
+                            isPrivate: privateRoomRequested,
+                            isFriendCall: friendCallModeRequested,
+                            friendTargetAppUserId
+                        });
                     }
                     const room = rooms.get(currentRoom);
                     const reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
@@ -255,26 +278,34 @@ wss.on('connection', (ws) => {
                         return;
                     }
                     if (!isCreating && room.isPrivate && room.participants.size > 0 && !reconnectTargetId) {
-                        const request = {
-                            id: clientId,
-                            ws,
-                            userName,
-                            userAvatar,
-                            appUserId,
-                            reconnectKey,
-                            requestedAt: Date.now()
-                        };
-                        room.joinRequests.set(clientId, request);
-                        safeSend(ws, {
-                            type: 'join-pending',
-                            roomId: currentRoom
-                        });
-                        broadcastJoinRequestToModerators(room, {
-                            type: 'join-request',
-                            roomId: currentRoom,
-                            request: serializeJoinRequest(request)
-                        });
-                        return;
+                        const invitedFriend = isInvitedFriendForRoom(room, appUserId);
+                        if (room.isFriendCall && !invitedFriend) {
+                            safeSend(ws, { type: 'error', message: 'Комната закрыта' });
+                            return;
+                        }
+                        const shouldQueueJoinRequest = !room.isFriendCall || !invitedFriend;
+                        if (shouldQueueJoinRequest) {
+                            const request = {
+                                id: clientId,
+                                ws,
+                                userName,
+                                userAvatar,
+                                appUserId,
+                                reconnectKey,
+                                requestedAt: Date.now()
+                            };
+                            room.joinRequests.set(clientId, request);
+                            safeSend(ws, {
+                                type: 'join-pending',
+                                roomId: currentRoom
+                            });
+                            broadcastJoinRequestToModerators(room, {
+                                type: 'join-request',
+                                roomId: currentRoom,
+                                request: serializeJoinRequest(request)
+                            });
+                            return;
+                        }
                     }
 
                     if (reconnectTargetId && room.participants.has(reconnectTargetId)) {
@@ -723,6 +754,10 @@ function handleDisconnect(clientId, roomId) {
     const shouldStopWatch = room.watchParty && room.watchParty.ownerId === clientId;
     if (shouldStopWatch) {
         room.watchParty = null;
+    }
+    if (room.isFriendCall) {
+        closeRoom(room, clientId, participant.userName || '');
+        return;
     }
     
     if (room.participants.size === 0) {
