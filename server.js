@@ -237,6 +237,7 @@ wss.on('connection', (ws) => {
                     const userAvatar = data.userAvatar || '';
                     const appUserId = typeof data.appUserId === 'string' ? data.appUserId.trim().slice(0, 80) : '';
                     const isCreating = data.type === 'create';
+                    const privateRoomRequested = !!data.privateRoom;
                     const reconnectKey = typeof data.reconnectKey === 'string' ? data.reconnectKey.trim().slice(0, 160) : '';
 
                     if (!currentRoom || typeof currentRoom !== 'string') {
@@ -245,7 +246,7 @@ wss.on('connection', (ws) => {
                     }
 
                     if (!rooms.has(currentRoom)) {
-                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), joinRequests: new Map(), ownerId: null, watchParty: null, isPrivate: false });
+                        rooms.set(currentRoom, { id: currentRoom, participants: new Map(), joinRequests: new Map(), ownerId: null, watchParty: null, isPrivate: privateRoomRequested });
                     }
                     const room = rooms.get(currentRoom);
                     const reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
