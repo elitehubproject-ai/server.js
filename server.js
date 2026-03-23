@@ -91,6 +91,7 @@ function serializeParticipant(id, participant) {
         id,
         userName: participant.userName,
         userAvatar: participant.userAvatar || '',
+        appUserId: participant.appUserId || '',
         video: !!participant.video,
         audio: !!participant.audio,
         screen: !!participant.screen,
@@ -234,6 +235,7 @@ wss.on('connection', (ws) => {
                     currentRoom = data.roomId;
                     userName = data.userName;
                     const userAvatar = data.userAvatar || '';
+                    const appUserId = typeof data.appUserId === 'string' ? data.appUserId.trim().slice(0, 80) : '';
                     const isCreating = data.type === 'create';
                     const reconnectKey = typeof data.reconnectKey === 'string' ? data.reconnectKey.trim().slice(0, 160) : '';
 
@@ -257,6 +259,7 @@ wss.on('connection', (ws) => {
                             ws,
                             userName,
                             userAvatar,
+                            appUserId,
                             reconnectKey,
                             requestedAt: Date.now()
                         };
@@ -281,6 +284,7 @@ wss.on('connection', (ws) => {
                             ws,
                             userName,
                             userAvatar,
+                            appUserId: appUserId || existing?.appUserId || '',
                             reconnectKey: reconnectKey || existing?.reconnectKey || ''
                         };
                         room.participants.set(reconnectTargetId, participantInfo);
@@ -308,6 +312,7 @@ wss.on('connection', (ws) => {
                         ws,
                         userName,
                         userAvatar,
+                        appUserId,
                         video: false,
                         audio: true,
                         screen: false,
@@ -428,6 +433,7 @@ wss.on('connection', (ws) => {
 
                 case 'request-video':
                 case 'request-audio':
+                case 'friend-request':
                 case 'force-video-off':
                 case 'force-audio-off':
                 case 'make-admin':
@@ -492,6 +498,7 @@ wss.on('connection', (ws) => {
                                 ws: request.ws,
                                 userName: request.userName,
                                 userAvatar: request.userAvatar || '',
+                                appUserId: request.appUserId || '',
                                 video: false,
                                 audio: true,
                                 screen: false,
