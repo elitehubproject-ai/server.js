@@ -440,6 +440,7 @@ function setUserOffline(appUserId) {
             await messengerMysql.setUserOnlineFlags(userId, false);
             const p = await messengerMysql.getProfile(userId);
             if (p) messengerProfileMem.set(userId, p);
+            broadcastMessengerPresence(userId, false, p?.lastSeenAt || Date.now());
             return;
         }
         const chatsDb = loadChatsDb();
@@ -448,6 +449,7 @@ function setUserOffline(appUserId) {
         chatsDb.users[userId].online = false;
         chatsDb.users[userId].lastSeenAt = Date.now();
         saveChatsDb(chatsDb);
+        broadcastMessengerPresence(userId, false, chatsDb.users[userId].lastSeenAt);
     })();
 }
 
@@ -530,6 +532,39 @@ function composeHintFromGate(gate) {
     if (gate.code === 'policy') return 'Пользователь ограничил личные сообщения';
     if (gate.code === 'friends') return 'Пользователь принимает сообщения только от друзей';
     return 'Вы не можете отправить сообщение этому пользователю';
+}
+
+/** Звонок другу: сначала те же ограничения, что и на ЛС (ЧС + who_can_write), затем who_can_call. */
+function outgoingCallGate(fromUserId, toUserId) {
+    const dm = directMessageGate(fromUserId, toUserId);
+    if (!dm.ok) return dm;
+    const toId = normalizeAccountId(toUserId);
+    const toP = getUserProfile(toId);
+    if (!toP) return { ok: true, code: 'ok' };
+    const policy = toP.privacy?.canCall || 'all';
+    if (policy === 'all') return { ok: true, code: 'ok' };
+    if (policy === 'nobody') return { ok: false, code: 'call_policy' };
+    if (!areFriendsForMessenger(fromUserId, toId)) return { ok: false, code: 'call_friends' };
+    return { ok: true, code: 'ok' };
+}
+
+function composeCallHintFromGate(gate) {
+    if (!gate || gate.ok) return '';
+    if (gate.code === 'blocked') return 'Невозможно позвонить этому пользователю';
+    if (gate.code === 'policy' || gate.code === 'friends') return composeHintFromGate(gate);
+    if (gate.code === 'call_policy') return 'Пользователь отключил входящие звонки';
+    if (gate.code === 'call_friends') return 'Пользователь принимает звонки только от друзей';
+    return 'Невозможно совершить звонок';
+}
+
+function broadcastMessengerPresence(userId, online, lastSeenAt) {
+    const id = normalizeAccountId(userId);
+    if (!id) return;
+    const ts = Number(lastSeenAt) || Date.now();
+    const payload = { type: 'messenger-presence', userId: id, online: !!online, lastSeenAt: ts };
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) safeSend(client, payload);
+    });
 }
 
 function canUserWriteTo(fromUserId, toUserId) {
@@ -1099,6 +1134,7 @@ wss.on('connection', (ws) => {
                                 upsertUserPresenceProfileJson(accountId, patch);
                             }
                             emitMessengerSync(accountId, 'init');
+                            broadcastMessengerPresence(accountId, true, Date.now());
                         })();
                     }
                     break;
@@ -1207,19 +1243,39 @@ wss.on('connection', (ws) => {
                             const text = normalizeText(data.text, 4000);
                             const audioRaw = typeof data.audioBase64 === 'string' ? data.audioBase64 : '';
                             const audioBase64 = audioRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
+                            const imageRaw = typeof data.imageBase64 === 'string' ? data.imageBase64 : '';
+                            const imageBase64 = imageRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
+                            const videoRaw = typeof data.videoBase64 === 'string' ? data.videoBase64 : '';
+                            const videoBase64 = videoRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
                             const isVoice = audioBase64.length > 32 && (data.messageKind === 'voice' || !!data.audioBase64);
-                            if (!text && !isVoice) return;
+                            const isImage = imageBase64.length > 80 && data.messageKind === 'image';
+                            const isVideo = videoBase64.length > 80 && data.messageKind === 'video';
+                            if (!text && !isVoice && !isImage && !isVideo) return;
                             const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
                             const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav)$/i.test(mimeRaw) ? mimeRaw.slice(0, 80) : 'audio/webm';
+                            const videoMimeRaw = typeof data.videoMime === 'string' ? data.videoMime : 'video/mp4';
+                            const videoMime = /^video\/(webm|mp4|quicktime|ogg)$/i.test(videoMimeRaw) ? videoMimeRaw.slice(0, 80) : 'video/mp4';
+                            let messageKind = 'text';
+                            if (isVoice) messageKind = 'voice';
+                            else if (isImage) messageKind = 'image';
+                            else if (isVideo) messageKind = 'video';
                             const message = {
                                 id: `msg_${uuidv4()}`,
                                 chatId: chat.id,
                                 fromId: currentAppUserId,
                                 toId: toUserId,
-                                text: text || (isVoice ? 'Голосовое сообщение' : ''),
-                                messageKind: isVoice ? 'voice' : 'text',
+                                text:
+                                    text ||
+                                    (isVoice ? 'Голосовое сообщение' : '') ||
+                                    (isImage ? '📷 Фото' : '') ||
+                                    (isVideo ? '🎬 Видео' : '') ||
+                                    '',
+                                messageKind,
                                 audioMime: isVoice ? audioMime : '',
                                 audioBase64: isVoice ? audioBase64 : '',
+                                imageBase64: isImage ? imageBase64 : '',
+                                videoBase64: isVideo ? videoBase64 : '',
+                                videoMime: isVideo ? videoMime : '',
                                 durationMs: isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0,
                                 createdAt: Date.now(),
                                 editedAt: 0,
@@ -1337,23 +1393,27 @@ wss.on('connection', (ws) => {
                                 await mysqlBoot;
                             } catch (_) {}
                             let row;
+                            let chatId = '';
                             if (messengerMysql.isEnabled()) {
                                 row = await messengerMysql.getMessageById(messageId);
                                 if (!row || row.fromId !== currentAppUserId || row.deletedAt) return;
-                                await messengerMysql.updateMessageFields(messageId, { deletedAt: Date.now() });
+                                chatId = row.chatId;
+                                await messengerMysql.deleteMessageByIdHard(messageId);
                             } else {
                                 const messagesDb = loadMessagesDb();
-                                row = messagesDb.messages.find((item) => item.id === messageId);
+                                const idx = messagesDb.messages.findIndex((item) => item.id === messageId);
+                                row = messagesDb.messages[idx];
                                 if (!row || row.fromId !== currentAppUserId || row.deletedAt) return;
-                                row.deletedAt = Date.now();
+                                chatId = row.chatId;
+                                messagesDb.messages.splice(idx, 1);
                                 saveMessagesDb(messagesDb);
                             }
                             const chat = messengerMysql.isEnabled()
-                                ? await messengerMysql.getChatById(row.chatId)
-                                : findChatById(row.chatId);
+                                ? await messengerMysql.getChatById(chatId)
+                                : findChatById(chatId);
                             if (!chat) return;
                             const peerId = chat.members.find((item) => item !== currentAppUserId) || '';
-                            const payload = { type: 'messenger-message-deleted', chatId: row.chatId, messageId };
+                            const payload = { type: 'messenger-message-deleted', chatId, messageId };
                             sendToUserSessions(currentAppUserId, payload);
                             if (peerId) sendToUserSessions(peerId, payload);
                         })();
@@ -1528,6 +1588,14 @@ wss.on('connection', (ws) => {
                         return;
                     }
 
+                    if (isCreating && friendCallModeRequested && friendTargetAppUserId) {
+                        const cg = outgoingCallGate(appUserId, friendTargetAppUserId);
+                        if (!cg.ok) {
+                            safeSend(ws, { type: 'error', message: composeCallHintFromGate(cg) });
+                            return;
+                        }
+                    }
+
                     if (!rooms.has(currentRoom)) {
                         if (!isCreating) {
                             safeSend(ws, { type: 'error', message: 'Такой комнаты не существует' });
@@ -1546,6 +1614,17 @@ wss.on('connection', (ws) => {
                     }
                     const room = rooms.get(currentRoom);
                     const reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
+                    if (!isCreating && room.isFriendCall && isInvitedFriendForRoom(room, appUserId) && !reconnectTargetId) {
+                        const ownerPart = room.ownerId ? room.participants.get(room.ownerId) : null;
+                        const callerAid = normalizeAccountId(ownerPart?.appUserId || '');
+                        if (callerAid) {
+                            const cg = outgoingCallGate(callerAid, appUserId);
+                            if (!cg.ok) {
+                                safeSend(ws, { type: 'error', message: composeCallHintFromGate(cg) });
+                                return;
+                            }
+                        }
+                    }
                     if (isCreating && room.participants.size > 0 && !reconnectTargetId) {
                         safeSend(ws, { type: 'error', message: 'Комната уже используется' });
                         return;
