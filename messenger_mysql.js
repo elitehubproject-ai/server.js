@@ -5,9 +5,91 @@ const mysql = require('mysql2/promise');
 let pool = null;
 let enabled = false;
 
+/** Как в bot.js: Render кладёт значения в process.env.* — читаем напрямую, с trim. */
 function env(name, def = '') {
   const v = process.env[name];
-  return v != null && String(v).length ? String(v) : def;
+  if (v == null) return def;
+  const t = String(v).trim();
+  return t.length ? t : def;
+}
+
+/**
+ * Парсинг URL вида mysql://user:pass@host:3306/dbname?ssl=true
+ * (Railway, PlanetScale, часть хостингов; на Render можно задать одной строкой).
+ */
+function tryParseMysqlConnectionUrl(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!/^mysql2?:\/\//i.test(s)) return null;
+  try {
+    const normalized = s.replace(/^mysql2:/i, 'mysql:');
+    const u = new URL(normalized);
+    const database = decodeURIComponent((u.pathname || '').replace(/^\//, '').split('?')[0] || '');
+    if (!database) return null;
+    const user = decodeURIComponent(u.username || '');
+    const password = u.password ? decodeURIComponent(u.password) : '';
+    const host = u.hostname || '127.0.0.1';
+    const port = u.port ? parseInt(u.port, 10) : 3306;
+    const sp = u.searchParams;
+    const sslFromUrl =
+      sp.get('ssl') === 'true' ||
+      sp.get('ssl') === '1' ||
+      String(sp.get('sslmode') || '').toUpperCase() === 'REQUIRED';
+    return { host, port, user, password, database, sslFromUrl };
+  } catch {
+    return null;
+  }
+}
+
+/** Собираем конфиг: сначала явные DB_*, иначе mysql:// URL из переменных окружения. */
+function resolveMysqlPoolConfig() {
+  const urlCandidates = [
+    env('MYSQL_DATABASE_URL'),
+    env('MYSQL_URL'),
+    env('DATABASE_URL')
+  ].filter(Boolean);
+  let fromUrl = null;
+  for (const c of urlCandidates) {
+    fromUrl = tryParseMysqlConnectionUrl(c);
+    if (fromUrl) break;
+  }
+
+  let database = env('DB_NAME') || env('MYSQL_DATABASE', '');
+  let host = env('DB_HOST') || env('MYSQL_HOST', '127.0.0.1');
+  let port = Number(env('DB_PORT') || env('MYSQL_PORT', '3306')) || 3306;
+  let user = env('DB_USER') || env('MYSQL_USER', 'root');
+  let password = env('DB_PASSWORD') || env('MYSQL_PASSWORD', '');
+  let sslHint = false;
+
+  if (fromUrl) {
+    database = fromUrl.database;
+    host = fromUrl.host;
+    port = fromUrl.port;
+    user = fromUrl.user;
+    password = fromUrl.password;
+    sslHint = fromUrl.sslFromUrl;
+  }
+
+  const wantSsl =
+    sslHint ||
+    env('DB_SSL') === '1' ||
+    env('MYSQL_SSL') === '1' ||
+    String(env('MYSQL_ATTR_SSL_CA', '')).length > 0;
+
+  let ssl = undefined;
+  if (wantSsl) {
+    ssl = { rejectUnauthorized: env('DB_SSL_REJECT_UNAUTHORIZED') !== '0' };
+  }
+
+  return {
+    database: database.replace(/`/g, ''),
+    host,
+    port,
+    user,
+    password,
+    ssl,
+    connectTimeout: Number(env('DB_CONNECT_TIMEOUT_MS', '20000')) || 20000
+  };
 }
 
 function sortedPair(a, b) {
@@ -87,20 +169,24 @@ async function ensureTables() {
 }
 
 async function initMessengerMysql() {
-  const database = env('DB_NAME') || env('MYSQL_DATABASE', '');
-  if (!database) {
-    console.warn('[messenger_mysql] DB_NAME / MYSQL_DATABASE not set — messenger DB disabled');
+  const cfg = resolveMysqlPoolConfig();
+  if (!cfg.database) {
+    console.warn('[messenger_mysql] DB_NAME / MYSQL_DATABASE / mysql:// URL not set — messenger DB disabled');
     return false;
   }
-  const host = env('DB_HOST') || env('MYSQL_HOST', '127.0.0.1');
-  const port = Number(env('DB_PORT') || env('MYSQL_PORT', '3306')) || 3306;
-  const user = env('DB_USER') || env('MYSQL_USER', 'root');
-  const password = env('DB_PASSWORD') || env('MYSQL_PASSWORD', '');
-  const safeDb = database.replace(/`/g, '');
+  const safeDb = cfg.database;
   const allowCreateDb = env('MESSENGER_CREATE_DATABASE', '') === '1';
+  const baseOpts = {
+    host: cfg.host,
+    port: cfg.port,
+    user: cfg.user,
+    password: cfg.password,
+    connectTimeout: cfg.connectTimeout,
+    ssl: cfg.ssl
+  };
   try {
     if (allowCreateDb) {
-      const admin = await mysql.createConnection({ host, port, user, password });
+      const admin = await mysql.createConnection(baseOpts);
       await admin.query(
         `CREATE DATABASE IF NOT EXISTS \`${safeDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
       );
@@ -108,23 +194,45 @@ async function initMessengerMysql() {
     }
 
     pool = mysql.createPool({
-      host,
-      port,
-      user,
-      password,
+      ...baseOpts,
       database: safeDb,
       waitForConnections: true,
       connectionLimit: 10,
       namedPlaceholders: true,
       charset: 'utf8mb4',
+      enableKeepAlive: true
     });
     await pool.query('SELECT 1');
     await ensureTables();
     enabled = true;
-    console.log('[messenger_mysql] connected:', host, safeDb);
+    console.log(
+      '[messenger_mysql] connected:',
+      cfg.host + ':' + cfg.port,
+      safeDb,
+      cfg.ssl ? '(SSL)' : ''
+    );
     return true;
   } catch (err) {
-    console.error('[messenger_mysql] init failed:', err && err.message);
+    const code = err && err.code ? String(err.code) : '';
+    const hostShown = cfg.host || '(no host)';
+    console.error('[messenger_mysql] init failed:', err && err.message, code ? `code=${code}` : '');
+    console.error('[messenger_mysql] tried host:', hostShown, 'port:', cfg.port);
+    if (code === 'ENOTFOUND' || (err && String(err.message || '').includes('ENOTFOUND'))) {
+      console.error(
+        '[messenger_mysql] ENOTFOUND: DNS не находит этот хост. Скопируйте точное имя MySQL из панели хостинга (Control Panel → MySQL). Старые имена вида sql###.infinityfree.com иногда меняются.'
+      );
+      console.error(
+        '[messenger_mysql] Важно: бесплатный MySQL на InfinityFree обычно доступен только с их PHP-хостинга, не с внешних серверов (Render, VPS). Для Node.js на Render нужна БД с разрешённым удалённым доступом (PlanetScale, Railway MySQL, Aiven, VPS MySQL и т.д.).'
+      );
+    } else if (code === 'ECONNREFUSED') {
+      console.error('[messenger_mysql] ECONNREFUSED: порт закрыт или MySQL не принимает внешние подключения с этого IP.');
+    } else if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') {
+      console.error('[messenger_mysql] timeout: проверьте файрвол, whitelist IP Render в панели БД, или MYSQL_PORT.');
+    } else {
+      console.error(
+        '[messenger_mysql] hint: MYSQL_HOST / DB_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE; при необходимости MYSQL_SSL=1 или mysql:// URL'
+      );
+    }
     pool = null;
     enabled = false;
     return false;
