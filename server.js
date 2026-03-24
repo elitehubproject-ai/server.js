@@ -693,6 +693,13 @@ wss.on('connection', (ws) => {
                         if (!withUserId || withUserId === currentAppUserId) return;
                         const chat = getOrCreateDirectChat(currentAppUserId, withUserId);
                         if (!chat) return;
+                        const chatsDb = loadChatsDb();
+                        const chatIndex = chatsDb.chats.findIndex((item) => item.id === chat.id);
+                        if (chatIndex >= 0) {
+                            if (!chatsDb.chats[chatIndex].meta) chatsDb.chats[chatIndex].meta = { clearedBy: {}, removedBy: {}, blockedBy: {} };
+                            chatsDb.chats[chatIndex].meta.removedBy[currentAppUserId] = false;
+                            saveChatsDb(chatsDb);
+                        }
                         const messages = getChatMessagesForUser(chat.id, currentAppUserId, 250);
                         safeSend(ws, {
                             type: 'messenger-chat-history',
