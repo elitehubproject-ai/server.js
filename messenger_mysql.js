@@ -87,22 +87,25 @@ async function ensureTables() {
 }
 
 async function initMessengerMysql() {
-  const database = env('MYSQL_DATABASE', '');
+  const database = env('DB_NAME') || env('MYSQL_DATABASE', '');
   if (!database) {
-    console.warn('[messenger_mysql] MYSQL_DATABASE not set — messenger DB disabled');
+    console.warn('[messenger_mysql] DB_NAME / MYSQL_DATABASE not set — messenger DB disabled');
     return false;
   }
-  const host = env('MYSQL_HOST', '127.0.0.1');
-  const port = Number(env('MYSQL_PORT', '3306')) || 3306;
-  const user = env('MYSQL_USER', 'root');
-  const password = env('MYSQL_PASSWORD', '');
+  const host = env('DB_HOST') || env('MYSQL_HOST', '127.0.0.1');
+  const port = Number(env('DB_PORT') || env('MYSQL_PORT', '3306')) || 3306;
+  const user = env('DB_USER') || env('MYSQL_USER', 'root');
+  const password = env('DB_PASSWORD') || env('MYSQL_PASSWORD', '');
   const safeDb = database.replace(/`/g, '');
+  const allowCreateDb = env('MESSENGER_CREATE_DATABASE', '') === '1';
   try {
-    const admin = await mysql.createConnection({ host, port, user, password });
-    await admin.query(
-      `CREATE DATABASE IF NOT EXISTS \`${safeDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
-    );
-    await admin.end();
+    if (allowCreateDb) {
+      const admin = await mysql.createConnection({ host, port, user, password });
+      await admin.query(
+        `CREATE DATABASE IF NOT EXISTS \`${safeDb}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+      );
+      await admin.end();
+    }
 
     pool = mysql.createPool({
       host,
@@ -115,9 +118,10 @@ async function initMessengerMysql() {
       namedPlaceholders: true,
       charset: 'utf8mb4',
     });
+    await pool.query('SELECT 1');
     await ensureTables();
     enabled = true;
-    console.log('[messenger_mysql] connected:', safeDb);
+    console.log('[messenger_mysql] connected:', host, safeDb);
     return true;
   } catch (err) {
     console.error('[messenger_mysql] init failed:', err && err.message);
@@ -252,6 +256,16 @@ async function upsertSettings(userId, privacy) {
 async function listAllUserIds() {
   const [rows] = await pool.query('SELECT user_id FROM messenger_profiles');
   return rows.map((r) => r.user_id);
+}
+
+async function findDirectChat(a, b) {
+  const [u1, u2] = sortedPair(String(a), String(b));
+  const [rows] = await pool.query(
+    'SELECT id, user1_id, user2_id, last_message, updated_at, meta_json FROM chats WHERE user1_id = ? AND user2_id = ? LIMIT 1',
+    [u1, u2]
+  );
+  if (!rows[0]) return null;
+  return rowToChat(rows[0], u1, u2);
 }
 
 async function getOrCreateChat(a, b) {
@@ -481,6 +495,7 @@ module.exports = {
   upsertProfile,
   upsertSettings,
   listAllUserIds,
+  findDirectChat,
   getOrCreateChat,
   getChatById,
   loadChatMeta,
