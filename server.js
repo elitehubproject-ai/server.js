@@ -199,6 +199,27 @@ function getUserProfile(appUserId) {
     return chatsDb?.users?.[userId] || null;
 }
 
+function getUserProfileFromFriendsStore(targetUserId) {
+    const targetId = normalizeAccountId(targetUserId);
+    if (!targetId) return null;
+    const store = readJson(FRIENDS_STORE_PATH, { users: [] });
+    const list = Array.isArray(store?.users) ? store.users : [];
+    const row = list.find((u) => normalizeAccountId(u?.id) === targetId);
+    if (!row) return null;
+    return {
+        id: targetId,
+        name: normalizeText(row.name || '', 120) || targetId,
+        avatar: normalizeText(row.avatar || '', 1000),
+        username: normalizeUsername(row.username || ''),
+        statusText: '',
+        online: false,
+        lastSeenAt: 0,
+        blacklist: [],
+        blacklistMeta: {},
+        privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all' }
+    };
+}
+
 function areFriendsForMessenger(userA, userB) {
     const a = normalizeAccountId(userA);
     const b = normalizeAccountId(userB);
@@ -246,8 +267,26 @@ function canUserViewProfile(viewerUserId, targetUserId) {
 function buildProfileViewFor(viewerUserId, targetUserId) {
     const viewerId = normalizeAccountId(viewerUserId);
     const targetId = normalizeAccountId(targetUserId);
-    const target = getUserProfile(targetId);
-    if (!target) return { ok: false, reason: 'not-found' };
+    let target = getUserProfile(targetId);
+    if (!target) {
+        const fromFriends = getUserProfileFromFriendsStore(targetId);
+        if (fromFriends) target = fromFriends;
+    }
+    if (!target) {
+        return {
+            ok: true,
+            reason: 'minimal',
+            profile: {
+                id: targetId,
+                name: targetId,
+                avatar: '',
+                username: '',
+                statusText: '',
+                online: false,
+                lastSeenAt: 0
+            }
+        };
+    }
     const isBlocked = Array.isArray(target.blacklist) && target.blacklist.includes(viewerId);
     if (isBlocked) {
         return {
@@ -711,9 +750,10 @@ wss.on('connection', (ws) => {
                     }
                     break;
                 case 'messenger-send':
+                case 'sendMessage':
                     {
                         if (!currentAppUserId) return;
-                        const toUserId = normalizeAccountId(data.toUserId);
+                        const toUserId = normalizeAccountId(data.toUserId || data.to);
                         if (!toUserId || toUserId === currentAppUserId) return;
                         if (!canUserWriteTo(currentAppUserId, toUserId)) {
                             safeSend(ws, { type: 'messenger-error', code: 'write_forbidden', message: 'Пользователь ограничил личные сообщения' });
