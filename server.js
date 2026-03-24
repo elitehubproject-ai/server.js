@@ -17,26 +17,27 @@ const DEFAULT_ICE_SERVERS = [
     { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
 ];
 
-
+// ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 512 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
 const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
 const pendingDisconnects = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
-const messengerMysql = require('./messenger_mysql');
+const messengerMysql = require('./messenger_pg');
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
-    console.log('[messenger] storage backend:', ok ? 'mysql' : 'unavailable');
-    const needDb = !!(process.env.DB_NAME || process.env.MYSQL_DATABASE);
-    if (!ok && needDb) {
-        console.error('[messenger] FATAL: DB_NAME is set but MySQL connection failed. Fix DB_HOST / credentials.');
+    console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
+    const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
+    const needDb = !!e('DATABASE_URL');
+    const exitOnFail = e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1';
+    if (!ok && needDb && exitOnFail) {
         process.exit(1);
     }
     return ok;
 }).catch((err) => {
-    console.error('[messenger] mysql init error:', err && err.message);
-    const needDb = !!(process.env.DB_NAME || process.env.MYSQL_DATABASE);
-    if (needDb) process.exit(1);
+    const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
+    const needDb = !!e('DATABASE_URL');
+    if (needDb && e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1') process.exit(1);
     return false;
 });
 /** @type {Map<string, object>} */
@@ -44,13 +45,13 @@ const messengerProfileMem = new Map();
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
-
+// Health check сервер - тоже слушаем на 0.0.0.0
 const healthServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('WebSocket server is running');
 });
 
-
+// Используем другой порт для health check
 const HEALTH_PORT = parseInt(PORT) + 1;
 healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
 
@@ -592,7 +593,7 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
             reason,
             userId: id,
             chats: [],
-            messengerStorageError: 'mysql_unavailable'
+            messengerStorageError: 'storage_unavailable'
         });
         return;
     }
@@ -940,7 +941,7 @@ wss.on('connection', (ws) => {
                                 safeSend(ws, {
                                     type: 'messenger-error',
                                     code: 'storage_unavailable',
-                                    message: 'Messenger недоступен (нет MySQL)'
+                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
                                 });
                                 return;
                             }
@@ -992,7 +993,7 @@ wss.on('connection', (ws) => {
                                 safeSend(ws, {
                                     type: 'messenger-error',
                                     code: 'storage_unavailable',
-                                    message: 'Messenger недоступен (нет MySQL)'
+                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
                                 });
                                 return;
                             }
@@ -1833,7 +1834,8 @@ function handleDisconnect(clientId, roomId, options = {}) {
     finalizeParticipantDisconnect(clientId, roomId);
 }
 
-
+// ============ АВТО-ПИНГ ДЛЯ ПРЕДОТВРАЩЕНИЯ ЗАСЫПАНИЯ ============
+// Каждые 4 минуты пингуем сам себя, чтобы Render не уснул
 const keepAlive = () => {
     const http = require('http');
     const options = {
@@ -1849,12 +1851,12 @@ const keepAlive = () => {
     });
     
     req.on('error', (err) => {
-        
+        // Тишина, просто не пишем ошибки
     });
     
     req.end();
 };
 
-
+// Запускаем авто-пинг каждые 4 минуты
 setInterval(keepAlive, 4 * 60 * 1000);
 console.log('✅ Keep-alive enabled (ping every 4 minutes)');
