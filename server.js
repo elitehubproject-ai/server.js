@@ -26,7 +26,27 @@ const pendingDisconnects = new Map();
 const DATA_DIR = path.join(__dirname, 'data');
 const CHATS_DB_PATH = path.join(DATA_DIR, 'chats.json');
 const MESSAGES_DB_PATH = path.join(DATA_DIR, 'messages.json');
+const USERS_DB_PATH = path.join(DATA_DIR, 'users.json');
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
+
+function ensureMessengerDataFiles() {
+    try {
+        if (!fs.existsSync(DATA_DIR)) {
+            fs.mkdirSync(DATA_DIR, { recursive: true });
+        }
+        if (!fs.existsSync(CHATS_DB_PATH)) {
+            fs.writeFileSync(CHATS_DB_PATH, JSON.stringify({ chats: [] }, null, 2), 'utf8');
+        }
+        if (!fs.existsSync(MESSAGES_DB_PATH)) {
+            fs.writeFileSync(MESSAGES_DB_PATH, JSON.stringify({ messages: [] }, null, 2), 'utf8');
+        }
+        if (!fs.existsSync(USERS_DB_PATH)) {
+            fs.writeFileSync(USERS_DB_PATH, JSON.stringify({ users: {} }, null, 2), 'utf8');
+        }
+    } catch (err) {
+        console.error('[messenger] ensureMessengerDataFiles', err && err.message);
+    }
+}
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
@@ -87,10 +107,13 @@ function writeJson(filePath, value) {
     }
 }
 
+ensureMessengerDataFiles();
 ensureJsonFile(CHATS_DB_PATH, { chats: [] });
 ensureJsonFile(MESSAGES_DB_PATH, { messages: [] });
+ensureJsonFile(USERS_DB_PATH, { users: {} });
 console.log('[messenger] chats db:', CHATS_DB_PATH);
 console.log('[messenger] messages db:', MESSAGES_DB_PATH);
+console.log('[messenger] users db:', USERS_DB_PATH);
 console.log('[messenger] friends store:', FRIENDS_STORE_PATH);
 
 function normalizeAccountId(value) {
@@ -130,6 +153,82 @@ function saveChatsDb(db) {
 
 function saveMessagesDb(db) {
     return writeJson(MESSAGES_DB_PATH, db);
+}
+
+function loadUsersDb() {
+    const db = readJson(USERS_DB_PATH, { users: {} });
+    if (!db.users || typeof db.users !== 'object' || Array.isArray(db.users)) {
+        db.users = {};
+    }
+    return db;
+}
+
+function saveUsersDb(db) {
+    return writeJson(USERS_DB_PATH, db);
+}
+
+function computeUserInitials(name, accountId) {
+    const n = normalizeText(name || '', 120);
+    if (n) {
+        const parts = n.split(/\s+/).filter(Boolean);
+        if (parts.length >= 2) {
+            const a = parts[0].charAt(0);
+            const b = parts[1].charAt(0);
+            return `${a}${b}`.toUpperCase().replace(/[^A-ZА-ЯЁ0-9]/gi, '') || n.slice(0, 2).toUpperCase();
+        }
+        return n.slice(0, 2).toUpperCase();
+    }
+    const id = normalizeAccountId(accountId);
+    const alnum = id.replace(/[^a-zA-Z0-9]/g, '');
+    if (alnum.length >= 2) return alnum.slice(0, 2).toUpperCase();
+    if (id.length >= 2) return id.slice(0, 2).toUpperCase();
+    return id ? id.charAt(0).toUpperCase() : '·';
+}
+
+/**
+ * Единый объект пользователя для UI: имя/username/аватар из users.json + chats + friends_store.
+ */
+function getFormattedUser(userId) {
+    const id = normalizeAccountId(userId);
+    if (!id) {
+        return {
+            id: '',
+            name: '',
+            displayName: '',
+            username: '',
+            avatar: '',
+            initials: '·',
+            online: false,
+            lastSeenAt: 0,
+            statusText: ''
+        };
+    }
+    const usersFile = loadUsersDb();
+    const rowFile = usersFile.users[id] || {};
+    const chatsDb = loadChatsDb();
+    const rowChats = chatsDb?.users?.[id] || {};
+    const friends = getUserProfileFromFriendsStore(id);
+    const name = normalizeText(rowFile.name || rowChats.name || (friends && friends.name) || '', 120);
+    const username = normalizeUsername(rowFile.username || rowChats.username || (friends && friends.username) || '');
+    const avatar = normalizeText(rowFile.avatar || rowChats.avatar || (friends && friends.avatar) || '', 1000);
+    const statusText = normalizeText(rowChats.statusText || '', 160);
+    const online = !!rowChats.online;
+    const lastSeenAt = Number(rowChats.lastSeenAt || 0);
+    let displayName = name;
+    if (!displayName && username) displayName = `@${username}`;
+    if (!displayName) displayName = id;
+    const initials = computeUserInitials(name || username, id);
+    return {
+        id,
+        name: name || '',
+        displayName,
+        username,
+        avatar,
+        initials,
+        online,
+        lastSeenAt,
+        statusText
+    };
 }
 
 /** Все сообщения из JSON (после перезапуска сервера остаются на диске). */
@@ -189,7 +288,7 @@ function upsertUserPresenceProfile(appUserId, profile) {
     chatsDb.users[userId] = {
         ...prev,
         id: userId,
-        name: normalizeText(profile?.name || prev.name || 'Пользователь', 120),
+        name: normalizeText(profile?.name || prev.name || '', 120),
         avatar: normalizeText(profile?.avatar || prev.avatar || '', 1000),
         username: normalizeUsername(profile?.username || prev.username || ''),
         statusText: normalizeText(profile?.statusText || prev.statusText || '', 160),
@@ -205,6 +304,17 @@ function upsertUserPresenceProfile(appUserId, profile) {
         friendIds: Array.isArray(profile?.friendIds) ? profile.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean) : (Array.isArray(prev.friendIds) ? prev.friendIds : [])
     };
     saveChatsDb(chatsDb);
+    const pu = chatsDb.users[userId];
+    const udb = loadUsersDb();
+    udb.users[userId] = {
+        ...(udb.users[userId] || {}),
+        id: userId,
+        name: (pu && pu.name) || '',
+        username: (pu && pu.username) || '',
+        avatar: (pu && pu.avatar) || '',
+        updatedAt: Date.now()
+    };
+    saveUsersDb(udb);
 }
 
 function setUserOffline(appUserId) {
@@ -331,6 +441,8 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
             profile: {
                 id: targetId,
                 name: targetId,
+                displayName: targetId,
+                initials: computeUserInitials('', targetId),
                 avatar: '',
                 username: '',
                 statusText: '',
@@ -341,15 +453,18 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
     }
     const isBlocked = Array.isArray(target.blacklist) && target.blacklist.includes(viewerId);
     if (isBlocked) {
+        const fmtB = getFormattedUser(targetId);
         return {
             ok: false,
             reason: 'blocked',
             profile: {
                 id: targetId,
-                name: 'Вас заблокировал пользователь',
-                avatar: '',
-                username: '',
-                statusText: target.blacklistMeta?.[viewerId] || 'Возможно, вы его сильно обидели.',
+                name: fmtB.displayName,
+                displayName: fmtB.displayName,
+                initials: fmtB.initials,
+                avatar: fmtB.avatar,
+                username: fmtB.username,
+                statusText: target.blacklistMeta?.[viewerId] || 'Вас заблокировал этот аккаунт.',
                 online: !!target.online
             }
         };
@@ -368,14 +483,17 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
             }
         };
     }
+    const fmt = getFormattedUser(targetId);
     return {
         ok: true,
         reason: 'ok',
         profile: {
-            id: target.id,
-            name: target.name || 'Пользователь',
-            avatar: target.avatar || '',
-            username: target.username || '',
+            id: fmt.id,
+            name: fmt.displayName,
+            displayName: fmt.displayName,
+            initials: fmt.initials,
+            avatar: fmt.avatar,
+            username: fmt.username,
             statusText: target.statusText || '',
             online: !!target.online,
             lastSeenAt: Number(target.lastSeenAt || 0)
@@ -402,7 +520,7 @@ function buildChatListForUser(appUserId) {
     const all = chatsDb.chats.filter((chat) => Array.isArray(chat.members) && chat.members.includes(userId));
     return all.map((chat) => {
         const peerId = chat.members.find((item) => item !== userId) || userId;
-        const peer = chatsDb?.users?.[peerId] || { id: peerId, name: 'Пользователь', avatar: '', username: '', online: false };
+        const fmt = getFormattedUser(peerId);
         const removed = !!chat.meta?.removedBy?.[userId];
         if (removed) return null;
         const clearedAt = Number(chat.meta?.clearedBy?.[userId] || 0);
@@ -413,13 +531,15 @@ function buildChatListForUser(appUserId) {
             id: chat.id,
             kind: chat.kind || 'direct',
             peer: {
-                id: peer.id,
-                name: peer.name || 'Пользователь',
-                avatar: peer.avatar || '',
-                username: peer.username || '',
-                statusText: peer.statusText || '',
-                online: !!peer.online,
-                lastSeenAt: Number(peer.lastSeenAt || 0)
+                id: fmt.id,
+                name: fmt.name,
+                displayName: fmt.displayName,
+                initials: fmt.initials,
+                avatar: fmt.avatar,
+                username: fmt.username,
+                statusText: fmt.statusText || '',
+                online: !!fmt.online,
+                lastSeenAt: Number(fmt.lastSeenAt || 0)
             },
             updatedAt: Number(chat.updatedAt || chat.createdAt || Date.now()),
             lastMessage: lastMessage ? {
@@ -765,7 +885,7 @@ wss.on('connection', (ws) => {
                         ws.__appUserId = accountId;
                         registerUserSession(accountId, ws);
                         upsertUserPresenceProfile(accountId, {
-                            name: data.userName || data.name || 'Пользователь',
+                            name: data.userName || data.name || '',
                             avatar: data.userAvatar || data.avatar || '',
                             username: data.username || '',
                             statusText: data.statusText || '',
