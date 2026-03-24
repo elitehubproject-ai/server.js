@@ -167,16 +167,38 @@ function persistMessengerStore() {
 }
 
 function getFriendsStore() {
-    const parsed = readJsonFile(FRIENDS_STORE_PATH, { friends: [] });
-    const list = Array.isArray(parsed.friends) ? parsed.friends : [];
-    return list;
+    const parsed = readJsonFile(FRIENDS_STORE_PATH, { friends: [], users: [] });
+    return {
+        friends: Array.isArray(parsed.friends) ? parsed.friends : [],
+        users: Array.isArray(parsed.users) ? parsed.users : []
+    };
+}
+
+function syncUsersFromFriendsStore() {
+    const source = getFriendsStore();
+    const users = Array.isArray(source.users) ? source.users : [];
+    let changed = false;
+    users.forEach((row) => {
+        const uid = normalizeUserId(row?.id);
+        if (!uid) return;
+        const before = messengerStore.users[uid] ? JSON.stringify(messengerStore.users[uid]) : '';
+        ensureMessengerUser(uid, {
+            name: row?.name || '',
+            avatar: row?.avatar || '',
+            username: row?.username || ''
+        });
+        const after = messengerStore.users[uid] ? JSON.stringify(messengerStore.users[uid]) : '';
+        if (before !== after) changed = true;
+    });
+    return changed;
 }
 
 function areFriendsByUserId(firstId, secondId) {
     const a = normalizeUserId(firstId);
     const b = normalizeUserId(secondId);
     if (!a || !b || a === b) return false;
-    const friends = getFriendsStore();
+    const friendsStore = getFriendsStore();
+    const friends = Array.isArray(friendsStore.friends) ? friendsStore.friends : [];
     return friends.some((row) => {
         const left = normalizeUserId(row?.a);
         const right = normalizeUserId(row?.b);
@@ -759,6 +781,10 @@ wss.on('connection', (ws) => {
                             status: data.status || ''
                         });
                         subscribeMessengerSocket(authUserId, ws);
+                        const usersSynced = syncUsersFromFriendsStore();
+                        if (usersSynced) {
+                            persistMessengerStore();
+                        }
                         persistMessengerStore();
                         safeSend(ws, {
                             type: 'messenger-auth-ok',
@@ -775,6 +801,9 @@ wss.on('connection', (ws) => {
                         const syncUserId = normalizeUserId(data.appUserId || ws.__messengerUserId || '');
                         if (!syncUserId) return;
                         ensureMessengerUser(syncUserId, {});
+                        if (syncUsersFromFriendsStore()) {
+                            persistMessengerStore();
+                        }
                         persistMessengerStore();
                         safeSend(ws, {
                             type: 'messenger-state',
@@ -789,6 +818,9 @@ wss.on('connection', (ws) => {
                         const query = normalizeText(data.query || '', 80).toLowerCase();
                         if (!searchUserId) return;
                         ensureMessengerUser(searchUserId, {});
+                        if (syncUsersFromFriendsStore()) {
+                            persistMessengerStore();
+                        }
                         const results = [];
                         if (query) {
                             Object.keys(messengerStore.users).forEach((uid) => {
@@ -824,6 +856,9 @@ wss.on('connection', (ws) => {
                         const targetId = normalizeUserId(data.targetId || '');
                         let chatId = normalizeUserId(data.chatId || '');
                         if (!actorId) return;
+                        if (syncUsersFromFriendsStore()) {
+                            persistMessengerStore();
+                        }
                         ensureMessengerUser(actorId, {});
                         if (!chatId && targetId) {
                             ensureMessengerUser(targetId, {});
@@ -857,6 +892,9 @@ wss.on('connection', (ws) => {
                         const replyToId = normalizeText(data.replyToId || '', 80);
                         const forwardedFromId = normalizeText(data.forwardedFromId || '', 80);
                         if (!actorId) return;
+                        if (syncUsersFromFriendsStore()) {
+                            persistMessengerStore();
+                        }
                         ensureMessengerUser(actorId, {});
                         if (!chatId && targetId) {
                             ensureMessengerUser(targetId, {});
@@ -1045,6 +1083,9 @@ wss.on('connection', (ws) => {
                         const actorId = normalizeUserId(data.appUserId || ws.__messengerUserId || '');
                         const targetId = normalizeUserId(data.targetId || actorId);
                         if (!actorId || !targetId) return;
+                        if (syncUsersFromFriendsStore()) {
+                            persistMessengerStore();
+                        }
                         ensureMessengerUser(actorId, {});
                         ensureMessengerUser(targetId, {});
                         const blockedByTarget = getBlockRecord(targetId, actorId);
