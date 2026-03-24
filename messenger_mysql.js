@@ -70,7 +70,7 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS messenger_profiles (
       user_id VARCHAR(120) NOT NULL PRIMARY KEY,
       display_name VARCHAR(200) NOT NULL DEFAULT '',
-      avatar_url VARCHAR(2000) NOT NULL DEFAULT '',
+      avatar_url MEDIUMTEXT NOT NULL,
       username VARCHAR(64) NOT NULL DEFAULT '',
       status_text VARCHAR(200) NOT NULL DEFAULT '',
       blacklist_json JSON NULL,
@@ -81,6 +81,9 @@ async function ensureTables() {
       updated_at BIGINT NOT NULL DEFAULT 0
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  try {
+    await pool.query('ALTER TABLE messenger_profiles MODIFY COLUMN avatar_url MEDIUMTEXT NOT NULL');
+  } catch (_) {}
 }
 
 async function initMessengerMysql() {
@@ -321,6 +324,7 @@ function rowToMessage(row) {
   const dbType = row.type;
   const isVoice = dbType === 'audio';
   const isImage = dbType === 'image';
+  const isVideo = dbType === 'video';
   const createdAt = Number(row.created_at) || 0;
   const base = {
     id: row.id,
@@ -329,7 +333,7 @@ function rowToMessage(row) {
     toId: row.to_id,
     createdAt,
     text: row.text || '',
-    messageKind: isVoice ? 'voice' : isImage ? 'image' : 'text',
+    messageKind: isVoice ? 'voice' : isImage ? 'image' : isVideo ? 'video' : 'text',
     replyTo: row.reply_to || '',
     forwardedFromMessageId: row.forwarded_from || '',
     editedAt: Number(row.edited_at) || 0,
@@ -347,6 +351,10 @@ function rowToMessage(row) {
   if (isImage) {
     base.imageBase64 = row.file_url || '';
   }
+  if (isVideo) {
+    base.videoBase64 = row.file_url || '';
+    base.videoMime = row.audio_mime || 'video/mp4';
+  }
   return base;
 }
 
@@ -354,8 +362,10 @@ async function insertMessage(msg) {
   const mk = msg.messageKind || msg.kind;
   const isVoice = mk === 'voice' || mk === 'audio';
   const isImage = mk === 'image';
-  const type = isVoice ? 'audio' : isImage ? 'image' : 'text';
-  const fileUrl = isVoice ? msg.audioBase64 || '' : isImage ? msg.imageBase64 || '' : '';
+  const isVideo = mk === 'video';
+  const type = isVoice ? 'audio' : isImage ? 'image' : isVideo ? 'video' : 'text';
+  const fileUrl = isVoice ? msg.audioBase64 || '' : isImage ? msg.imageBase64 || '' : isVideo ? msg.videoBase64 || '' : '';
+  const mimeCol = isVoice ? msg.audioMime || '' : isVideo ? msg.videoMime || 'video/mp4' : '';
   const createdAt = Number(msg.createdAt || msg.at || Date.now());
   await pool.query(
     `INSERT INTO messages (id, chat_id, from_id, to_id, text, type, file_url, duration_ms, audio_mime, reply_to, forwarded_from, created_at, edited_at, deleted_at)
@@ -369,7 +379,7 @@ async function insertMessage(msg) {
       type,
       fileUrl,
       msg.durationMs || 0,
-      msg.audioMime || '',
+      mimeCol,
       msg.replyTo || '',
       msg.forwardedFromMessageId || msg.forwardedFrom || '',
       createdAt,
@@ -401,6 +411,10 @@ async function listMessagesForChat(chatId, clearedAfterTs = 0, limit = 500) {
 async function getMessageById(id) {
   const [rows] = await pool.query('SELECT * FROM messages WHERE id = ? LIMIT 1', [id]);
   return rows[0] ? rowToMessage(rows[0]) : null;
+}
+
+async function deleteMessageByIdHard(id) {
+  await pool.query('DELETE FROM messages WHERE id = ?', [id]);
 }
 
 async function updateMessageFields(id, patch) {
@@ -476,6 +490,7 @@ module.exports = {
   listMessagesForChat,
   getLatestMessageInChatAfter,
   getMessageById,
+  deleteMessageByIdHard,
   updateMessageFields,
   listChatsForUser,
   deleteChatRow,
