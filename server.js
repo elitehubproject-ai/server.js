@@ -1,6 +1,8 @@
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const DEFAULT_ICE_SERVERS = [
@@ -18,8 +20,13 @@ const DEFAULT_ICE_SERVERS = [
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 512 * 1024 });
 const rooms = new Map();
+const userSessions = new Map();
 const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
 const pendingDisconnects = new Map();
+const DATA_DIR = path.join(__dirname, 'data');
+const CHATS_DB_PATH = path.join(DATA_DIR, 'chats.json');
+const MESSAGES_DB_PATH = path.join(DATA_DIR, 'messages.json');
+const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
@@ -38,6 +45,334 @@ function safeSend(ws, payload) {
     try {
         ws.send(JSON.stringify(payload));
     } catch (_) {}
+}
+
+function ensureJsonFile(filePath, fallback) {
+    try {
+        if (!fs.existsSync(DATA_DIR)) {
+            fs.mkdirSync(DATA_DIR, { recursive: true });
+        }
+        if (!fs.existsSync(filePath)) {
+            fs.writeFileSync(filePath, JSON.stringify(fallback, null, 2), 'utf8');
+            return;
+        }
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (typeof parsed === 'undefined' || parsed === null) {
+            fs.writeFileSync(filePath, JSON.stringify(fallback, null, 2), 'utf8');
+        }
+    } catch (_) {
+        try {
+            fs.writeFileSync(filePath, JSON.stringify(fallback, null, 2), 'utf8');
+        } catch (_) {}
+    }
+}
+
+function readJson(filePath, fallback) {
+    try {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        return parsed ?? fallback;
+    } catch (_) {
+        return fallback;
+    }
+}
+
+function writeJson(filePath, value) {
+    try {
+        fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8');
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+ensureJsonFile(CHATS_DB_PATH, { chats: [] });
+ensureJsonFile(MESSAGES_DB_PATH, { messages: [] });
+
+function normalizeAccountId(value) {
+    return typeof value === 'string' ? value.trim().slice(0, 120) : '';
+}
+
+function normalizeUsername(value) {
+    return typeof value === 'string' ? value.trim().replace(/^@+/, '').slice(0, 64) : '';
+}
+
+function normalizeText(value, max = 4000) {
+    if (typeof value !== 'string') return '';
+    return value.trim().slice(0, max);
+}
+
+function createDirectChatId(a, b) {
+    const pair = [normalizeAccountId(a), normalizeAccountId(b)].filter(Boolean).sort();
+    if (pair.length !== 2) return '';
+    return `dm:${pair[0]}::${pair[1]}`;
+}
+
+function loadChatsDb() {
+    const db = readJson(CHATS_DB_PATH, { chats: [] });
+    if (!Array.isArray(db.chats)) db.chats = [];
+    return db;
+}
+
+function loadMessagesDb() {
+    const db = readJson(MESSAGES_DB_PATH, { messages: [] });
+    if (!Array.isArray(db.messages)) db.messages = [];
+    return db;
+}
+
+function saveChatsDb(db) {
+    return writeJson(CHATS_DB_PATH, db);
+}
+
+function saveMessagesDb(db) {
+    return writeJson(MESSAGES_DB_PATH, db);
+}
+
+function findChatById(chatId) {
+    const chatsDb = loadChatsDb();
+    return chatsDb.chats.find((chat) => chat.id === chatId) || null;
+}
+
+function getOrCreateDirectChat(firstUserId, secondUserId) {
+    const a = normalizeAccountId(firstUserId);
+    const b = normalizeAccountId(secondUserId);
+    if (!a || !b || a === b) return null;
+    const chatId = createDirectChatId(a, b);
+    const chatsDb = loadChatsDb();
+    let chat = chatsDb.chats.find((item) => item.id === chatId);
+    if (!chat) {
+        chat = {
+            id: chatId,
+            kind: 'direct',
+            members: [a, b],
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            meta: { clearedBy: {}, removedBy: {}, blockedBy: {} }
+        };
+        chatsDb.chats.push(chat);
+        saveChatsDb(chatsDb);
+    }
+    return chat;
+}
+
+function upsertUserPresenceProfile(appUserId, profile) {
+    const userId = normalizeAccountId(appUserId);
+    if (!userId) return;
+    const chatsDb = loadChatsDb();
+    if (!chatsDb.users || typeof chatsDb.users !== 'object') chatsDb.users = {};
+    const prev = chatsDb.users[userId] || {};
+    chatsDb.users[userId] = {
+        ...prev,
+        id: userId,
+        name: normalizeText(profile?.name || prev.name || 'Пользователь', 120),
+        avatar: normalizeText(profile?.avatar || prev.avatar || '', 1000),
+        username: normalizeUsername(profile?.username || prev.username || ''),
+        statusText: normalizeText(profile?.statusText || prev.statusText || '', 160),
+        online: true,
+        lastSeenAt: Date.now(),
+        privacy: {
+            canWrite: ['all', 'friends', 'nobody'].includes(profile?.privacy?.canWrite) ? profile.privacy.canWrite : (prev.privacy?.canWrite || 'all'),
+            canCall: ['all', 'friends', 'nobody'].includes(profile?.privacy?.canCall) ? profile.privacy.canCall : (prev.privacy?.canCall || 'all'),
+            canViewProfile: ['all', 'friends', 'nobody'].includes(profile?.privacy?.canViewProfile) ? profile.privacy.canViewProfile : (prev.privacy?.canViewProfile || 'all')
+        },
+        blacklist: Array.isArray(profile?.blacklist) ? profile.blacklist.map((v) => normalizeAccountId(v)).filter(Boolean) : (Array.isArray(prev.blacklist) ? prev.blacklist : []),
+        blacklistMeta: typeof profile?.blacklistMeta === 'object' && profile.blacklistMeta ? profile.blacklistMeta : (typeof prev.blacklistMeta === 'object' && prev.blacklistMeta ? prev.blacklistMeta : {})
+    };
+    saveChatsDb(chatsDb);
+}
+
+function setUserOffline(appUserId) {
+    const userId = normalizeAccountId(appUserId);
+    if (!userId) return;
+    const chatsDb = loadChatsDb();
+    if (!chatsDb.users || typeof chatsDb.users !== 'object') return;
+    if (!chatsDb.users[userId]) return;
+    chatsDb.users[userId].online = false;
+    chatsDb.users[userId].lastSeenAt = Date.now();
+    saveChatsDb(chatsDb);
+}
+
+function getUserProfile(appUserId) {
+    const userId = normalizeAccountId(appUserId);
+    const chatsDb = loadChatsDb();
+    return chatsDb?.users?.[userId] || null;
+}
+
+function areFriendsForMessenger(userA, userB) {
+    const a = normalizeAccountId(userA);
+    const b = normalizeAccountId(userB);
+    if (!a || !b) return false;
+    const store = readJson(FRIENDS_STORE_PATH, { friends: [] });
+    const list = Array.isArray(store?.friends) ? store.friends : [];
+    const key = [a, b].sort().join('::');
+    return list.some((row) => {
+        const left = normalizeAccountId(row?.a);
+        const right = normalizeAccountId(row?.b);
+        if (!left || !right) return false;
+        return [left, right].sort().join('::') === key;
+    });
+}
+
+function canUserWriteTo(fromUserId, toUserId) {
+    const fromId = normalizeAccountId(fromUserId);
+    const toId = normalizeAccountId(toUserId);
+    if (!fromId || !toId) return false;
+    const toProfile = getUserProfile(toId);
+    if (!toProfile) return true;
+    const blocked = Array.isArray(toProfile.blacklist) && toProfile.blacklist.includes(fromId);
+    if (blocked) return false;
+    const policy = toProfile.privacy?.canWrite || 'all';
+    if (policy === 'all') return true;
+    if (policy === 'nobody') return false;
+    return areFriendsForMessenger(fromId, toId);
+}
+
+function canUserViewProfile(viewerUserId, targetUserId) {
+    const viewerId = normalizeAccountId(viewerUserId);
+    const targetId = normalizeAccountId(targetUserId);
+    if (!viewerId || !targetId) return false;
+    if (viewerId === targetId) return true;
+    const target = getUserProfile(targetId);
+    if (!target) return true;
+    const blocked = Array.isArray(target.blacklist) && target.blacklist.includes(viewerId);
+    if (blocked) return false;
+    const policy = target.privacy?.canViewProfile || 'all';
+    if (policy === 'all') return true;
+    if (policy === 'nobody') return false;
+    return areFriendsForMessenger(viewerId, targetId);
+}
+
+function buildProfileViewFor(viewerUserId, targetUserId) {
+    const viewerId = normalizeAccountId(viewerUserId);
+    const targetId = normalizeAccountId(targetUserId);
+    const target = getUserProfile(targetId);
+    if (!target) return { ok: false, reason: 'not-found' };
+    const isBlocked = Array.isArray(target.blacklist) && target.blacklist.includes(viewerId);
+    if (isBlocked) {
+        return {
+            ok: false,
+            reason: 'blocked',
+            profile: {
+                id: targetId,
+                name: 'Вас заблокировал пользователь',
+                avatar: '',
+                username: '',
+                statusText: target.blacklistMeta?.[viewerId] || 'Возможно, вы его сильно обидели.',
+                online: !!target.online
+            }
+        };
+    }
+    if (!canUserViewProfile(viewerId, targetId)) {
+        return {
+            ok: false,
+            reason: 'private',
+            profile: {
+                id: targetId,
+                name: 'Профиль закрыт',
+                avatar: '',
+                username: '',
+                statusText: 'Пользователь закрыл профиль от публичного доступа.',
+                online: false
+            }
+        };
+    }
+    return {
+        ok: true,
+        reason: 'ok',
+        profile: {
+            id: target.id,
+            name: target.name || 'Пользователь',
+            avatar: target.avatar || '',
+            username: target.username || '',
+            statusText: target.statusText || '',
+            online: !!target.online,
+            lastSeenAt: Number(target.lastSeenAt || 0)
+        }
+    };
+}
+
+function getChatMessagesForUser(chatId, userId, limit = 120) {
+    const messagesDb = loadMessagesDb();
+    const chatsDb = loadChatsDb();
+    const chat = chatsDb.chats.find((item) => item.id === chatId);
+    if (!chat) return [];
+    const clearedAt = Number(chat.meta?.clearedBy?.[userId] || 0);
+    const rows = messagesDb.messages
+        .filter((item) => item.chatId === chatId && Number(item.createdAt || 0) >= clearedAt)
+        .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+    return rows.slice(Math.max(0, rows.length - limit));
+}
+
+function buildChatListForUser(appUserId) {
+    const userId = normalizeAccountId(appUserId);
+    const chatsDb = loadChatsDb();
+    const messagesDb = loadMessagesDb();
+    const all = chatsDb.chats.filter((chat) => Array.isArray(chat.members) && chat.members.includes(userId));
+    return all.map((chat) => {
+        const peerId = chat.members.find((item) => item !== userId) || userId;
+        const peer = chatsDb?.users?.[peerId] || { id: peerId, name: 'Пользователь', avatar: '', username: '', online: false };
+        const removed = !!chat.meta?.removedBy?.[userId];
+        if (removed) return null;
+        const clearedAt = Number(chat.meta?.clearedBy?.[userId] || 0);
+        const lastMessage = messagesDb.messages
+            .filter((item) => item.chatId === chat.id && Number(item.createdAt || 0) >= clearedAt)
+            .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))[0] || null;
+        return {
+            id: chat.id,
+            kind: chat.kind || 'direct',
+            peer: {
+                id: peer.id,
+                name: peer.name || 'Пользователь',
+                avatar: peer.avatar || '',
+                username: peer.username || '',
+                statusText: peer.statusText || '',
+                online: !!peer.online,
+                lastSeenAt: Number(peer.lastSeenAt || 0)
+            },
+            updatedAt: Number(chat.updatedAt || chat.createdAt || Date.now()),
+            lastMessage: lastMessage ? {
+                id: lastMessage.id,
+                text: lastMessage.text || '',
+                fromId: lastMessage.fromId,
+                createdAt: lastMessage.createdAt,
+                editedAt: Number(lastMessage.editedAt || 0)
+            } : null
+        };
+    }).filter(Boolean).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+}
+
+function registerUserSession(appUserId, ws) {
+    const id = normalizeAccountId(appUserId);
+    if (!id || !ws) return;
+    if (!userSessions.has(id)) userSessions.set(id, new Set());
+    userSessions.get(id).add(ws);
+}
+
+function unregisterUserSession(appUserId, ws) {
+    const id = normalizeAccountId(appUserId);
+    if (!id || !ws || !userSessions.has(id)) return;
+    const set = userSessions.get(id);
+    set.delete(ws);
+    if (set.size === 0) userSessions.delete(id);
+}
+
+function sendToUserSessions(appUserId, payload) {
+    const id = normalizeAccountId(appUserId);
+    const set = userSessions.get(id);
+    if (!set) return;
+    set.forEach((sessionWs) => safeSend(sessionWs, payload));
+}
+
+function emitMessengerSync(appUserId, reason = 'update') {
+    const id = normalizeAccountId(appUserId);
+    if (!id) return;
+    sendToUserSessions(id, {
+        type: 'messenger-sync',
+        reason,
+        userId: id,
+        chats: buildChatListForUser(id)
+    });
 }
 
 function sanitizeIceServer(item) {
@@ -315,6 +650,7 @@ wss.on('connection', (ws) => {
 
     let currentRoom = null;
     let userName = '';
+    let currentAppUserId = '';
 
     ws.on('message', (message) => {
         try {
@@ -324,6 +660,225 @@ wss.on('connection', (ws) => {
             switch (data.type) {
                 case 'ping':
                     safeSend(ws, { type: 'pong', ts: Date.now() });
+                    break;
+                case 'messenger-register':
+                    {
+                        const accountId = normalizeAccountId(data.appUserId);
+                        if (!accountId) {
+                            safeSend(ws, { type: 'error', message: 'appUserId required for messenger-register' });
+                            return;
+                        }
+                        currentAppUserId = accountId;
+                        ws.__appUserId = accountId;
+                        registerUserSession(accountId, ws);
+                        upsertUserPresenceProfile(accountId, {
+                            name: data.userName || data.name || 'Пользователь',
+                            avatar: data.userAvatar || data.avatar || '',
+                            username: data.username || '',
+                            statusText: data.statusText || '',
+                            privacy: data.privacy || null,
+                            blacklist: data.blacklist || null
+                        });
+                        emitMessengerSync(accountId, 'init');
+                    }
+                    break;
+                case 'messenger-sync':
+                    if (!currentAppUserId) return;
+                    emitMessengerSync(currentAppUserId, 'manual-sync');
+                    break;
+                case 'messenger-open-chat':
+                    {
+                        if (!currentAppUserId) return;
+                        const withUserId = normalizeAccountId(data.withUserId);
+                        if (!withUserId || withUserId === currentAppUserId) return;
+                        const chat = getOrCreateDirectChat(currentAppUserId, withUserId);
+                        if (!chat) return;
+                        const messages = getChatMessagesForUser(chat.id, currentAppUserId, 250);
+                        safeSend(ws, {
+                            type: 'messenger-chat-history',
+                            chatId: chat.id,
+                            withUserId,
+                            messages
+                        });
+                        emitMessengerSync(currentAppUserId, 'chat-opened');
+                    }
+                    break;
+                case 'messenger-send':
+                    {
+                        if (!currentAppUserId) return;
+                        const toUserId = normalizeAccountId(data.toUserId);
+                        if (!toUserId || toUserId === currentAppUserId) return;
+                        if (!canUserWriteTo(currentAppUserId, toUserId)) {
+                            safeSend(ws, { type: 'messenger-error', code: 'write_forbidden', message: 'Пользователь ограничил личные сообщения' });
+                            return;
+                        }
+                        const chat = getOrCreateDirectChat(currentAppUserId, toUserId);
+                        if (!chat) return;
+                        const text = normalizeText(data.text, 4000);
+                        if (!text) return;
+                        const messagesDb = loadMessagesDb();
+                        const chatsDb = loadChatsDb();
+                        const message = {
+                            id: `msg_${uuidv4()}`,
+                            chatId: chat.id,
+                            fromId: currentAppUserId,
+                            toId: toUserId,
+                            text,
+                            createdAt: Date.now(),
+                            editedAt: 0,
+                            deletedAt: 0,
+                            replyTo: normalizeText(data.replyTo || '', 64),
+                            forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64)
+                        };
+                        messagesDb.messages.push(message);
+                        const chatIndex = chatsDb.chats.findIndex((item) => item.id === chat.id);
+                        if (chatIndex >= 0) {
+                            chatsDb.chats[chatIndex].updatedAt = Date.now();
+                            if (!chatsDb.chats[chatIndex].meta) chatsDb.chats[chatIndex].meta = { clearedBy: {}, removedBy: {}, blockedBy: {} };
+                            chatsDb.chats[chatIndex].meta.removedBy[currentAppUserId] = false;
+                            chatsDb.chats[chatIndex].meta.removedBy[toUserId] = false;
+                        }
+                        saveMessagesDb(messagesDb);
+                        saveChatsDb(chatsDb);
+                        sendToUserSessions(currentAppUserId, { type: 'messenger-message', chatId: chat.id, message });
+                        sendToUserSessions(toUserId, { type: 'messenger-message', chatId: chat.id, message });
+                        emitMessengerSync(currentAppUserId, 'new-message');
+                        emitMessengerSync(toUserId, 'new-message');
+                    }
+                    break;
+                case 'messenger-typing':
+                    {
+                        if (!currentAppUserId) return;
+                        const toUserId = normalizeAccountId(data.toUserId);
+                        if (!toUserId || toUserId === currentAppUserId) return;
+                        sendToUserSessions(toUserId, {
+                            type: 'messenger-typing',
+                            fromUserId: currentAppUserId,
+                            chatId: createDirectChatId(currentAppUserId, toUserId),
+                            isTyping: !!data.isTyping,
+                            ts: Date.now()
+                        });
+                    }
+                    break;
+                case 'messenger-edit':
+                    {
+                        if (!currentAppUserId) return;
+                        const messageId = normalizeText(data.messageId || '', 80);
+                        const nextText = normalizeText(data.text, 4000);
+                        if (!messageId || !nextText) return;
+                        const messagesDb = loadMessagesDb();
+                        const row = messagesDb.messages.find((item) => item.id === messageId);
+                        if (!row || row.fromId !== currentAppUserId || row.deletedAt) return;
+                        row.text = nextText;
+                        row.editedAt = Date.now();
+                        saveMessagesDb(messagesDb);
+                        const chat = findChatById(row.chatId);
+                        if (!chat) return;
+                        const peerId = chat.members.find((item) => item !== currentAppUserId) || '';
+                        const payload = { type: 'messenger-message-updated', chatId: row.chatId, message: row };
+                        sendToUserSessions(currentAppUserId, payload);
+                        if (peerId) sendToUserSessions(peerId, payload);
+                    }
+                    break;
+                case 'messenger-delete':
+                    {
+                        if (!currentAppUserId) return;
+                        const messageId = normalizeText(data.messageId || '', 80);
+                        if (!messageId) return;
+                        const messagesDb = loadMessagesDb();
+                        const row = messagesDb.messages.find((item) => item.id === messageId);
+                        if (!row || row.fromId !== currentAppUserId || row.deletedAt) return;
+                        row.deletedAt = Date.now();
+                        saveMessagesDb(messagesDb);
+                        const chat = findChatById(row.chatId);
+                        if (!chat) return;
+                        const peerId = chat.members.find((item) => item !== currentAppUserId) || '';
+                        const payload = { type: 'messenger-message-deleted', chatId: row.chatId, messageId };
+                        sendToUserSessions(currentAppUserId, payload);
+                        if (peerId) sendToUserSessions(peerId, payload);
+                    }
+                    break;
+                case 'messenger-clear-chat':
+                    {
+                        if (!currentAppUserId) return;
+                        const chatId = normalizeText(data.chatId || '', 220);
+                        const chatsDb = loadChatsDb();
+                        const index = chatsDb.chats.findIndex((item) => item.id === chatId);
+                        if (index < 0) return;
+                        if (!Array.isArray(chatsDb.chats[index].members) || !chatsDb.chats[index].members.includes(currentAppUserId)) return;
+                        if (!chatsDb.chats[index].meta) chatsDb.chats[index].meta = { clearedBy: {}, removedBy: {}, blockedBy: {} };
+                        chatsDb.chats[index].meta.clearedBy[currentAppUserId] = Date.now();
+                        chatsDb.chats[index].updatedAt = Date.now();
+                        saveChatsDb(chatsDb);
+                        emitMessengerSync(currentAppUserId, 'chat-cleared');
+                    }
+                    break;
+                case 'messenger-delete-chat':
+                    {
+                        if (!currentAppUserId) return;
+                        const chatId = normalizeText(data.chatId || '', 220);
+                        const chatsDb = loadChatsDb();
+                        const index = chatsDb.chats.findIndex((item) => item.id === chatId);
+                        if (index < 0) return;
+                        if (!Array.isArray(chatsDb.chats[index].members) || !chatsDb.chats[index].members.includes(currentAppUserId)) return;
+                        if (!chatsDb.chats[index].meta) chatsDb.chats[index].meta = { clearedBy: {}, removedBy: {}, blockedBy: {} };
+                        chatsDb.chats[index].meta.removedBy[currentAppUserId] = true;
+                        saveChatsDb(chatsDb);
+                        emitMessengerSync(currentAppUserId, 'chat-removed');
+                    }
+                    break;
+                case 'messenger-block-user':
+                    {
+                        if (!currentAppUserId) return;
+                        const targetId = normalizeAccountId(data.targetUserId);
+                        if (!targetId || targetId === currentAppUserId) return;
+                        const profile = getUserProfile(currentAppUserId) || { blacklist: [] };
+                        const set = new Set(Array.isArray(profile.blacklist) ? profile.blacklist : []);
+                        const blacklistMeta = typeof profile.blacklistMeta === 'object' && profile.blacklistMeta ? profile.blacklistMeta : {};
+                        if (!!data.blocked) {
+                            set.add(targetId);
+                            const note = normalizeText(data.comment || '', 180);
+                            if (note) blacklistMeta[targetId] = note;
+                        } else {
+                            set.delete(targetId);
+                            delete blacklistMeta[targetId];
+                        }
+                        upsertUserPresenceProfile(currentAppUserId, { ...profile, blacklist: Array.from(set), blacklistMeta });
+                        emitMessengerSync(currentAppUserId, 'blacklist-updated');
+                    }
+                    break;
+                case 'messenger-get-profile':
+                    {
+                        if (!currentAppUserId) return;
+                        const targetId = normalizeAccountId(data.targetUserId);
+                        if (!targetId) return;
+                        safeSend(ws, {
+                            type: 'messenger-profile',
+                            targetUserId: targetId,
+                            view: buildProfileViewFor(currentAppUserId, targetId)
+                        });
+                    }
+                    break;
+                case 'messenger-update-profile':
+                    if (!currentAppUserId) return;
+                    upsertUserPresenceProfile(currentAppUserId, {
+                        name: data.name,
+                        avatar: data.avatar,
+                        username: data.username,
+                        statusText: data.statusText
+                    });
+                    emitMessengerSync(currentAppUserId, 'profile-updated');
+                    break;
+                case 'messenger-update-privacy':
+                    if (!currentAppUserId) return;
+                    upsertUserPresenceProfile(currentAppUserId, {
+                        privacy: {
+                            canWrite: data.canWrite,
+                            canCall: data.canCall,
+                            canViewProfile: data.canViewProfile
+                        }
+                    });
+                    emitMessengerSync(currentAppUserId, 'privacy-updated');
                     break;
 
                 case 'create':
@@ -799,6 +1354,12 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
+        if (currentAppUserId) {
+            unregisterUserSession(currentAppUserId, ws);
+            if (!userSessions.has(currentAppUserId)) {
+                setUserOffline(currentAppUserId);
+            }
+        }
         if (ws.__superseded) return;
         const roomToLeave = currentRoom;
         currentRoom = null;
