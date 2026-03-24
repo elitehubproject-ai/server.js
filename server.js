@@ -230,8 +230,8 @@ function getProfile(userId) {
         name: normalizeText(raw.name || fallbackUser.name || 'Пользователь', 80),
         username: normalizeUsername(raw.username || fallbackUser.username || ''),
         status: normalizeText(raw.status || '', 140),
-        avatar: normalizeText(raw.avatar || fallbackUser.avatar || '', 500),
-        cover: normalizeText(raw.cover || '', 500),
+        avatar: normalizeText(raw.avatar || fallbackUser.avatar || '', 300000),
+        cover: normalizeText(raw.cover || '', 300000),
         updatedAt: Number(raw.updatedAt || 0) || 0
     };
 }
@@ -243,7 +243,7 @@ function ensureMessengerUser(userId, payload = {}) {
         messengerStore.users[uid] = {
             id: uid,
             name: normalizeText(payload.name || 'Пользователь', 80),
-            avatar: normalizeText(payload.avatar || '', 500),
+            avatar: normalizeText(payload.avatar || '', 300000),
             username: normalizeUsername(payload.username || ''),
             status: normalizeText(payload.status || '', 140),
             lastSeenAt: nowMs()
@@ -251,7 +251,7 @@ function ensureMessengerUser(userId, payload = {}) {
     } else {
         const user = messengerStore.users[uid];
         const nextName = normalizeText(payload.name || user.name || 'Пользователь', 80);
-        const nextAvatar = normalizeText(payload.avatar || user.avatar || '', 500);
+        const nextAvatar = normalizeText(payload.avatar || user.avatar || '', 300000);
         const nextUsername = normalizeUsername(payload.username || user.username || '');
         const nextStatus = normalizeText(payload.status || user.status || '', 140);
         user.name = nextName;
@@ -270,8 +270,8 @@ function ensureMessengerUser(userId, payload = {}) {
         name: normalizeText(existingProfile.name || messengerStore.users[uid].name || 'Пользователь', 80),
         username: normalizeUsername(existingProfile.username || messengerStore.users[uid].username || ''),
         status: normalizeText(existingProfile.status || messengerStore.users[uid].status || '', 140),
-        avatar: normalizeText(existingProfile.avatar || messengerStore.users[uid].avatar || '', 500),
-        cover: normalizeText(existingProfile.cover || '', 500),
+        avatar: normalizeText(existingProfile.avatar || messengerStore.users[uid].avatar || '', 300000),
+        cover: normalizeText(existingProfile.cover || '', 300000),
         updatedAt: Number(existingProfile.updatedAt || nowMs())
     };
     return messengerStore.users[uid];
@@ -1103,8 +1103,8 @@ wss.on('connection', (ws) => {
                             name: normalizeText(data.name ?? profile.name, 80) || 'Пользователь',
                             username: nextUsername,
                             status: normalizeText(data.status ?? profile.status, 140),
-                            avatar: normalizeText(data.avatar ?? profile.avatar, 500),
-                            cover: normalizeText(data.cover ?? profile.cover, 500),
+                            avatar: normalizeText(data.avatar ?? profile.avatar, 300000),
+                            cover: normalizeText(data.cover ?? profile.cover, 300000),
                             updatedAt: nowMs()
                         };
                         messengerStore.profiles[actorId] = nextProfile;
