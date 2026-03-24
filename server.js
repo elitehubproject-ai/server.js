@@ -192,6 +192,19 @@ function getFormattedUser(userId) {
     };
 }
 
+function enrichMessageWithSender(msg) {
+    if (!msg || typeof msg !== 'object') return msg;
+    const sid = normalizeAccountId(msg.fromId);
+    if (!sid) return msg;
+    const fmt = getFormattedUser(sid);
+    return {
+        ...msg,
+        senderDisplayName: fmt.displayName,
+        senderAvatar: fmt.avatar,
+        senderInitials: fmt.initials
+    };
+}
+
 async function upsertUserPresenceProfileMysql(appUserId, profile) {
     const userId = normalizeAccountId(appUserId);
     if (!userId) return;
@@ -266,11 +279,12 @@ async function upsertUserPresenceProfileMysql(appUserId, profile) {
 
 async function ensureProfilesLoaded(...ids) {
     const todo = [...new Set(ids.map((x) => normalizeAccountId(x)).filter(Boolean))];
+    if (!messengerMysql.isEnabled()) return;
     for (const uid of todo) {
-        if (messengerProfileMem.has(uid)) continue;
-        if (!messengerMysql.isEnabled()) continue;
-        const p = await messengerMysql.getProfile(uid);
-        if (p) messengerProfileMem.set(uid, p);
+        try {
+            const p = await messengerMysql.getProfile(uid);
+            if (p) messengerProfileMem.set(uid, p);
+        } catch (_) {}
     }
 }
 
@@ -936,7 +950,6 @@ wss.on('connection', (ws) => {
                             try {
                                 await mysqlBoot;
                             } catch (_) {}
-                            await ensureProfilesLoaded(currentAppUserId, withUserId);
                             if (!messengerMysql.isEnabled()) {
                                 safeSend(ws, {
                                     type: 'messenger-error',
@@ -949,9 +962,15 @@ wss.on('connection', (ws) => {
                             const chatId = chat?.id || createDirectChatId(currentAppUserId, withUserId);
                             if (!chatId) return;
                             const clearedAt = chat ? Number(chat.meta?.clearedBy?.[currentAppUserId] || 0) : 0;
-                            const messages = chat
+                            const rawMsgs = chat
                                 ? await messengerMysql.listMessagesForChat(chat.id, clearedAt, 250)
                                 : [];
+                            await ensureProfilesLoaded(
+                                currentAppUserId,
+                                withUserId,
+                                ...rawMsgs.map((m) => m.fromId).filter(Boolean)
+                            );
+                            const messages = rawMsgs.map(enrichMessageWithSender);
                             const gate = directMessageGate(currentAppUserId, withUserId);
                             safeSend(ws, {
                                 type: 'messenger-chat-history',
@@ -1010,7 +1029,12 @@ wss.on('connection', (ws) => {
                             if (!chat) return;
                             const text = normalizeText(data.text, 4000);
                             const audioRaw = typeof data.audioBase64 === 'string' ? data.audioBase64 : '';
-                            const audioBase64 = audioRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
+                            const isVoiceEarly =
+                                audioRaw.replace(/[^a-zA-Z0-9+/=]/g, '').length > 32 &&
+                                (data.messageKind === 'voice' || !!data.audioBase64);
+                            const audioBase64 = audioRaw
+                                .replace(/[^a-zA-Z0-9+/=]/g, '')
+                                .slice(0, isVoiceEarly ? 2800000 : 720000);
                             const imageRaw = typeof data.imageBase64 === 'string' ? data.imageBase64 : '';
                             const imageBase64 = imageRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
                             const videoRaw = typeof data.videoBase64 === 'string' ? data.videoBase64 : '';
@@ -1077,8 +1101,9 @@ wss.on('connection', (ws) => {
                                 safeSend(ws, { type: 'messenger-error', code: 'save_failed', message: 'Не удалось сохранить сообщение' });
                                 return;
                             }
-                            sendToUserSessions(currentAppUserId, { type: 'messenger-message', chatId: chat.id, message });
-                            sendToUserSessions(toUserId, { type: 'messenger-message', chatId: chat.id, message });
+                            const msgOut = enrichMessageWithSender(message);
+                            sendToUserSessions(currentAppUserId, { type: 'messenger-message', chatId: chat.id, message: msgOut });
+                            sendToUserSessions(toUserId, { type: 'messenger-message', chatId: chat.id, message: msgOut });
                             emitMessengerSync(currentAppUserId, 'new-message');
                             emitMessengerSync(toUserId, 'new-message');
                         })();
@@ -1112,7 +1137,7 @@ wss.on('connection', (ws) => {
                             let row = await messengerMysql.getMessageById(messageId);
                             if (!row || row.fromId !== currentAppUserId || row.deletedAt) return;
                             await messengerMysql.updateMessageFields(messageId, { text: nextText, editedAt: Date.now() });
-                            row = { ...row, text: nextText, editedAt: Date.now() };
+                            row = enrichMessageWithSender({ ...row, text: nextText, editedAt: Date.now() });
                             const chat = await messengerMysql.getChatById(row.chatId);
                             if (!chat) return;
                             const peerId = chat.members.find((item) => item !== currentAppUserId) || '';
