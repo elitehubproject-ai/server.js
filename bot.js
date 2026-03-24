@@ -1,13 +1,13 @@
 // Telegram Bot - токен из переменных окружения Render
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const BOT_USERNAME = 'seych_call_bot';
-const APP_URL = 'https://seych-call.gt.tc';
+const BOT_USERNAME = process.env.BOT_USERNAME;
+const APP_URL = process.env.APP_URL;
 const fs = require('fs');
 const path = require('path');
 const USERS_FILE = path.join(__dirname, 'telegram_users.json');
 
 if (!TELEGRAM_TOKEN) {
-    console.error('❌ TELEGRAM_TOKEN не задан! Добавьте его в Environment Variables на Render');
+    console.error('❌ TELEGRAM_TOKEN error');
     process.exit(1);
 }
 
@@ -73,12 +73,12 @@ async function sendMessageWithKeyboard(chatId, text, keyboard) {
 
 async function sendMiniAppMessage(chatId, url, text) {
     await sendMessageWithKeyboard(chatId, text, {
-        inline_keyboard: [[{ text: '🚀 Открыть Seych Calls', web_app: { url: url } }]]
+        inline_keyboard: [[{ text: '🚀 Открыть Seych', web_app: { url: url } }]]
     });
 }
 
 async function sendMainMenu(chatId) {
-    await sendMessageWithKeyboard(chatId, '🎥 Seych Calls\n\nВыберите действие:', {
+    await sendMessageWithKeyboard(chatId, '🎥 Seych\n\nВыберите действие:', {
         inline_keyboard: [
             [{ text: '🎥 Создать комнату', web_app: { url: APP_URL + '/' } }],
             [{ text: '🔗 Подключиться', web_app: { url: APP_URL + '/' } }],
@@ -135,7 +135,7 @@ async function processMessage(chatId, text, firstName, userId) {
     }
     
     if (text === '/help') {
-        const helpText = '📱 Помощь по Seych Calls\n\n' +
+        const helpText = '📱 Помощь по Seych\n\n' +
             '1️⃣ Откройте сайт и нажмите "Создать комнату"\n' +
             '2️⃣ Скопируйте ID комнаты\n' +
             '3️⃣ Отправьте ID другу\n' +
