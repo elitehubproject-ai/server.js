@@ -89,6 +89,9 @@ function writeJson(filePath, value) {
 
 ensureJsonFile(CHATS_DB_PATH, { chats: [] });
 ensureJsonFile(MESSAGES_DB_PATH, { messages: [] });
+console.log('[messenger] chats db:', CHATS_DB_PATH);
+console.log('[messenger] messages db:', MESSAGES_DB_PATH);
+console.log('[messenger] friends store:', FRIENDS_STORE_PATH);
 
 function normalizeAccountId(value) {
     return typeof value === 'string' ? value.trim().slice(0, 120) : '';
@@ -127,6 +130,27 @@ function saveChatsDb(db) {
 
 function saveMessagesDb(db) {
     return writeJson(MESSAGES_DB_PATH, db);
+}
+
+/** Все сообщения из JSON (после перезапуска сервера остаются на диске). */
+function loadMessages() {
+    return loadMessagesDb().messages;
+}
+
+/**
+ * Немедленная запись одного сообщения в messages.json (полный перезапись файла, как у друзей через PHP).
+ */
+function saveMessage(message) {
+    try {
+        const db = loadMessagesDb();
+        db.messages.push(message);
+        const ok = saveMessagesDb(db);
+        if (!ok) console.error('[messenger] saveMessage: writeJson failed', MESSAGES_DB_PATH);
+        return ok;
+    } catch (err) {
+        console.error('[messenger] saveMessage error', err && err.message);
+        return false;
+    }
 }
 
 function findChatById(chatId) {
@@ -177,7 +201,8 @@ function upsertUserPresenceProfile(appUserId, profile) {
             canViewProfile: ['all', 'friends', 'nobody'].includes(profile?.privacy?.canViewProfile) ? profile.privacy.canViewProfile : (prev.privacy?.canViewProfile || 'all')
         },
         blacklist: Array.isArray(profile?.blacklist) ? profile.blacklist.map((v) => normalizeAccountId(v)).filter(Boolean) : (Array.isArray(prev.blacklist) ? prev.blacklist : []),
-        blacklistMeta: typeof profile?.blacklistMeta === 'object' && profile.blacklistMeta ? profile.blacklistMeta : (typeof prev.blacklistMeta === 'object' && prev.blacklistMeta ? prev.blacklistMeta : {})
+        blacklistMeta: typeof profile?.blacklistMeta === 'object' && profile.blacklistMeta ? profile.blacklistMeta : (typeof prev.blacklistMeta === 'object' && prev.blacklistMeta ? prev.blacklistMeta : {}),
+        friendIds: Array.isArray(profile?.friendIds) ? profile.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean) : (Array.isArray(prev.friendIds) ? prev.friendIds : [])
     };
     saveChatsDb(chatsDb);
 }
@@ -227,26 +252,53 @@ function areFriendsForMessenger(userA, userB) {
     const store = readJson(FRIENDS_STORE_PATH, { friends: [] });
     const list = Array.isArray(store?.friends) ? store.friends : [];
     const key = [a, b].sort().join('::');
-    return list.some((row) => {
+    const inStoreFile = list.some((row) => {
         const left = normalizeAccountId(row?.a);
         const right = normalizeAccountId(row?.b);
         if (!left || !right) return false;
         return [left, right].sort().join('::') === key;
     });
+    if (inStoreFile) return true;
+    const pa = getUserProfile(a);
+    const pb = getUserProfile(b);
+    const af = Array.isArray(pa?.friendIds) ? pa.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean) : [];
+    const bf = Array.isArray(pb?.friendIds) ? pb.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean) : [];
+    return af.includes(b) || bf.includes(a);
+}
+
+/** Кто может писать кому: ЧС с обеих сторон + политика получателя + друзья из friends_store / friendIds на сервере. */
+function directMessageGate(fromUserId, toUserId) {
+    const fromId = normalizeAccountId(fromUserId);
+    const toId = normalizeAccountId(toUserId);
+    if (!fromId || !toId || fromId === toId) return { ok: false, code: 'invalid' };
+    const fromP = getUserProfile(fromId);
+    const toP = getUserProfile(toId);
+    if (fromP && Array.isArray(fromP.blacklist) && fromP.blacklist.includes(toId)) {
+        return { ok: false, code: 'blocked' };
+    }
+    if (toP && Array.isArray(toP.blacklist) && toP.blacklist.includes(fromId)) {
+        return { ok: false, code: 'blocked' };
+    }
+    if (!toP) {
+        return { ok: true, code: 'ok' };
+    }
+    const policy = toP.privacy?.canWrite || 'all';
+    if (policy === 'all') return { ok: true, code: 'ok' };
+    if (policy === 'nobody') return { ok: false, code: 'policy' };
+    if (!areFriendsForMessenger(fromId, toId)) return { ok: false, code: 'friends' };
+    return { ok: true, code: 'ok' };
+}
+
+function composeHintFromGate(gate) {
+    if (!gate || gate.ok) return '';
+    if (gate.code === 'blocked') return 'Вы не можете отправить сообщение этому пользователю';
+    if (gate.code === 'policy') return 'Пользователь ограничил личные сообщения';
+    if (gate.code === 'friends') return 'Пользователь принимает сообщения только от друзей';
+    return 'Вы не можете отправить сообщение этому пользователю';
 }
 
 function canUserWriteTo(fromUserId, toUserId) {
-    const fromId = normalizeAccountId(fromUserId);
-    const toId = normalizeAccountId(toUserId);
-    if (!fromId || !toId) return false;
-    const toProfile = getUserProfile(toId);
-    if (!toProfile) return true;
-    const blocked = Array.isArray(toProfile.blacklist) && toProfile.blacklist.includes(fromId);
-    if (blocked) return false;
-    const policy = toProfile.privacy?.canWrite || 'all';
-    if (policy === 'all') return true;
-    if (policy === 'nobody') return false;
-    return areFriendsForMessenger(fromId, toId);
+    return directMessageGate(fromUserId, toUserId).ok;
 }
 
 function canUserViewProfile(viewerUserId, targetUserId) {
@@ -375,7 +427,9 @@ function buildChatListForUser(appUserId) {
                 text: lastMessage.text || '',
                 fromId: lastMessage.fromId,
                 createdAt: lastMessage.createdAt,
-                editedAt: Number(lastMessage.editedAt || 0)
+                editedAt: Number(lastMessage.editedAt || 0),
+                messageKind: lastMessage.messageKind || 'text',
+                audioBase64: lastMessage.audioBase64 || ''
             } : null
         };
     }).filter(Boolean).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
@@ -740,13 +794,28 @@ wss.on('connection', (ws) => {
                             saveChatsDb(chatsDb);
                         }
                         const messages = getChatMessagesForUser(chat.id, currentAppUserId, 250);
+                        const gate = directMessageGate(currentAppUserId, withUserId);
                         safeSend(ws, {
                             type: 'messenger-chat-history',
                             chatId: chat.id,
                             withUserId,
-                            messages
+                            messages,
+                            composeBlocked: !gate.ok,
+                            composeHint: composeHintFromGate(gate)
                         });
                         emitMessengerSync(currentAppUserId, 'chat-opened');
+                    }
+                    break;
+                case 'messenger-friends-sync':
+                    if (!currentAppUserId) return;
+                    {
+                        const ids = Array.isArray(data.friendIds) ? data.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean) : [];
+                        const cdb = loadChatsDb();
+                        if (!cdb.users || typeof cdb.users !== 'object') cdb.users = {};
+                        const uid = currentAppUserId;
+                        const prevRow = cdb.users[uid] || { id: uid };
+                        cdb.users[uid] = { ...prevRow, id: uid, friendIds: ids };
+                        saveChatsDb(cdb);
                     }
                     break;
                 case 'messenger-send':
@@ -755,29 +824,45 @@ wss.on('connection', (ws) => {
                         if (!currentAppUserId) return;
                         const toUserId = normalizeAccountId(data.toUserId || data.to);
                         if (!toUserId || toUserId === currentAppUserId) return;
-                        if (!canUserWriteTo(currentAppUserId, toUserId)) {
-                            safeSend(ws, { type: 'messenger-error', code: 'write_forbidden', message: 'Пользователь ограничил личные сообщения' });
+                        const gate = directMessageGate(currentAppUserId, toUserId);
+                        if (!gate.ok) {
+                            safeSend(ws, {
+                                type: 'messenger-error',
+                                code: 'write_forbidden',
+                                message: composeHintFromGate(gate)
+                            });
                             return;
                         }
                         const chat = getOrCreateDirectChat(currentAppUserId, toUserId);
                         if (!chat) return;
                         const text = normalizeText(data.text, 4000);
-                        if (!text) return;
-                        const messagesDb = loadMessagesDb();
+                        const audioRaw = typeof data.audioBase64 === 'string' ? data.audioBase64 : '';
+                        const audioBase64 = audioRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
+                        const isVoice = audioBase64.length > 32 && (data.messageKind === 'voice' || !!data.audioBase64);
+                        if (!text && !isVoice) return;
                         const chatsDb = loadChatsDb();
+                        const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
+                        const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav)$/i.test(mimeRaw) ? mimeRaw.slice(0, 80) : 'audio/webm';
                         const message = {
                             id: `msg_${uuidv4()}`,
                             chatId: chat.id,
                             fromId: currentAppUserId,
                             toId: toUserId,
-                            text,
+                            text: text || (isVoice ? 'Голосовое сообщение' : ''),
+                            messageKind: isVoice ? 'voice' : 'text',
+                            audioMime: isVoice ? audioMime : '',
+                            audioBase64: isVoice ? audioBase64 : '',
+                            durationMs: isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0,
                             createdAt: Date.now(),
                             editedAt: 0,
                             deletedAt: 0,
                             replyTo: normalizeText(data.replyTo || '', 64),
                             forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64)
                         };
-                        messagesDb.messages.push(message);
+                        if (!saveMessage(message)) {
+                            safeSend(ws, { type: 'messenger-error', code: 'save_failed', message: 'Не удалось сохранить сообщение' });
+                            return;
+                        }
                         const chatIndex = chatsDb.chats.findIndex((item) => item.id === chat.id);
                         if (chatIndex >= 0) {
                             chatsDb.chats[chatIndex].updatedAt = Date.now();
@@ -785,7 +870,6 @@ wss.on('connection', (ws) => {
                             chatsDb.chats[chatIndex].meta.removedBy[currentAppUserId] = false;
                             chatsDb.chats[chatIndex].meta.removedBy[toUserId] = false;
                         }
-                        saveMessagesDb(messagesDb);
                         saveChatsDb(chatsDb);
                         sendToUserSessions(currentAppUserId, { type: 'messenger-message', chatId: chat.id, message });
                         sendToUserSessions(toUserId, { type: 'messenger-message', chatId: chat.id, message });
