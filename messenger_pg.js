@@ -81,6 +81,8 @@ async function ensureTables() {
       duration_ms INT NOT NULL DEFAULT 0,
       reply_to VARCHAR(100) NOT NULL DEFAULT '',
       forwarded_from VARCHAR(100) NOT NULL DEFAULT '',
+      delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb,
+      read_by JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at BIGINT NOT NULL,
       edited_at BIGINT NOT NULL DEFAULT 0,
       deleted_at BIGINT NOT NULL DEFAULT 0
@@ -89,6 +91,8 @@ async function ensureTables() {
 
   // На случай уже существующей таблицы (если у вас код обновился, а БД нет).
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_mime VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
 
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
@@ -358,7 +362,9 @@ function rowToMessage(row) {
     forwardedFromMessageId: row.forwarded_from || '',
     editedAt: Number(row.edited_at) || 0,
     deletedAt: Number(row.deleted_at) || 0,
-    mimeType: ''
+    mimeType: '',
+    deliveredBy: Array.isArray(row.delivered_by) ? row.delivered_by : [],
+    readBy: Array.isArray(row.read_by) ? row.read_by : []
   };
   if (isVoice) {
     base.audioBase64 = row.file_url || '';
@@ -390,9 +396,11 @@ async function insertMessage(msg) {
   const mimeCol = isVoice ? msg.audioMime || '' : isVideo ? msg.videoMime || 'video/mp4' : '';
   const imageMimeCol = isImage ? msg.mimeType || msg.imageMime || 'image/jpeg' : '';
   const createdAt = Number(msg.createdAt || msg.at || Date.now());
+  const deliveredBy = Array.isArray(msg.deliveredBy) ? msg.deliveredBy : [];
+  const readBy = Array.isArray(msg.readBy) ? msg.readBy : [];
   await pool.query(
-    `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, created_at, edited_at, deleted_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, delivered_by, read_by, created_at, edited_at, deleted_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
     [
       msg.id,
       msg.chatId,
@@ -406,6 +414,8 @@ async function insertMessage(msg) {
       imageMimeCol,
       msg.replyTo || '',
       msg.forwardedFromMessageId || msg.forwardedFrom || '',
+      deliveredBy,
+      readBy,
       createdAt,
       msg.editedAt || 0,
       msg.deletedAt || 0
@@ -439,6 +449,19 @@ async function getMessageById(id) {
 
 async function deleteMessageByIdHard(id) {
   await pool.query('DELETE FROM messages WHERE id = $1', [id]);
+}
+
+async function addMessageReadBy(messageId, readerUserId) {
+  const mid = String(messageId || '').trim();
+  const rid = String(readerUserId || '').trim();
+  if (!mid || !rid) return false;
+  const { rows } = await pool.query('SELECT read_by FROM messages WHERE id = $1 LIMIT 1', [mid]);
+  const prev = rows[0] && Array.isArray(rows[0].read_by) ? rows[0].read_by : [];
+  const already = prev.some((x) => String(x) === rid);
+  if (already) return false;
+  const next = [...prev.map(String), rid];
+  await pool.query('UPDATE messages SET read_by = $1 WHERE id = $2', [next, mid]);
+  return true;
 }
 
 async function updateMessageFields(id, patch) {
@@ -524,5 +547,6 @@ module.exports = {
   listChatsForUser,
   deleteChatRow,
   setUserOnlineFlags,
-  directChatId
+  directChatId,
+  addMessageReadBy
 };
