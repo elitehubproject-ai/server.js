@@ -1160,8 +1160,13 @@ wss.on('connection', (ws) => {
                                 };
                                 await messengerMysql.updateLastMessagePreview(chat.id, preview, Date.now());
                             } catch (err) {
-                                console.error('[messenger] mysql insertMessage', err && err.message);
-                                safeSend(ws, { type: 'messenger-error', code: 'save_failed', message: 'Не удалось сохранить сообщение' });
+                                console.error('[messenger] mysql insertMessage', err && err.stack ? err.stack : (err && err.message));
+                                safeSend(ws, {
+                                    type: 'messenger-error',
+                                    code: 'save_failed',
+                                    message: `Не удалось сохранить сообщение: ${String(err?.message || err || '').slice(0, 220)}`
+                                    // Для очистки локального pending-сообщения можно будет использовать clientMessageId
+                                });
                                 return;
                             }
                             const msgOut = enrichMessageWithSender(message);
