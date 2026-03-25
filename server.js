@@ -1132,7 +1132,11 @@ wss.on('connection', (ws) => {
                                 editedAt: 0,
                                 deletedAt: 0,
                                 replyTo: normalizeText(data.replyTo || '', 64),
-                                forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64)
+                                forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64),
+                                // Галочки: 1) доставлено получателю (после рассылки в его сессии)
+                                // 2) прочитано — когда получатель открыл диалог.
+                                deliveredBy: [toUserId],
+                                readBy: []
                             };
                             try {
                                 await messengerMysql.insertMessage(message);
@@ -1192,13 +1196,21 @@ wss.on('connection', (ws) => {
                         const messageId = normalizeText(data.messageId || '', 100);
                         const senderId = normalizeAccountId(data.senderId || '');
                         if (!chatId || !messageId || !senderId) return;
-                        sendToUserSessions(senderId, {
-                            type: 'messenger-message-receipt',
-                            chatId,
-                            messageId,
-                            receipt: 'read',
-                            readBy: currentAppUserId
-                        });
+                        void (async () => {
+                            try {
+                                await mysqlBoot;
+                            } catch (_) {}
+                            if (!messengerMysql.isEnabled()) return;
+                            // Пишем прочтение в БД, чтобы после перезагрузки галочки не исчезали.
+                            await messengerMysql.addMessageReadBy(messageId, currentAppUserId);
+                            sendToUserSessions(senderId, {
+                                type: 'messenger-message-receipt',
+                                chatId,
+                                messageId,
+                                receipt: 'read',
+                                readBy: currentAppUserId
+                            });
+                        })();
                     }
                     break;
                 case 'messenger-edit':
