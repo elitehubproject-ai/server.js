@@ -396,11 +396,11 @@ async function insertMessage(msg) {
   const mimeCol = isVoice ? msg.audioMime || '' : isVideo ? msg.videoMime || 'video/mp4' : '';
   const imageMimeCol = isImage ? msg.mimeType || msg.imageMime || 'image/jpeg' : '';
   const createdAt = Number(msg.createdAt || msg.at || Date.now());
-  const deliveredBy = Array.isArray(msg.deliveredBy) ? msg.deliveredBy : [];
-  const readBy = Array.isArray(msg.readBy) ? msg.readBy : [];
+  const deliveredBy = Array.isArray(msg.deliveredBy) ? msg.deliveredBy.map(String) : [];
+  const readBy = Array.isArray(msg.readBy) ? msg.readBy.map(String) : [];
   await pool.query(
     `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, delivered_by, read_by, created_at, edited_at, deleted_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15,$16,$17)`,
     [
       msg.id,
       msg.chatId,
@@ -414,8 +414,8 @@ async function insertMessage(msg) {
       imageMimeCol,
       msg.replyTo || '',
       msg.forwardedFromMessageId || msg.forwardedFrom || '',
-      deliveredBy,
-      readBy,
+      JSON.stringify(deliveredBy),
+      JSON.stringify(readBy),
       createdAt,
       msg.editedAt || 0,
       msg.deletedAt || 0
@@ -460,7 +460,7 @@ async function addMessageReadBy(messageId, readerUserId) {
   const already = prev.some((x) => String(x) === rid);
   if (already) return false;
   const next = [...prev.map(String), rid];
-  await pool.query('UPDATE messages SET read_by = $1 WHERE id = $2', [next, mid]);
+  await pool.query('UPDATE messages SET read_by = $1::jsonb WHERE id = $2', [JSON.stringify(next), mid]);
   return true;
 }
 
