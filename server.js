@@ -18,13 +18,18 @@ const DEFAULT_ICE_SERVERS = [
 ];
 
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
-const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 512 * 1024 });
+// maxPayload ограничивает размер одного сообщения WebSocket (в байтах).
+// Медиа-сообщения кладутся в JSON (base64), поэтому лимит должен быть существенно выше.
+const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
 const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
 const pendingDisconnects = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
 const messengerMysql = require('./messenger_pg');
+// Для медиа-сообщений ограничиваем длину base64-строки на сервере.
+// Ориентир: 50MB файл => ~67MB base64 символов.
+const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
@@ -420,6 +425,48 @@ function broadcastMessengerPresence(userId, online, lastSeenAt) {
     const payload = { type: 'messenger-presence', userId: id, online: !!online, lastSeenAt: ts };
     wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) safeSend(client, payload);
+    });
+}
+
+function broadcastMessengerProfilePatch(targetUserId) {
+    const id = normalizeAccountId(targetUserId);
+    if (!id) return;
+    const fmt = getFormattedUser(id);
+    const payload = {
+        type: 'messenger-profile-patch',
+        targetUserId: id,
+        profile: {
+            id: fmt.id,
+            name: fmt.name,
+            displayName: fmt.displayName,
+            avatar: fmt.avatar,
+            username: fmt.username,
+            statusText: fmt.statusText,
+            initials: fmt.initials,
+            online: !!fmt.online,
+            lastSeenAt: Number(fmt.lastSeenAt || 0)
+        }
+    };
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) safeSend(client, payload);
+    });
+}
+
+function emitMessengerComposeStatus(viewerUserId, peerUserId) {
+    const viewerId = normalizeAccountId(viewerUserId);
+    const peerId = normalizeAccountId(peerUserId);
+    if (!viewerId || !peerId || viewerId === peerId) return;
+    const gate = directMessageGate(viewerId, peerId);
+    const composeBlocked = !gate.ok;
+    const composeHint = composeHintFromGate(gate);
+    const chatId = createDirectChatId(viewerId, peerId);
+    if (!chatId) return;
+    sendToUserSessions(viewerId, {
+        type: 'messenger-compose-status',
+        chatId,
+        withUserId: peerId,
+        composeBlocked,
+        composeHint
     });
 }
 
@@ -1033,6 +1080,8 @@ wss.on('connection', (ws) => {
                             }
                             const chat = await messengerMysql.getOrCreateChat(currentAppUserId, toUserId);
                             if (!chat) return;
+                            const clientMessageId = normalizeText(data.clientMessageId || '', 100);
+                            const messageId = clientMessageId || `msg_${uuidv4()}`;
                             const text = normalizeText(data.text, 4000);
                             const audioRaw = typeof data.audioBase64 === 'string' ? data.audioBase64 : '';
                             const isVoiceEarly =
@@ -1042,9 +1091,9 @@ wss.on('connection', (ws) => {
                                 .replace(/[^a-zA-Z0-9+/=]/g, '')
                                 .slice(0, isVoiceEarly ? 2800000 : 720000);
                             const imageRaw = typeof data.imageBase64 === 'string' ? data.imageBase64 : '';
-                            const imageBase64 = imageRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
+                            const imageBase64 = imageRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, MAX_MEDIA_B64_LEN);
                             const videoRaw = typeof data.videoBase64 === 'string' ? data.videoBase64 : '';
-                            const videoBase64 = videoRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, 720000);
+                            const videoBase64 = videoRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, MAX_MEDIA_B64_LEN);
                             const isVoice = audioBase64.length > 32 && (data.messageKind === 'voice' || !!data.audioBase64);
                             const isImage = imageBase64.length > 80 && data.messageKind === 'image';
                             const isVideo = videoBase64.length > 80 && data.messageKind === 'video';
@@ -1058,7 +1107,7 @@ wss.on('connection', (ws) => {
                             else if (isImage) messageKind = 'image';
                             else if (isVideo) messageKind = 'video';
                             const message = {
-                                id: `msg_${uuidv4()}`,
+                                id: messageId,
                                 chatId: chat.id,
                                 fromId: currentAppUserId,
                                 toId: toUserId,
@@ -1072,6 +1121,7 @@ wss.on('connection', (ws) => {
                                 audioMime: isVoice ? audioMime : '',
                                 audioBase64: isVoice ? audioBase64 : '',
                                 imageBase64: isImage ? imageBase64 : '',
+                                mimeType: isImage ? normalizeText(data.mimeType || 'image/jpeg', 80) : '',
                                 videoBase64: isVideo ? videoBase64 : '',
                                 videoMime: isVideo ? videoMime : '',
                                 durationMs: isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0,
@@ -1256,6 +1306,9 @@ wss.on('connection', (ws) => {
                                 });
                             }
                             emitMessengerSync(currentAppUserId, 'blacklist-updated');
+                            // Блокировка влияет на возможность писать обеим сторонам.
+                            emitMessengerComposeStatus(currentAppUserId, targetId);
+                            emitMessengerComposeStatus(targetId, currentAppUserId);
                         })();
                     }
                     break;
@@ -1293,6 +1346,9 @@ wss.on('connection', (ws) => {
                             await upsertUserPresenceProfileMysql(currentAppUserId, patch);
                         }
                         emitMessengerSync(currentAppUserId, 'profile-updated');
+                        // Разошлем патч профиля всем подключенным клиентам,
+                        // чтобы аватары/имена обновлялись без перезагрузки.
+                        broadcastMessengerProfilePatch(currentAppUserId);
                     })();
                     break;
                 case 'messenger-update-privacy':
@@ -1312,6 +1368,17 @@ wss.on('connection', (ws) => {
                             await upsertUserPresenceProfileMysql(currentAppUserId, patch);
                         }
                         emitMessengerSync(currentAppUserId, 'privacy-updated');
+                        // Приватность влияет на то, могут ли другие писать текущему пользователю.
+                        // Поэтому обновляем compose-status всем участникам прямых чатов текущего пользователя.
+                        if (messengerMysql.isEnabled()) {
+                            const chats = await messengerMysql.listChatsForUser(normalizeAccountId(currentAppUserId));
+                            for (const ch of (chats || [])) {
+                                const members = Array.isArray(ch.members) ? ch.members : [];
+                                const peerId = members.find((m) => m !== normalizeAccountId(currentAppUserId)) || '';
+                                if (!peerId) continue;
+                                emitMessengerComposeStatus(peerId, currentAppUserId);
+                            }
+                        }
                     })();
                     break;
 
