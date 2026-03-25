@@ -1099,7 +1099,10 @@ wss.on('connection', (ws) => {
                             const isVideo = videoBase64.length > 80 && data.messageKind === 'video';
                             if (!text && !isVoice && !isImage && !isVideo) return;
                             const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
-                            const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav)$/i.test(mimeRaw) ? mimeRaw.slice(0, 80) : 'audio/webm';
+                            const mimeNorm = String(mimeRaw || '').split(';')[0].trim();
+                            const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav|m4a|x-m4a|aac|x-aac)$/i.test(mimeNorm)
+                                ? mimeNorm.slice(0, 80)
+                                : 'audio/webm';
                             const videoMimeRaw = typeof data.videoMime === 'string' ? data.videoMime : 'video/mp4';
                             const videoMime = /^video\/(webm|mp4|quicktime|ogg)$/i.test(videoMimeRaw) ? videoMimeRaw.slice(0, 80) : 'video/mp4';
                             let messageKind = 'text';
@@ -1176,6 +1179,25 @@ wss.on('connection', (ws) => {
                             chatId: createDirectChatId(currentAppUserId, toUserId),
                             isTyping: !!data.isTyping,
                             ts: Date.now()
+                        });
+                    }
+                    break;
+                case 'messenger-message-read':
+                    {
+                        // Сообщение прочитано в открытом диалоге на клиенте.
+                        // currentAppUserId — это получатель (который прочитал),
+                        // senderId — отправитель (которому надо показать "две галочки").
+                        if (!currentAppUserId) return;
+                        const chatId = normalizeText(data.chatId || '', 220);
+                        const messageId = normalizeText(data.messageId || '', 100);
+                        const senderId = normalizeAccountId(data.senderId || '');
+                        if (!chatId || !messageId || !senderId) return;
+                        sendToUserSessions(senderId, {
+                            type: 'messenger-message-receipt',
+                            chatId,
+                            messageId,
+                            receipt: 'read',
+                            readBy: currentAppUserId
                         });
                     }
                     break;
