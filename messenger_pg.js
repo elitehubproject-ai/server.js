@@ -77,6 +77,7 @@ async function ensureTables() {
       type VARCHAR(32) NOT NULL DEFAULT 'text',
       file_url TEXT,
       audio_mime VARCHAR(80) NOT NULL DEFAULT '',
+      image_mime VARCHAR(80) NOT NULL DEFAULT '',
       duration_ms INT NOT NULL DEFAULT 0,
       reply_to VARCHAR(100) NOT NULL DEFAULT '',
       forwarded_from VARCHAR(100) NOT NULL DEFAULT '',
@@ -85,6 +86,9 @@ async function ensureTables() {
       deleted_at BIGINT NOT NULL DEFAULT 0
     )
   `);
+
+  // На случай уже существующей таблицы (если у вас код обновился, а БД нет).
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_mime VARCHAR(80) NOT NULL DEFAULT ''`);
 
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
@@ -353,7 +357,8 @@ function rowToMessage(row) {
     replyTo: row.reply_to || '',
     forwardedFromMessageId: row.forwarded_from || '',
     editedAt: Number(row.edited_at) || 0,
-    deletedAt: Number(row.deleted_at) || 0
+    deletedAt: Number(row.deleted_at) || 0,
+    mimeType: ''
   };
   if (isVoice) {
     base.audioBase64 = row.file_url || '';
@@ -366,6 +371,7 @@ function rowToMessage(row) {
   }
   if (isImage) {
     base.imageBase64 = row.file_url || '';
+    base.mimeType = row.image_mime || 'image/jpeg';
   }
   if (isVideo) {
     base.videoBase64 = row.file_url || '';
@@ -382,10 +388,11 @@ async function insertMessage(msg) {
   const type = isVoice ? 'audio' : isImage ? 'image' : isVideo ? 'video' : 'text';
   const fileUrl = isVoice ? msg.audioBase64 || '' : isImage ? msg.imageBase64 || '' : isVideo ? msg.videoBase64 || '' : '';
   const mimeCol = isVoice ? msg.audioMime || '' : isVideo ? msg.videoMime || 'video/mp4' : '';
+  const imageMimeCol = isImage ? msg.mimeType || msg.imageMime || 'image/jpeg' : '';
   const createdAt = Number(msg.createdAt || msg.at || Date.now());
   await pool.query(
-    `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, reply_to, forwarded_from, created_at, edited_at, deleted_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+    `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, created_at, edited_at, deleted_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
     [
       msg.id,
       msg.chatId,
@@ -396,6 +403,7 @@ async function insertMessage(msg) {
       fileUrl,
       msg.durationMs || 0,
       mimeCol,
+      imageMimeCol,
       msg.replyTo || '',
       msg.forwardedFromMessageId || msg.forwardedFrom || '',
       createdAt,
