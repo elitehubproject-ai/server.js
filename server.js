@@ -117,6 +117,12 @@ function normalizeText(value, max = 4000) {
     return value.trim().slice(0, max);
 }
 
+/** Аватары часто data URL (base64) — короткий лимит ломал src и давал «мигание» в чатах. */
+const MAX_AVATAR_URL_LENGTH = 750000;
+function normalizeAvatarUrl(value) {
+    return normalizeText(typeof value === 'string' ? value : value == null ? '' : String(value), MAX_AVATAR_URL_LENGTH);
+}
+
 function createDirectChatId(a, b) {
     const pair = [normalizeAccountId(a), normalizeAccountId(b)].filter(Boolean).sort();
     if (pair.length !== 2) return '';
@@ -171,7 +177,7 @@ function getFormattedUser(userId) {
         : {};
     const name = normalizeText(rowChats.name || (friends && friends.name) || '', 120);
     const username = normalizeUsername(rowChats.username || (friends && friends.username) || '');
-    const avatar = normalizeText(rowChats.avatar || (friends && friends.avatar) || '', 1000);
+    const avatar = normalizeAvatarUrl(rowChats.avatar || (friends && friends.avatar) || '');
     const statusText = normalizeText(rowChats.statusText || '', 160);
     const online = !!rowChats.online;
     const lastSeenAt = Number(rowChats.lastSeenAt || 0);
@@ -226,7 +232,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile) {
         };
     const next = {
         name: profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
-        avatar: profile?.avatar != null ? normalizeText(String(profile.avatar), 1000) : prev.avatar,
+        avatar: profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
         username: profile?.username != null ? normalizeUsername(profile.username) : prev.username,
         statusText: profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
         online: profile?.online !== undefined ? !!profile.online : true,
@@ -321,7 +327,7 @@ function getUserProfileFromFriendsStore(targetUserId) {
     return {
         id: targetId,
         name: normalizeText(row.name || '', 120) || targetId,
-        avatar: normalizeText(row.avatar || '', 1000),
+        avatar: normalizeAvatarUrl(row.avatar || ''),
         username: normalizeUsername(row.username || ''),
         statusText: '',
         online: false,
