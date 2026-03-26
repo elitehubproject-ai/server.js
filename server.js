@@ -17,10 +17,119 @@ const DEFAULT_ICE_SERVERS = [
     { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
 ];
 
+// JWT secret for signing tokens (should match PHP side if needed)
+const JWT_SECRET = process.env.JWT_SECRET;
+
+function generateJWT(appUserId, expiresInSeconds = 30 * 24 * 3600) {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const payload = {
+        sub: appUserId,
+        iat: now,
+        exp: now + expiresInSeconds,
+        scope: 'friends_api'
+    };
+    const headerB64 = Buffer.from(JSON.stringify(header)).toString('base64url');
+    const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const toSign = `${headerB64}.${payloadB64}`;
+    const sig = require('crypto').createHmac('sha256', JWT_SECRET).update(toSign).digest('base64url');
+    return `${toSign}.${sig}`;
+}
+
+// Create shared HTTP server for both WebSocket upgrade and HTTP API
+const sharedHttpServer = http.createServer((req, res) => {
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+
+    const url = new URL(req.url, `http://${req.headers.host}`);
+
+    // Health check endpoint
+    if (url.pathname === '/' || url.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('WebSocket server is running');
+        return;
+    }
+
+    // Registration endpoint for auth bridge
+    if (url.pathname === '/api/register' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                const appUserId = normalizeAccountId(data.app_user_id || data.appUserId);
+                const name = normalizeText(data.name || '', 120);
+                const avatar = normalizeAvatarUrl(data.avatar || '');
+                const username = normalizeUsername(data.username || '');
+                const externalKey = normalizeText(data.external_key || '', 256);
+
+                if (!appUserId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'app_user_id required' }));
+                    return;
+                }
+
+                // Wait for MySQL to be ready
+                try {
+                    await mysqlBoot;
+                } catch (_) {}
+
+                // Create or update user profile in PostgreSQL
+                if (messengerMysql.isEnabled()) {
+                    await upsertUserPresenceProfileMysql(appUserId, {
+                        name,
+                        avatar,
+                        username,
+                        statusText: '',
+                        online: true,
+                        lastSeenAt: Date.now()
+                    });
+                }
+
+                // Generate JWT token
+                const jwt = generateJWT(appUserId);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    success: true,
+                    data: {
+                        appUserId,
+                        jwt,
+                        user: {
+                            id: appUserId,
+                            name,
+                            avatar,
+                            username,
+                            externalKey
+                        }
+                    }
+                }));
+            } catch (err) {
+                console.error('[api/register] error:', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Internal server error' }));
+            }
+        });
+        return;
+    }
+
+    // 404 for unknown endpoints
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: false, error: 'Not found' }));
+});
+
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 // maxPayload ограничивает размер одного сообщения WebSocket (в байтах).
 // Медиа-сообщения кладутся в JSON (base64), поэтому лимит должен быть существенно выше.
-const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
+const wss = new WebSocket.Server({ server: sharedHttpServer, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
 const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
@@ -48,17 +157,11 @@ const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
 /** @type {Map<string, object>} */
 const messengerProfileMem = new Map();
 
-console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
-
-// Health check сервер - тоже слушаем на 0.0.0.0
-const healthServer = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('WebSocket server is running');
+// Start the shared server on the single port
+sharedHttpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
+    console.log(`✅ HTTP API on http://0.0.0.0:${PORT}`);
 });
-
-// Используем другой порт для health check
-const HEALTH_PORT = parseInt(PORT) + 1;
-healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
 
 function safeSend(ws, payload) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
