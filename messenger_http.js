@@ -4,12 +4,15 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
+console.log('[messenger_http] process.env keys:', Object.keys(process.env).filter(k => k.includes('MESSENGER') || k.includes('API')));
+
 let apiUrl = '';
 let apiKey = '';
 let enabled = false;
 
 function env(name, def = '') {
   const v = process.env[name];
+  console.log(`[messenger_http] env("${name}") =`, v ? `"${v.substring(0, 5)}..."` : 'undefined/empty');
   if (v == null) return def;
   const t = String(v).trim();
   return t.length ? t : def;
