@@ -17,132 +17,28 @@ const DEFAULT_ICE_SERVERS = [
     { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
 ];
 
-// JWT secret for signing tokens (should match PHP side if needed)
-const JWT_SECRET = process.env.JWT_SECRET;
-
-function generateJWT(appUserId, expiresInSeconds = 30 * 24 * 3600) {
-    const now = Math.floor(Date.now() / 1000);
-    const header = { alg: 'HS256', typ: 'JWT' };
-    const payload = {
-        sub: appUserId,
-        iat: now,
-        exp: now + expiresInSeconds,
-        scope: 'friends_api'
-    };
-    const headerB64 = Buffer.from(JSON.stringify(header)).toString('base64url');
-    const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
-    const toSign = `${headerB64}.${payloadB64}`;
-    const sig = require('crypto').createHmac('sha256', JWT_SECRET).update(toSign).digest('base64url');
-    return `${toSign}.${sig}`;
-}
-
-// Create shared HTTP server for both WebSocket upgrade and HTTP API
-const sharedHttpServer = http.createServer((req, res) => {
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
-    }
-
-    const url = new URL(req.url, `http://${req.headers.host}`);
-
-    // Health check endpoint
-    if (url.pathname === '/' || url.pathname === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('WebSocket server is running');
-        return;
-    }
-
-    // Registration endpoint for auth bridge
-    if (url.pathname === '/api/register' && req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => { body += chunk; });
-        req.on('end', async () => {
-            try {
-                const data = JSON.parse(body);
-                const appUserId = normalizeAccountId(data.app_user_id || data.appUserId);
-                const name = normalizeText(data.name || '', 120);
-                const avatar = normalizeAvatarUrl(data.avatar || '');
-                const username = normalizeUsername(data.username || '');
-                const externalKey = normalizeText(data.external_key || '', 256);
-
-                if (!appUserId) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, error: 'app_user_id required' }));
-                    return;
-                }
-
-                // Wait for MySQL to be ready
-                try {
-                    await mysqlBoot;
-                } catch (_) {}
-
-                // Create or update user profile in PostgreSQL
-                if (messengerMysql.isEnabled()) {
-                    await upsertUserPresenceProfileMysql(appUserId, {
-                        name,
-                        avatar,
-                        username,
-                        statusText: '',
-                        online: true,
-                        lastSeenAt: Date.now()
-                    });
-                }
-
-                // Generate JWT token
-                const jwt = generateJWT(appUserId);
-
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    success: true,
-                    data: {
-                        appUserId,
-                        jwt,
-                        user: {
-                            id: appUserId,
-                            name,
-                            avatar,
-                            username,
-                            externalKey
-                        }
-                    }
-                }));
-            } catch (err) {
-                console.error('[api/register] error:', err);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'Internal server error' }));
-            }
-        });
-        return;
-    }
-
-    // 404 for unknown endpoints
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: false, error: 'Not found' }));
-});
-
-// ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
-// maxPayload ограничивает размер одного сообщения WebSocket (в байтах).
-// Медиа-сообщения кладутся в JSON (base64), поэтому лимит должен быть существенно выше.
-const wss = new WebSocket.Server({ server: sharedHttpServer, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
 const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
 const pendingDisconnects = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
-const messengerMysql = require('./messenger_pg');
-// Для медиа-сообщений ограничиваем длину base64-строки на сервере.
-// Ориентир: 50MB файл => ~67MB base64 символов.
+const messengerMysql = require('./messenger_http');
 const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
+
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('WebSocket server is running');
+});
+
+const wss = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
+
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
+});
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
-    console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
+    console.log('[messenger] storage backend:', ok ? 'http_api' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('DATABASE_URL');
+    const needDb = !!(e('MESSENGER_API_URL') && e('MESSENGER_API_KEY'));
     const exitOnFail = e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1';
     if (!ok && needDb && exitOnFail) {
         process.exit(1);
@@ -150,18 +46,13 @@ const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     return ok;
 }).catch((err) => {
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('DATABASE_URL');
+    const needDb = !!(e('MESSENGER_API_URL') && e('MESSENGER_API_KEY'));
     if (needDb && e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1') process.exit(1);
     return false;
 });
-/** @type {Map<string, object>} */
 const messengerProfileMem = new Map();
 
-// Start the shared server on the single port
-sharedHttpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
-    console.log(`✅ HTTP API on http://0.0.0.0:${PORT}`);
-});
+console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
 function safeSend(ws, payload) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -225,7 +116,6 @@ function normalizeText(value, max = 4000) {
     return value.trim().slice(0, max);
 }
 
-/** Аватары часто data URL (base64) — короткий лимит ломал src и давал «мигание» в чатах. */
 const MAX_AVATAR_URL_LENGTH = 750000;
 function normalizeAvatarUrl(value) {
     return normalizeText(typeof value === 'string' ? value : value == null ? '' : String(value), MAX_AVATAR_URL_LENGTH);
@@ -255,7 +145,6 @@ function computeUserInitials(name, accountId) {
     return id ? id.charAt(0).toUpperCase() : '·';
 }
 
-/** Профиль для UI: MySQL (messengerProfileMem) или friends_store как fallback имени. */
 function getFormattedUser(userId) {
     const id = normalizeAccountId(userId);
     if (!id) {
@@ -467,7 +356,6 @@ function areFriendsForMessenger(userA, userB) {
     return af.includes(b) || bf.includes(a);
 }
 
-/** Кто может писать кому: ЧС с обеих сторон + политика получателя + друзья из friends_store / friendIds на сервере. */
 function directMessageGate(fromUserId, toUserId) {
     const fromId = normalizeAccountId(fromUserId);
     const toId = normalizeAccountId(toUserId);
@@ -498,7 +386,6 @@ function composeHintFromGate(gate) {
     return 'Вы не можете отправить сообщение этому пользователю';
 }
 
-/** Звонок другу: сначала те же ограничения, что и на ЛС (ЧС + who_can_write), затем who_can_call. */
 function outgoingCallGate(fromUserId, toUserId) {
     const dm = directMessageGate(fromUserId, toUserId);
     if (!dm.ok) return dm;
@@ -1236,8 +1123,6 @@ wss.on('connection', (ws) => {
                                 deletedAt: 0,
                                 replyTo: normalizeText(data.replyTo || '', 64),
                                 forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64),
-                                // Галочки: 1) доставлено получателю (после рассылки в его сессии)
-                                // 2) прочитано — когда получатель открыл диалог.
                                 deliveredBy: [toUserId],
                                 readBy: []
                             };
@@ -1268,7 +1153,6 @@ wss.on('connection', (ws) => {
                                     type: 'messenger-error',
                                     code: 'save_failed',
                                     message: `Не удалось сохранить сообщение: ${String(err?.message || err || '').slice(0, 220)}`
-                                    // Для очистки локального pending-сообщения можно будет использовать clientMessageId
                                 });
                                 return;
                             }
@@ -1296,9 +1180,6 @@ wss.on('connection', (ws) => {
                     break;
                 case 'messenger-message-read':
                     {
-                        // Сообщение прочитано в открытом диалоге на клиенте.
-                        // currentAppUserId — это получатель (который прочитал),
-                        // senderId — отправитель (которому надо показать "две галочки").
                         if (!currentAppUserId) return;
                         const chatId = normalizeText(data.chatId || '', 220);
                         const messageId = normalizeText(data.messageId || '', 100);
@@ -1309,7 +1190,6 @@ wss.on('connection', (ws) => {
                                 await mysqlBoot;
                             } catch (_) {}
                             if (!messengerMysql.isEnabled()) return;
-                            // Пишем прочтение в БД, чтобы после перезагрузки галочки не исчезали.
                             await messengerMysql.addMessageReadBy(messageId, currentAppUserId);
                             sendToUserSessions(senderId, {
                                 type: 'messenger-message-receipt',
@@ -1448,7 +1328,6 @@ wss.on('connection', (ws) => {
                                 });
                             }
                             emitMessengerSync(currentAppUserId, 'blacklist-updated');
-                            // Блокировка влияет на возможность писать обеим сторонам.
                             emitMessengerComposeStatus(currentAppUserId, targetId);
                             emitMessengerComposeStatus(targetId, currentAppUserId);
                         })();
@@ -1488,8 +1367,6 @@ wss.on('connection', (ws) => {
                             await upsertUserPresenceProfileMysql(currentAppUserId, patch);
                         }
                         emitMessengerSync(currentAppUserId, 'profile-updated');
-                        // Разошлем патч профиля всем подключенным клиентам,
-                        // чтобы аватары/имена обновлялись без перезагрузки.
                         broadcastMessengerProfilePatch(currentAppUserId);
                     })();
                     break;
@@ -1510,8 +1387,6 @@ wss.on('connection', (ws) => {
                             await upsertUserPresenceProfileMysql(currentAppUserId, patch);
                         }
                         emitMessengerSync(currentAppUserId, 'privacy-updated');
-                        // Приватность влияет на то, могут ли другие писать текущему пользователю.
-                        // Поэтому обновляем compose-status всем участникам прямых чатов текущего пользователя.
                         if (messengerMysql.isEnabled()) {
                             const chats = await messengerMysql.listChatsForUser(normalizeAccountId(currentAppUserId));
                             for (const ch of (chats || [])) {
@@ -2074,8 +1949,6 @@ function handleDisconnect(clientId, roomId, options = {}) {
     finalizeParticipantDisconnect(clientId, roomId);
 }
 
-// ============ АВТО-ПИНГ ДЛЯ ПРЕДОТВРАЩЕНИЯ ЗАСЫПАНИЯ ============
-// Каждые 4 минуты пингуем сам себя, чтобы Render не уснул
 const keepAlive = () => {
     const http = require('http');
     const options = {
@@ -2091,12 +1964,10 @@ const keepAlive = () => {
     });
     
     req.on('error', (err) => {
-        // Тишина, просто не пишем ошибки
     });
     
     req.end();
 };
 
-// Запускаем авто-пинг каждые 4 минуты
 setInterval(keepAlive, 4 * 60 * 1000);
 console.log('✅ Keep-alive enabled (ping every 4 minutes)');
