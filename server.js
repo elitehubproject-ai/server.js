@@ -35,6 +35,10 @@ const wss = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload:
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 });
+
+console.log('[server] MESSENGER_API_URL:', process.env.MESSENGER_API_URL ? 'SET' : 'NOT SET');
+console.log('[server] MESSENGER_API_KEY:', process.env.MESSENGER_API_KEY ? 'SET' : 'NOT SET');
+
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     console.log('[messenger] storage backend:', ok ? 'http_api' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
