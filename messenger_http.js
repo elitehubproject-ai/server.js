@@ -32,9 +32,6 @@ function directChatId(a, b) {
 
 // HTTP запрос к PHP API
 async function apiRequest(action, payload = {}, isInit = false) {
-  if (!isInit && (!enabled || !apiUrl)) {
-    throw new Error('API not initialized');
-  }
   if (!apiUrl) {
     throw new Error('API URL not set');
   }
