@@ -105,16 +105,30 @@ async function initMessengerMysql() {
     return false;
   }
 
-  try {
-    await apiRequest('listAllUserIds', {}, true);
-    enabled = true;
-    console.log('[messenger_http] connected via HTTP API');
-    return true;
-  } catch (err) {
-    console.error('[messenger_http] init failed:', err.message);
-    enabled = false;
-    return false;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const maxRetries = 10;
+  const delayMs = 1500;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[messenger_http] init attempt ${attempt}/${maxRetries}...`);
+      await apiRequest('listAllUserIds', {}, true);
+      enabled = true;
+      console.log('[messenger_http] connected via HTTP API');
+      return true;
+    } catch (err) {
+      console.error(`[messenger_http] attempt ${attempt} failed:`, err.message.substring(0, 100));
+      if (attempt < maxRetries) {
+        console.log(`[messenger_http] waiting ${delayMs}ms before retry...`);
+        await sleep(delayMs);
+      } else {
+        console.error('[messenger_http] all retries exhausted');
+        enabled = false;
+        return false;
+      }
+    }
   }
+  return false;
 }
 
 function isEnabled() {
