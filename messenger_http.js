@@ -31,9 +31,12 @@ function directChatId(a, b) {
 }
 
 // HTTP запрос к PHP API
-async function apiRequest(action, payload = {}) {
-  if (!enabled || !apiUrl) {
+async function apiRequest(action, payload = {}, isInit = false) {
+  if (!isInit && (!enabled || !apiUrl)) {
     throw new Error('API not initialized');
+  }
+  if (!apiUrl) {
+    throw new Error('API URL not set');
   }
 
   const url = new URL(apiUrl);
@@ -103,7 +106,7 @@ async function initMessengerMysql() {
   }
 
   try {
-    await apiRequest('listAllUserIds');
+    await apiRequest('listAllUserIds', {}, true);
     enabled = true;
     console.log('[messenger_http] connected via HTTP API');
     return true;
