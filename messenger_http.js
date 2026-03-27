@@ -91,6 +91,9 @@ async function initMessengerMysql() {
   apiUrl = env('MESSENGER_API_URL', '');
   apiKey = env('MESSENGER_API_KEY', '');
 
+  console.log('[messenger_http] MESSENGER_API_URL:', apiUrl ? 'set' : 'NOT SET');
+  console.log('[messenger_http] MESSENGER_API_KEY:', apiKey ? 'set (length: ' + apiKey.length + ')' : 'NOT SET');
+
   if (!apiUrl || !apiKey) {
     console.warn('[messenger_http] MESSENGER_API_URL or MESSENGER_API_KEY not set');
     return false;
