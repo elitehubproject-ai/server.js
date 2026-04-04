@@ -348,6 +348,7 @@ function rowToMessage(row) {
   const dbType = row.type;
   const isVoice = dbType === 'audio';
   const isImage = dbType === 'image';
+  const isVideoNote = dbType === 'video_note';
   const isVideo = dbType === 'video';
   const createdAt = Number(row.created_at) || 0;
   const base = {
@@ -357,7 +358,7 @@ function rowToMessage(row) {
     toId: row.recipient_id,
     createdAt,
     text: row.text || '',
-    messageKind: isVoice ? 'voice' : isImage ? 'image' : isVideo ? 'video' : 'text',
+    messageKind: isVoice ? 'voice' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text',
     replyTo: row.reply_to || '',
     forwardedFromMessageId: row.forwarded_from || '',
     editedAt: Number(row.edited_at) || 0,
@@ -373,13 +374,13 @@ function rowToMessage(row) {
   } else {
     base.audioMime = '';
     base.audioBase64 = '';
-    base.durationMs = 0;
+    base.durationMs = isVideoNote ? Number(row.duration_ms) || 0 : 0;
   }
   if (isImage) {
     base.imageBase64 = row.file_url || '';
     base.mimeType = row.image_mime || 'image/jpeg';
   }
-  if (isVideo) {
+  if (isVideo || isVideoNote) {
     base.videoBase64 = row.file_url || '';
     base.videoMime = row.audio_mime || 'video/mp4';
   }
@@ -390,10 +391,17 @@ async function insertMessage(msg) {
   const mk = msg.messageKind || msg.kind;
   const isVoice = mk === 'voice' || mk === 'audio';
   const isImage = mk === 'image';
+  const isVideoNote = mk === 'video_note';
   const isVideo = mk === 'video';
-  const type = isVoice ? 'audio' : isImage ? 'image' : isVideo ? 'video' : 'text';
-  const fileUrl = isVoice ? msg.audioBase64 || '' : isImage ? msg.imageBase64 || '' : isVideo ? msg.videoBase64 || '' : '';
-  const mimeCol = isVoice ? msg.audioMime || '' : isVideo ? msg.videoMime || 'video/mp4' : '';
+  const type = isVoice ? 'audio' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text';
+  const fileUrl = isVoice
+    ? msg.audioBase64 || ''
+    : isImage
+      ? msg.imageBase64 || ''
+      : isVideo || isVideoNote
+        ? msg.videoBase64 || ''
+        : '';
+  const mimeCol = isVoice ? msg.audioMime || '' : isVideo || isVideoNote ? msg.videoMime || 'video/mp4' : '';
   const imageMimeCol = isImage ? msg.mimeType || msg.imageMime || 'image/jpeg' : '';
   const createdAt = Number(msg.createdAt || msg.at || Date.now());
   const deliveredBy = Array.isArray(msg.deliveredBy) ? msg.deliveredBy.map(String) : [];
