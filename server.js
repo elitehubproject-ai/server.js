@@ -1096,8 +1096,9 @@ wss.on('connection', (ws) => {
                             const videoBase64 = videoRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, MAX_MEDIA_B64_LEN);
                             const isVoice = audioBase64.length > 32 && (data.messageKind === 'voice' || !!data.audioBase64);
                             const isImage = imageBase64.length > 80 && data.messageKind === 'image';
+                            const isVideoNote = videoBase64.length > 80 && data.messageKind === 'video_note';
                             const isVideo = videoBase64.length > 80 && data.messageKind === 'video';
-                            if (!text && !isVoice && !isImage && !isVideo) return;
+                            if (!text && !isVoice && !isImage && !isVideo && !isVideoNote) return;
                             const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
                             const mimeNorm = String(mimeRaw || '').split(';')[0].trim();
                             const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav|m4a|x-m4a|aac|x-aac)$/i.test(mimeNorm)
@@ -1108,6 +1109,7 @@ wss.on('connection', (ws) => {
                             let messageKind = 'text';
                             if (isVoice) messageKind = 'voice';
                             else if (isImage) messageKind = 'image';
+                            else if (isVideoNote) messageKind = 'video_note';
                             else if (isVideo) messageKind = 'video';
                             const message = {
                                 id: messageId,
@@ -1118,6 +1120,7 @@ wss.on('connection', (ws) => {
                                     text ||
                                     (isVoice ? 'Голосовое сообщение' : '') ||
                                     (isImage ? '📷 Фото' : '') ||
+                                    (isVideoNote ? '📹 Видеосообщение' : '') ||
                                     (isVideo ? '🎬 Видео' : '') ||
                                     '',
                                 messageKind,
@@ -1125,9 +1128,12 @@ wss.on('connection', (ws) => {
                                 audioBase64: isVoice ? audioBase64 : '',
                                 imageBase64: isImage ? imageBase64 : '',
                                 mimeType: isImage ? normalizeText(data.mimeType || 'image/jpeg', 80) : '',
-                                videoBase64: isVideo ? videoBase64 : '',
-                                videoMime: isVideo ? videoMime : '',
-                                durationMs: isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0,
+                                videoBase64: isVideo || isVideoNote ? videoBase64 : '',
+                                videoMime: isVideo || isVideoNote ? videoMime : '',
+                                durationMs:
+                                    isVoice || isVideoNote
+                                        ? Math.min(600000, Math.max(0, Number(data.durationMs || 0)))
+                                        : 0,
                                 createdAt: Date.now(),
                                 editedAt: 0,
                                 deletedAt: 0,
