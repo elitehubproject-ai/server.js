@@ -27,6 +27,7 @@ const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env
 const pendingDisconnects = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
 const messengerMysql = require('./messenger_pg');
+const durakEngine = require('./durak_engine');
 // Для медиа-сообщений ограничиваем длину base64-строки на сервере.
 // Ориентир: 50MB файл => ~67MB base64 символов.
 const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
@@ -782,10 +783,58 @@ function broadcastRoomState(room) {
             ownerId: room.ownerId,
             participants,
             watchParty: room.watchParty || null,
+            durak: room.durak ? { phase: room.durak.phase, playerCount: room.durak.players?.length || 0 } : null,
             isPrivate: !!room.isPrivate,
             pendingJoinRequests,
             iceServers: ACTIVE_ICE_SERVERS
         });
+    });
+}
+
+function broadcastDurak(room) {
+    if (!room) return;
+    if (!room.durak) {
+        room.participants.forEach((participant, id) => {
+            safeSend(participant.ws, {
+                type: 'durak-state',
+                game: null
+            });
+        });
+        return;
+    }
+    room.participants.forEach((participant, id) => {
+        safeSend(participant.ws, {
+            type: 'durak-state',
+            game: durakEngine.exportGamePublic(room.durak, id)
+        });
+    });
+}
+
+function handleDurakDisconnect(room, clientId) {
+    if (!room || !room.durak) return;
+    const g = room.durak;
+    if (g.phase === 'ended') return;
+    if (g.phase === 'lobby') {
+        const r = durakEngine.lobbyLeave(g, clientId);
+        if (r.empty) room.durak = null;
+    } else {
+        durakEngine.endGameByModerator(g);
+        room.durak = null;
+    }
+    broadcastDurak(room);
+}
+
+function tickDurakRooms() {
+    rooms.forEach((room, roomId) => {
+        if (!room.durak) return;
+        const g = room.durak;
+        if (g.phase === 'lobby') {
+            const started = durakEngine.lobbyTick(g);
+            if (started && started.ok) broadcastDurak(room);
+        } else if (g.phase === 'playing') {
+            const t = durakEngine.tickTurnTimer(g);
+            if (t && t.ok) broadcastDurak(room);
+        }
     });
 }
 
@@ -897,6 +946,7 @@ function finalizeParticipantDisconnect(clientId, roomId) {
     if (shouldStopWatch) {
         room.watchParty = null;
     }
+    handleDurakDisconnect(room, clientId);
     if (room.isFriendCall) {
         closeRoom(room, clientId, participant.userName || '');
         return;
@@ -1096,9 +1146,8 @@ wss.on('connection', (ws) => {
                             const videoBase64 = videoRaw.replace(/[^a-zA-Z0-9+/=]/g, '').slice(0, MAX_MEDIA_B64_LEN);
                             const isVoice = audioBase64.length > 32 && (data.messageKind === 'voice' || !!data.audioBase64);
                             const isImage = imageBase64.length > 80 && data.messageKind === 'image';
-                            const isVideoNote = videoBase64.length > 80 && data.messageKind === 'video_note';
                             const isVideo = videoBase64.length > 80 && data.messageKind === 'video';
-                            if (!text && !isVoice && !isImage && !isVideo && !isVideoNote) return;
+                            if (!text && !isVoice && !isImage && !isVideo) return;
                             const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
                             const mimeNorm = String(mimeRaw || '').split(';')[0].trim();
                             const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav|m4a|x-m4a|aac|x-aac)$/i.test(mimeNorm)
@@ -1109,7 +1158,6 @@ wss.on('connection', (ws) => {
                             let messageKind = 'text';
                             if (isVoice) messageKind = 'voice';
                             else if (isImage) messageKind = 'image';
-                            else if (isVideoNote) messageKind = 'video_note';
                             else if (isVideo) messageKind = 'video';
                             const message = {
                                 id: messageId,
@@ -1120,7 +1168,6 @@ wss.on('connection', (ws) => {
                                     text ||
                                     (isVoice ? 'Голосовое сообщение' : '') ||
                                     (isImage ? '📷 Фото' : '') ||
-                                    (isVideoNote ? '📹 Видеосообщение' : '') ||
                                     (isVideo ? '🎬 Видео' : '') ||
                                     '',
                                 messageKind,
@@ -1128,12 +1175,9 @@ wss.on('connection', (ws) => {
                                 audioBase64: isVoice ? audioBase64 : '',
                                 imageBase64: isImage ? imageBase64 : '',
                                 mimeType: isImage ? normalizeText(data.mimeType || 'image/jpeg', 80) : '',
-                                videoBase64: isVideo || isVideoNote ? videoBase64 : '',
-                                videoMime: isVideo || isVideoNote ? videoMime : '',
-                                durationMs:
-                                    isVoice || isVideoNote
-                                        ? Math.min(600000, Math.max(0, Number(data.durationMs || 0)))
-                                        : 0,
+                                videoBase64: isVideo ? videoBase64 : '',
+                                videoMime: isVideo ? videoMime : '',
+                                durationMs: isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0,
                                 createdAt: Date.now(),
                                 editedAt: 0,
                                 deletedAt: 0,
@@ -1463,6 +1507,7 @@ wss.on('connection', (ws) => {
                             joinRequests: new Map(),
                             ownerId: null,
                             watchParty: null,
+                            durak: null,
                             isPrivate: privateRoomRequested,
                             isFriendCall: friendCallModeRequested,
                             friendTargetAppUserId
@@ -1541,6 +1586,12 @@ wss.on('connection', (ws) => {
                             iceServers: ACTIVE_ICE_SERVERS
                         });
                         broadcastRoomState(room);
+                        if (room.durak) {
+                            safeSend(ws, {
+                                type: 'durak-state',
+                                game: durakEngine.exportGamePublic(room.durak, reconnectTargetId)
+                            });
+                        }
                         if (oldWs && oldWs !== ws) {
                             oldWs.__superseded = true;
                             try { oldWs.close(); } catch (_) {}
@@ -1590,6 +1641,12 @@ wss.on('connection', (ws) => {
                     });
 
                     broadcastRoomState(room);
+                    if (room.durak) {
+                        safeSend(ws, {
+                            type: 'durak-state',
+                            game: durakEngine.exportGamePublic(room.durak, clientId)
+                        });
+                    }
 
                     console.log(`🏠 User ${userName} ${isCreating ? 'created' : 'joined'} room: ${currentRoom}`);
                     break;
@@ -1905,6 +1962,96 @@ wss.on('connection', (ws) => {
                     }
                     break;
 
+                case 'durak-propose':
+                case 'durak-join':
+                case 'durak-leave':
+                case 'durak-cancel':
+                case 'durak-start':
+                case 'durak-action':
+                case 'durak-end':
+                    {
+                        const room = rooms.get(currentRoom);
+                        if (!room) return;
+                        const sender = room.participants.get(senderId);
+                        if (!sender) return;
+                        const senderIsOwner = room.ownerId === senderId;
+                        const senderIsAdmin = !!sender.isAdmin;
+                        const mod = senderIsOwner || senderIsAdmin;
+
+                        if (data.type === 'durak-propose') {
+                            if (room.durak) return;
+                            const mode = data.mode === 'perevodnoy' ? 'perevodnoy' : 'podkidnoy';
+                            room.durak = durakEngine.createLobby(senderId, userName, mode);
+                            broadcastDurak(room);
+                            broadcastRoomState(room);
+                            return;
+                        }
+
+                        if (!room.durak) return;
+                        const g = room.durak;
+
+                        if (data.type === 'durak-join') {
+                            durakEngine.lobbyJoin(g, senderId, userName);
+                            broadcastDurak(room);
+                            return;
+                        }
+
+                        if (data.type === 'durak-leave') {
+                            if (g.phase === 'ended') {
+                                room.durak = null;
+                            } else if (g.phase === 'lobby') {
+                                const r = durakEngine.lobbyLeave(g, senderId);
+                                if (r.empty) room.durak = null;
+                            } else {
+                                durakEngine.endGameByModerator(g);
+                                room.durak = null;
+                            }
+                            broadcastDurak(room);
+                            broadcastRoomState(room);
+                            return;
+                        }
+
+                        if (data.type === 'durak-cancel') {
+                            const r = durakEngine.cancelLobby(g, senderId, senderIsOwner, senderIsAdmin);
+                            if (r.ok && r.cancelled) {
+                                room.durak = null;
+                                broadcastDurak(room);
+                                broadcastRoomState(room);
+                            }
+                            return;
+                        }
+
+                        if (data.type === 'durak-start') {
+                            const force = !!data.force;
+                            const canForceStart = mod || senderId === g.initiatorId;
+                            const r = durakEngine.tryStartGame(g, senderId, force, canForceStart);
+                            if (r.ok) {
+                                broadcastDurak(room);
+                                broadcastRoomState(room);
+                            } else if (r.error) {
+                                safeSend(ws, { type: 'durak-error', message: r.error });
+                            }
+                            return;
+                        }
+
+                        if (data.type === 'durak-action') {
+                            const r = durakEngine.processAction(g, senderId, data.action || {});
+                            if (r.ok) broadcastDurak(room);
+                            else safeSend(ws, { type: 'durak-error', message: r.error || 'Ход невозможен' });
+                            return;
+                        }
+
+                        if (data.type === 'durak-end') {
+                            if (!mod) return;
+                            durakEngine.endGameByModerator(g);
+                            room.durak = null;
+                            broadcastDurak(room);
+                            broadcastRoomState(room);
+                            return;
+                        }
+                    }
+                    break;
+
                 case 'leave':
                     {
                         const roomToLeave = currentRoom;
@@ -2003,3 +2150,5 @@ const keepAlive = () => {
 // Запускаем авто-пинг каждые 4 минуты
 setInterval(keepAlive, 4 * 60 * 1000);
 console.log('✅ Keep-alive enabled (ping every 4 minutes)');
+
+setInterval(tickDurakRooms, 2000);
