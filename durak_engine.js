@@ -11,7 +11,9 @@ const RANKS = ['6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
 const RANK_VALUE = Object.fromEntries(RANKS.map((r, i) => [r, i]));
 
 function parseCard(id) {
-  const s = String(id || '').trim().toLowerCase();
+  let s = String(id || '').trim().toLowerCase();
+  if (!s) return null;
+  s = s.replace(/~\d+$/, '');
   if (s.length < 2) return null;
   const suit = s.slice(-1);
   if (!SUITS.includes(suit)) return null;
@@ -31,9 +33,10 @@ function parseCard(id) {
 
 function makeDeck36() {
   const d = [];
+  let uid = 0;
   for (const suit of SUITS) {
     for (const rank of RANKS) {
-      d.push(`${rank}${suit}`);
+      d.push(`${rank}${suit}~${uid++}`);
     }
   }
   return d;
@@ -61,12 +64,11 @@ function sortHand(ids, trumpSuit) {
   });
 }
 
-/** Тузом нельзя отбиваться (как картой защиты). */
+/** Обычные правила: та же масть старше, иначе козырь; козырь на козырь — старше по рангу. */
 function canBeat(attackId, defendId, trumpSuit) {
   const a = parseCard(attackId);
   const d = parseCard(defendId);
   if (!a || !d) return false;
-  if (d.rank === 'A') return false;
   const aTrump = a.suit === trumpSuit;
   const dTrump = d.suit === trumpSuit;
   if (aTrump && dTrump) return RANK_VALUE[d.rank] > RANK_VALUE[a.rank];
@@ -223,15 +225,46 @@ function checkGameEnd(game) {
   return false;
 }
 
-/** После «беру»: первым ходит бывший атакующий. После «бито»: бывший защитник становится атакующим. */
-function startNextBattle(game, nextAttackerPid) {
+/** После «беру»: снова атакует тот же атакующий, защищается тот, кто взял карты. */
+function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
   game.battlesFinished++;
   if (game.battlesFinished >= 1) game.firstDealRules = false;
   if (checkGameEnd(game)) return;
 
-  let ai = game.players.indexOf(nextAttackerPid);
+  let ai = game.players.indexOf(prevAttackerPid);
+  if (ai < 0) ai = 0;
+  ai = nextNonEmptyHandIndex(game, ai);
+  game.attackerIndex = ai;
+
+  let di = game.players.indexOf(prevDefenderPid);
+  if (di < 0) di = nextNonEmptyHandIndex(game, nextIndex(ai, n));
+  di = nextNonEmptyHandIndex(game, di);
+  if (di === ai) di = nextNonEmptyHandIndex(game, nextIndex(di, n));
+  game.defenderIndex = di;
+
+  game.battle = {
+    table: [],
+    subPhase: 'attack',
+    attackerPid: game.players[game.attackerIndex],
+    defenderPid: game.players[game.defenderIndex],
+    tosserQueue: [],
+    leadingRank: null
+  };
+  game.turnDeadline = Date.now() + game.turnSeconds * 1000;
+  game.version++;
+}
+
+/** После «бито»: бывший защитник отбивается и становится атакующим. */
+function startNextBattleAfterBeat(game, prevDefenderPid) {
+  const n = game.players.length;
+  if (!game.stockEmpty) refillHands(game);
+  game.battlesFinished++;
+  if (game.battlesFinished >= 1) game.firstDealRules = false;
+  if (checkGameEnd(game)) return;
+
+  let ai = game.players.indexOf(prevDefenderPid);
   if (ai < 0) ai = 0;
   ai = nextNonEmptyHandIndex(game, ai);
   game.attackerIndex = ai;
@@ -424,12 +457,13 @@ function applyTake(game) {
   const b = game.battle;
   const dpid = game.players[game.defenderIndex];
   const prevAttackerPid = game.players[game.attackerIndex];
+  const prevDefenderPid = dpid;
   const hand = game.hands.get(dpid) || [];
   for (const row of b.table) {
     pushTableCardsToHand(hand, row);
   }
   game.hands.set(dpid, sortHand(hand, game.trump));
-  startNextBattle(game, prevAttackerPid);
+  startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid);
   return { ok: true };
 }
 
@@ -443,7 +477,7 @@ function applyBito(game) {
   for (const row of b.table) {
     pushTableCardsToDiscard(game, row);
   }
-  startNextBattle(game, prevDefenderPid);
+  startNextBattleAfterBeat(game, prevDefenderPid);
   return { ok: true };
 }
 
@@ -576,51 +610,75 @@ function processAction(game, pid, action) {
       }
       const { row, beatAttack } = tgt;
 
-      if (game.mode === 'perevodnoy' && action.transfer && beatAttack) {
-        const tr = parseCard(cardId);
-        const lead = parseCard(row.attack);
-        if (tr && lead && tr.rank === lead.rank) {
-          row.transferCard = cardId;
-          row.beatType = 'transfer';
-          let ni = nextIndex(game.defenderIndex, n);
-          let steps = 0;
-          while (steps < n && (game.hands.get(game.players[ni]) || []).length === 0) {
-            ni = nextIndex(ni, n);
-            steps++;
-          }
-          game.defenderIndex = ni;
-          b.defenderPid = game.players[game.defenderIndex];
-          b.subPhase = 'defend';
+      const playTarget =
+        action.target === 'beat' ? 'beat' : action.target === 'transfer' ? 'transfer' : action.transfer ? 'transfer' : null;
+
+      const applyTransfer = () => {
+        row.transferCard = cardId;
+        row.beatType = 'transfer';
+        let ni = nextIndex(game.defenderIndex, n);
+        let steps = 0;
+        while (steps < n && (game.hands.get(game.players[ni]) || []).length === 0) {
+          ni = nextIndex(ni, n);
+          steps++;
+        }
+        game.defenderIndex = ni;
+        b.defenderPid = game.players[game.defenderIndex];
+        b.subPhase = 'defend';
+        game.turnDeadline = Date.now() + game.turnSeconds * 1000;
+        game.version++;
+      };
+
+      const applyBeat = () => {
+        const attackCard = beatAttack ? row.attack : row.transferCard;
+        if (!canBeat(attackCard, cardId, game.trump)) {
+          game.hands.get(pid).push(cardId);
+          game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
+          return { ok: false, error: 'Этой картой нельзя побить' };
+        }
+        if (beatAttack) {
+          row.defense = cardId;
+          row.beatType = row.transferCard ? row.beatType : 'beat';
+        } else {
+          row.transferDefense = cardId;
+          row.beatType = 'beat';
+        }
+        const still = nextDefendTarget(b);
+        if (still) {
           game.turnDeadline = Date.now() + game.turnSeconds * 1000;
           game.version++;
           return { ok: true };
         }
-      }
-
-      const attackCard = beatAttack ? row.attack : row.transferCard;
-      if (!canBeat(attackCard, cardId, game.trump)) {
-        game.hands.get(pid).push(cardId);
-        game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
-        return { ok: false, error: 'Этой картой нельзя побить' };
-      }
-      if (beatAttack) {
-        row.defense = cardId;
-        row.beatType = row.transferCard ? row.beatType : 'beat';
-      } else {
-        row.transferDefense = cardId;
-        row.beatType = 'beat';
-      }
-
-      const still = nextDefendTarget(b);
-      if (still) {
+        b.subPhase = 'toss';
         game.turnDeadline = Date.now() + game.turnSeconds * 1000;
         game.version++;
         return { ok: true };
+      };
+
+      if (game.mode === 'perevodnoy' && beatAttack) {
+        const tr = parseCard(cardId);
+        const lead = parseCard(row.attack);
+        const sameRank = tr && lead && tr.rank === lead.rank;
+        const beatOk = canBeat(row.attack, cardId, game.trump);
+        if (sameRank && beatOk) {
+          if (playTarget === 'transfer') {
+            applyTransfer();
+            return { ok: true };
+          }
+          if (playTarget === 'beat') {
+            return applyBeat();
+          }
+          game.hands.get(pid).push(cardId);
+          game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
+          return { ok: false, error: 'Перетащите карту в «Побить» или «Перевод»' };
+        }
+        if (sameRank && !beatOk) {
+          applyTransfer();
+          return { ok: true };
+        }
       }
-      b.subPhase = 'toss';
-      game.turnDeadline = Date.now() + game.turnSeconds * 1000;
-      game.version++;
-      return { ok: true };
+
+      return applyBeat();
     }
 
     if (b.subPhase === 'toss') {
