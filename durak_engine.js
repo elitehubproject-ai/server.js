@@ -361,11 +361,11 @@ function lobbyLeave(game, pid) {
   return { ok: true };
 }
 
-function tryStartGame(game, pid, force, isModerator) {
+function tryStartGame(game, pid, force, canForceStart) {
   if (game.phase !== 'lobby') return { ok: false, error: 'Уже не лобби' };
   if (!game.players.includes(pid)) return { ok: false, error: 'Не в лобби' };
   if (game.players.length < 2) return { ok: false, error: 'Нужно минимум 2 игрока' };
-  if (force && !isModerator) return { ok: false, error: 'Только модератор' };
+  if (force && !canForceStart) return { ok: false, error: 'Нет прав на принудительный старт' };
   return dealInitial(game);
 }
 
