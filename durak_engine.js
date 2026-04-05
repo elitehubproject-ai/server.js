@@ -351,6 +351,21 @@ function startNextBattleAfterBeat(game, prevDefenderPid) {
   game.version++;
 }
 
+/** Кто нажимает «бито»: обычно атакующий по индексу; если после перевода совпал с защитником — другой игрок (не защитник). */
+function bitoAuthorityPid(game) {
+  const n = game.players.length;
+  const atkIdx = game.attackerIndex;
+  const defIdx = game.defenderIndex;
+  if (atkIdx !== defIdx) return game.players[atkIdx];
+  let i = nextNonEmptyHandIndex(game, nextIndex(defIdx, n));
+  let guard = 0;
+  while (guard < n && i === defIdx) {
+    i = nextNonEmptyHandIndex(game, nextIndex(i, n));
+    guard++;
+  }
+  return game.players[i];
+}
+
 function ranksOnTable(battle) {
   const s = new Set();
   for (const row of battle.table) {
@@ -809,7 +824,7 @@ function processAction(game, pid, action) {
   }
 
   if (type === 'done') {
-    if (pid !== game.players[game.attackerIndex]) return { ok: false, error: 'Только атакующий нажимает бито' };
+    if (pid !== bitoAuthorityPid(game)) return { ok: false, error: 'Только атакующий нажимает бито' };
     if (game.battle.subPhase !== 'toss') return { ok: false, error: 'Сначала отбейтесь' };
     if (game.battle.table.some((r) => !rowFullyDefendedForBito(r))) return { ok: false, error: 'Есть неотбитые' };
     return applyBito(game);
@@ -903,6 +918,7 @@ function processAction(game, pid, action) {
           return { ok: true };
         }
         b.subPhase = 'toss';
+        b.attackerPid = bitoAuthorityPid(game);
         game.turnDeadline = Date.now() + game.turnSeconds * 1000;
         game.version++;
         return { ok: true };
