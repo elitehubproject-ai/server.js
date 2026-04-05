@@ -818,8 +818,8 @@ function handleDurakDisconnect(room, clientId) {
         const r = durakEngine.lobbyLeave(g, clientId);
         if (r.empty) room.durak = null;
     } else {
-        durakEngine.endGameByModerator(g);
-        room.durak = null;
+        const r = durakEngine.playingLeave(g, clientId);
+        if (r.empty) room.durak = null;
     }
     broadcastDurak(room);
 }
@@ -2003,8 +2003,8 @@ wss.on('connection', (ws) => {
                                 const r = durakEngine.lobbyLeave(g, senderId);
                                 if (r.empty) room.durak = null;
                             } else {
-                                durakEngine.endGameByModerator(g);
-                                room.durak = null;
+                                const r = durakEngine.playingLeave(g, senderId);
+                                if (r.empty) room.durak = null;
                             }
                             broadcastDurak(room);
                             broadcastRoomState(room);
