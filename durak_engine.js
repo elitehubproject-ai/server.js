@@ -128,6 +128,40 @@ function nextIndex(n, len) {
   return (n + 1) % len;
 }
 
+/** Цепочка переводов: [{ card, defense }]. Совместимость со старым transferCard. */
+function ensureTransferStack(row) {
+  if (!row || typeof row !== 'object') return;
+  if (!Array.isArray(row.transferStack)) {
+    row.transferStack = [];
+    if (row.transferCard) {
+      row.transferStack.push({ card: row.transferCard, defense: row.transferDefense || null });
+    }
+  }
+}
+
+function getTransfers(row) {
+  ensureTransferStack(row);
+  return row.transferStack;
+}
+
+/** Сколько карт в сумме в неотбитой «куче» на столе, если на targetRow добавить ещё один перевод. */
+function totalCardsInAttackPileAfterOneMoreTransfer(battle, targetRow) {
+  let n = 0;
+  for (const row of battle.table) {
+    ensureTransferStack(row);
+    const ts = row.transferStack;
+    const addHere = row === targetRow ? 1 : 0;
+    if (!row.defense) {
+      n += 1 + ts.length + addHere;
+    } else {
+      for (const t of ts) {
+        if (!t.defense) n++;
+      }
+    }
+  }
+  return n;
+}
+
 function removeCardFromHand(hands, pid, cardId) {
   const h = hands.get(pid);
   if (!h) return false;
@@ -308,9 +342,13 @@ function ranksOnTable(battle) {
       const d = parseCard(row.defense);
       if (d) s.add(d.rank);
     }
-    if (row.transferCard) {
-      const t = parseCard(row.transferCard);
-      if (t) s.add(t.rank);
+    for (const t of getTransfers(row)) {
+      const x = parseCard(t.card);
+      if (x) s.add(x.rank);
+      if (t.defense) {
+        const d2 = parseCard(t.defense);
+        if (d2) s.add(d2.rank);
+      }
     }
   }
   return s;
@@ -346,14 +384,14 @@ function canAnyToss(game) {
   return false;
 }
 
-/** Что отбивать дальше: сначала атака, потом карта перевода. */
+/** Что отбивать дальше: сначала атака, потом карты перевода по порядку. */
 function nextDefendTarget(battle) {
   for (const row of battle.table) {
-    if (row.transferCard) {
-      if (!row.defense) return { row, beatAttack: true };
-      if (!row.transferDefense) return { row, beatAttack: false };
-    } else {
-      if (!row.defense) return { row, beatAttack: true };
+    ensureTransferStack(row);
+    if (!row.defense) return { row, beatAttack: true, transferIndex: null };
+    const ts = row.transferStack;
+    for (let i = 0; i < ts.length; i++) {
+      if (!ts[i].defense) return { row, beatAttack: false, transferIndex: i };
     }
   }
   return null;
@@ -363,35 +401,31 @@ function nextDefendTarget(battle) {
 function enumerateBeatTargets(battle, defendCardId, trumpSuit) {
   const out = [];
   for (const row of battle.table) {
+    ensureTransferStack(row);
     if (!row.defense && canBeat(row.attack, defendCardId, trumpSuit)) {
-      out.push({ row, beatAttack: true, anchor: row.attack });
+      out.push({ row, beatAttack: true, anchor: row.attack, transferIndex: null });
     }
-    if (row.defense && row.transferCard && !row.transferDefense && canBeat(row.transferCard, defendCardId, trumpSuit)) {
-      out.push({ row, beatAttack: false, anchor: row.transferCard });
+    if (row.defense) {
+      const ts = row.transferStack;
+      for (let i = 0; i < ts.length; i++) {
+        const t = ts[i];
+        if (!t.defense && canBeat(t.card, defendCardId, trumpSuit)) {
+          out.push({ row, beatAttack: false, anchor: t.card, transferIndex: i });
+        }
+      }
     }
   }
   return out;
 }
 
-/** Перевод только по непобитой первичной атаке (не подкид, не после отбоя). */
+/** Перевод по непобитой атаке (цепочка: можно снова перевести тем же достоинством). */
 function canTransferOnRow(game, row, cardId) {
   if (game.mode !== 'perevodnoy') return false;
   if (row.defense) return false;
-  if (row.beatType !== 'attack') return false;
-  if (row.transferCard) return false;
+  if (row.beatType === 'toss') return false;
   const tr = parseCard(cardId);
   const lead = parseCard(row.attack);
   return !!(tr && lead && tr.rank === lead.rank);
-}
-
-function countUnbeatenSidesAfterTransfer(battle, targetRow, transferCardId) {
-  let n = 0;
-  for (const row of battle.table) {
-    const xfer = row === targetRow ? transferCardId : row.transferCard;
-    if (!row.defense) n++;
-    if (xfer && !row.transferDefense) n++;
-  }
-  return n;
 }
 
 function resolveNextDefenderIndex(game) {
@@ -438,9 +472,9 @@ function tryDefendPlay(game, cardId, action) {
 
   const transferAllowedForRow = (row) => {
     const ni = resolveNextDefenderIndex(game);
-    const need = countUnbeatenSidesAfterTransfer(b, row, cardId);
+    const need = totalCardsInAttackPileAfterOneMoreTransfer(b, row);
     if ((game.hands.get(game.players[ni]) || []).length < need) {
-      return { ok: false, error: 'У следующего защитника мало карт для перевода' };
+      return { ok: false, error: 'У защитника мало карт — перевод невозможен' };
     }
     return { ok: true, ni };
   };
@@ -485,7 +519,13 @@ function tryDefendPlay(game, cardId, action) {
     if (!hit) {
       return { ok: false, error: against ? 'Нельзя побить эту карту' : 'Укажите, какую карту бьёте' };
     }
-    return { ok: true, kind: 'beat', row: hit.row, beatAttack: hit.beatAttack };
+    return {
+      ok: true,
+      kind: 'beat',
+      row: hit.row,
+      beatAttack: hit.beatAttack,
+      transferIndex: hit.transferIndex == null ? null : hit.transferIndex
+    };
   }
 
   const xfer = pickTransferRow();
@@ -514,7 +554,15 @@ function tryDefendPlay(game, cardId, action) {
       return { ok: true, kind: 'transfer', row: rowByAttack };
     }
     const hitA = beats.find((t) => t.anchor === against);
-    if (hitA) return { ok: true, kind: 'beat', row: hitA.row, beatAttack: hitA.beatAttack };
+    if (hitA) {
+      return {
+        ok: true,
+        kind: 'beat',
+        row: hitA.row,
+        beatAttack: hitA.beatAttack,
+        transferIndex: hitA.transferIndex == null ? null : hitA.transferIndex
+      };
+    }
     return { ok: false, error: 'Нельзя сходить на эту карту' };
   }
 
@@ -525,7 +573,13 @@ function tryDefendPlay(game, cardId, action) {
   }
 
   if (hit && !xfer) {
-    return { ok: true, kind: 'beat', row: hit.row, beatAttack: hit.beatAttack };
+    return {
+      ok: true,
+      kind: 'beat',
+      row: hit.row,
+      beatAttack: hit.beatAttack,
+      transferIndex: hit.transferIndex == null ? null : hit.transferIndex
+    };
   }
 
   if (!xfer && !hit) {
@@ -538,17 +592,23 @@ function tryDefendPlay(game, cardId, action) {
 }
 
 function pushTableCardsToHand(hand, row) {
+  ensureTransferStack(row);
   hand.push(row.attack);
-  if (row.transferCard) hand.push(row.transferCard);
   if (row.defense) hand.push(row.defense);
-  if (row.transferDefense) hand.push(row.transferDefense);
+  for (const t of row.transferStack) {
+    hand.push(t.card);
+    if (t.defense) hand.push(t.defense);
+  }
 }
 
 function pushTableCardsToDiscard(game, row) {
+  ensureTransferStack(row);
   game.discard.push(row.attack);
-  if (row.transferCard) game.discard.push(row.transferCard);
   if (row.defense) game.discard.push(row.defense);
-  if (row.transferDefense) game.discard.push(row.transferDefense);
+  for (const t of row.transferStack) {
+    game.discard.push(t.card);
+    if (t.defense) game.discard.push(t.defense);
+  }
 }
 
 function exportGamePublic(game, viewerId) {
@@ -656,12 +716,15 @@ function applyTake(game) {
   return { ok: true };
 }
 
+function rowFullyDefendedForBito(row) {
+  ensureTransferStack(row);
+  if (!row.defense) return false;
+  return row.transferStack.every((t) => t.defense);
+}
+
 function applyBito(game) {
   const b = game.battle;
-  if (b.table.some((r) => !r.defense)) return { ok: false, error: 'Не всё отбито' };
-  for (const row of b.table) {
-    if (row.transferCard && !row.transferDefense) return { ok: false, error: 'Перевод не отбит' };
-  }
+  if (b.table.some((r) => !rowFullyDefendedForBito(r))) return { ok: false, error: 'Не всё отбито' };
   const prevDefenderPid = game.players[game.defenderIndex];
   for (const row of b.table) {
     pushTableCardsToDiscard(game, row);
@@ -738,10 +801,7 @@ function processAction(game, pid, action) {
   if (type === 'done') {
     if (pid !== game.players[game.attackerIndex]) return { ok: false, error: 'Только атакующий нажимает бито' };
     if (game.battle.subPhase !== 'toss') return { ok: false, error: 'Сначала отбейтесь' };
-    if (game.battle.table.some((r) => !r.defense)) return { ok: false, error: 'Есть неотбитые' };
-    for (const row of game.battle.table) {
-      if (row.transferCard && !row.transferDefense) return { ok: false, error: 'Перевод не отбит' };
-    }
+    if (game.battle.table.some((r) => !rowFullyDefendedForBito(r))) return { ok: false, error: 'Есть неотбитые' };
     return applyBito(game);
   }
 
@@ -772,7 +832,7 @@ function processAction(game, pid, action) {
       }
       b.leadingRank = rank0;
       for (const cid of cardIds) {
-        b.table.push({ attack: cid, defense: null, beatType: 'attack', transferCard: null, transferDefense: null });
+        b.table.push({ attack: cid, defense: null, beatType: 'attack', transferStack: [] });
       }
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
@@ -793,7 +853,8 @@ function processAction(game, pid, action) {
       if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
 
       const applyTransfer = (row) => {
-        row.transferCard = cardId;
+        ensureTransferStack(row);
+        row.transferStack.push({ card: cardId, defense: null });
         row.beatType = 'transfer';
         let ni = nextIndex(game.defenderIndex, n);
         let steps = 0;
@@ -809,8 +870,9 @@ function processAction(game, pid, action) {
         game.version++;
       };
 
-      const applyBeat = (row, beatAttack) => {
-        const attackCard = beatAttack ? row.attack : row.transferCard;
+      const applyBeat = (row, beatAttack, transferIdx) => {
+        ensureTransferStack(row);
+        const attackCard = beatAttack ? row.attack : row.transferStack[transferIdx].card;
         if (!canBeat(attackCard, cardId, game.trump)) {
           game.hands.get(pid).push(cardId);
           game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
@@ -818,9 +880,9 @@ function processAction(game, pid, action) {
         }
         if (beatAttack) {
           row.defense = cardId;
-          row.beatType = row.transferCard ? row.beatType : 'beat';
+          row.beatType = row.transferStack.length > 0 ? 'transfer' : 'beat';
         } else {
-          row.transferDefense = cardId;
+          row.transferStack[transferIdx].defense = cardId;
           row.beatType = 'beat';
         }
         const still = nextDefendTarget(b);
@@ -841,7 +903,8 @@ function processAction(game, pid, action) {
         checkGameEnd(game);
         return { ok: true };
       }
-      const br = applyBeat(plan.row, plan.beatAttack);
+      const tidx = plan.beatAttack ? 0 : plan.transferIndex;
+      const br = applyBeat(plan.row, plan.beatAttack, tidx);
       if (br && br.ok) checkGameEnd(game);
       return br;
     }
@@ -865,8 +928,7 @@ function processAction(game, pid, action) {
         attack: cardId,
         defense: null,
         beatType: 'toss',
-        transferCard: null,
-        transferDefense: null
+        transferStack: []
       });
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
