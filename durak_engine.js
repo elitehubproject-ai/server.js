@@ -1,13 +1,13 @@
 'use strict';
 
 /**
- * Подкидной / переводной дурак, колода 52 карты (как типичный спрайт 13×4).
- * Формат карты: ранг + масть, напр. "2s", "Ah", "Ts" (десятка).
- * Масти: s пики, h червы, d бубны, c трефы
+ * Подкидной / переводной дурак, колода 36 (6…A × 4 масти).
+ * Формат карты: "6s", "Th", "As" …
+ * Масти: s пики, h черви, d бубны, c трефы
  */
 
 const SUITS = ['s', 'h', 'd', 'c'];
-const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+const RANKS = ['6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
 const RANK_VALUE = Object.fromEntries(RANKS.map((r, i) => [r, i]));
 
 function parseCard(id) {
@@ -21,7 +21,7 @@ function parseCard(id) {
   else if (head.length === 1) {
     const c = head;
     if (c === 't') rank = 'T';
-    else if (/^[2-9]$/.test(c)) rank = c;
+    else if (/^[6-9]$/.test(c)) rank = c;
     else if (/^[jqka]$/i.test(c)) rank = c.toUpperCase();
     else return null;
   } else return null;
@@ -29,7 +29,7 @@ function parseCard(id) {
   return { rank, suit, id: `${rank}${suit}` };
 }
 
-function makeDeck52() {
+function makeDeck36() {
   const d = [];
   for (const suit of SUITS) {
     for (const rank of RANKS) {
@@ -61,10 +61,12 @@ function sortHand(ids, trumpSuit) {
   });
 }
 
+/** Тузом нельзя отбиваться (как картой защиты). */
 function canBeat(attackId, defendId, trumpSuit) {
   const a = parseCard(attackId);
   const d = parseCard(defendId);
   if (!a || !d) return false;
+  if (d.rank === 'A') return false;
   const aTrump = a.suit === trumpSuit;
   const dTrump = d.suit === trumpSuit;
   if (aTrump && dTrump) return RANK_VALUE[d.rank] > RANK_VALUE[a.rank];
@@ -74,12 +76,11 @@ function canBeat(attackId, defendId, trumpSuit) {
   return false;
 }
 
-function lowestTrumpFirstAttacker(players, hands, trumpSuit) {
+function lowestTrumpFirstAttacker(players, hands, trumpSuit, rng = Math.random) {
   let best = null;
   let bestPid = null;
   for (const pid of players) {
-    const hand = hands.get(pid) || [];
-    for (const cid of hand) {
+    for (const cid of hands.get(pid) || []) {
       const c = parseCard(cid);
       if (!c || c.suit !== trumpSuit) continue;
       const val = RANK_VALUE[c.rank];
@@ -90,20 +91,7 @@ function lowestTrumpFirstAttacker(players, hands, trumpSuit) {
     }
   }
   if (bestPid) return bestPid;
-  let low = null;
-  let lowPid = players[0];
-  for (const pid of players) {
-    for (const cid of hands.get(pid) || []) {
-      const c = parseCard(cid);
-      if (!c) continue;
-      const key = RANK_VALUE[c.rank] * 10 + SUITS.indexOf(c.suit);
-      if (low === null || key < low) {
-        low = key;
-        lowPid = pid;
-      }
-    }
-  }
-  return lowPid;
+  return players[Math.floor(rng() * players.length)] || players[0];
 }
 
 function createEmptyGame(mode) {
@@ -121,6 +109,7 @@ function createEmptyGame(mode) {
     battle: null,
     attackerIndex: 0,
     defenderIndex: 1,
+    handTarget: 6,
     stockEmpty: false,
     firstDealRules: true,
     battlesFinished: 0,
@@ -137,10 +126,6 @@ function nextIndex(n, len) {
   return (n + 1) % len;
 }
 
-function prevIndex(n, len) {
-  return (n - 1 + len) % len;
-}
-
 function removeCardFromHand(hands, pid, cardId) {
   const h = hands.get(pid);
   if (!h) return false;
@@ -150,13 +135,30 @@ function removeCardFromHand(hands, pid, cardId) {
   return true;
 }
 
+/** Следующий непустой индекс руки, начиная с fromIdx. */
+function nextNonEmptyHandIndex(game, fromIdx) {
+  const n = game.players.length;
+  if (n === 0) return 0;
+  let i = fromIdx % n;
+  let steps = 0;
+  while (steps < n) {
+    const pid = game.players[i];
+    if ((game.hands.get(pid) || []).length > 0) return i;
+    i = nextIndex(i, n);
+    steps++;
+  }
+  return fromIdx % n;
+}
+
 function dealInitial(game) {
   const n = game.players.length;
-  if (n < 2 || n > 8) return { ok: false, error: 'Игроков должно быть от 2 до 8' };
-  game.deck = shuffle(makeDeck52());
+  if (n < 2 || n > 6) return { ok: false, error: 'Игроков от 2 до 6' };
+  game.deck = shuffle(makeDeck36());
   game.hands = new Map();
   game.players.forEach((pid) => game.hands.set(pid, []));
-  for (let round = 0; round < 6; round++) {
+  const perHand = n === 6 ? 5 : 6;
+  game.handTarget = perHand;
+  for (let round = 0; round < perHand; round++) {
     for (let p = 0; p < n; p++) {
       if (game.deck.length === 0) break;
       const pid = game.players[p];
@@ -170,11 +172,9 @@ function dealInitial(game) {
   game.stockEmpty = false;
   game.firstDealRules = true;
   game.battlesFinished = 0;
-  const ai = game.players.indexOf(
-    lowestTrumpFirstAttacker(game.players, game.hands, game.trump)
-  );
-  game.attackerIndex = ai >= 0 ? ai : 0;
-  game.defenderIndex = nextIndex(game.attackerIndex, n);
+  const firstPid = lowestTrumpFirstAttacker(game.players, game.hands, game.trump);
+  game.attackerIndex = Math.max(0, game.players.indexOf(firstPid));
+  game.defenderIndex = nextNonEmptyHandIndex(game, nextIndex(game.attackerIndex, n));
   game.phase = 'playing';
   game.battle = {
     table: [],
@@ -194,6 +194,7 @@ function dealInitial(game) {
 
 function refillHands(game) {
   const n = game.players.length;
+  const limit = game.handTarget || 6;
   const order = [];
   let idx = game.attackerIndex;
   for (let k = 0; k < n; k++) {
@@ -202,7 +203,7 @@ function refillHands(game) {
   }
   for (const pid of order) {
     const h = game.hands.get(pid) || [];
-    while (h.length < 6 && game.deck.length > 0) {
+    while (h.length < limit && game.deck.length > 0) {
       h.push(game.deck.pop());
     }
     game.hands.set(pid, sortHand(h, game.trump));
@@ -222,20 +223,26 @@ function checkGameEnd(game) {
   return false;
 }
 
-function startNextBattle(game) {
+/** После «беру»: первым ходит бывший атакующий. После «бито»: бывший защитник становится атакующим. */
+function startNextBattle(game, nextAttackerPid) {
   const n = game.players.length;
-  const prevDef = game.defenderIndex;
   if (!game.stockEmpty) refillHands(game);
   game.battlesFinished++;
   if (game.battlesFinished >= 1) game.firstDealRules = false;
   if (checkGameEnd(game)) return;
-  game.attackerIndex = prevDef;
+
+  let ai = game.players.indexOf(nextAttackerPid);
+  if (ai < 0) ai = 0;
+  ai = nextNonEmptyHandIndex(game, ai);
+  game.attackerIndex = ai;
+
   let dIdx = nextIndex(game.attackerIndex, n);
-  while ((game.hands.get(game.players[dIdx]) || []).length === 0) {
-    dIdx = nextIndex(dIdx, n);
-    if (dIdx === game.attackerIndex) break;
+  dIdx = nextNonEmptyHandIndex(game, dIdx);
+  if (dIdx === game.attackerIndex) {
+    dIdx = nextNonEmptyHandIndex(game, nextIndex(dIdx, n));
   }
   game.defenderIndex = dIdx;
+
   game.battle = {
     table: [],
     subPhase: 'attack',
@@ -295,6 +302,33 @@ function canAnyToss(game) {
   return false;
 }
 
+/** Что отбивать дальше: сначала атака, потом карта перевода. */
+function nextDefendTarget(battle) {
+  for (const row of battle.table) {
+    if (row.transferCard) {
+      if (!row.defense) return { row, beatAttack: true };
+      if (!row.transferDefense) return { row, beatAttack: false };
+    } else {
+      if (!row.defense) return { row, beatAttack: true };
+    }
+  }
+  return null;
+}
+
+function pushTableCardsToHand(hand, row) {
+  hand.push(row.attack);
+  if (row.transferCard) hand.push(row.transferCard);
+  if (row.defense) hand.push(row.defense);
+  if (row.transferDefense) hand.push(row.transferDefense);
+}
+
+function pushTableCardsToDiscard(game, row) {
+  game.discard.push(row.attack);
+  if (row.transferCard) game.discard.push(row.transferCard);
+  if (row.defense) game.discard.push(row.defense);
+  if (row.transferDefense) game.discard.push(row.transferDefense);
+}
+
 function exportGamePublic(game, viewerId) {
   const out = {
     mode: game.mode,
@@ -308,6 +342,7 @@ function exportGamePublic(game, viewerId) {
     trump: game.trump,
     trumpCard: game.trumpCard,
     deckCount: game.deck.length,
+    handTarget: game.handTarget || 6,
     battle: game.battle,
     attackerIndex: game.attackerIndex,
     defenderIndex: game.defenderIndex,
@@ -340,7 +375,7 @@ function createLobby(initiatorId, initiatorName, mode) {
 
 function lobbyJoin(game, pid, name) {
   if (game.phase !== 'lobby') return { ok: false, error: 'Не лобби' };
-  if (game.players.length > 8) return { ok: false, error: 'Максимум 8 игроков (колода 52)' };
+  if (game.players.length > 6) return { ok: false, error: 'Максимум 6 игроков' };
   if (!game.players.includes(pid)) {
     game.players.push(pid);
     game.playerNames[pid] = String(name || 'Игрок').slice(0, 40);
@@ -388,15 +423,13 @@ function endGameByModerator(game) {
 function applyTake(game) {
   const b = game.battle;
   const dpid = game.players[game.defenderIndex];
+  const prevAttackerPid = game.players[game.attackerIndex];
   const hand = game.hands.get(dpid) || [];
   for (const row of b.table) {
-    hand.push(row.attack);
-    if (row.transferCard) hand.push(row.transferCard);
-    if (row.defense) hand.push(row.defense);
+    pushTableCardsToHand(hand, row);
   }
   game.hands.set(dpid, sortHand(hand, game.trump));
-  game.discard.push(...b.table.map((r) => [r.attack, r.defense].filter(Boolean)).flat());
-  startNextBattle(game);
+  startNextBattle(game, prevAttackerPid);
   return { ok: true };
 }
 
@@ -404,11 +437,65 @@ function applyBito(game) {
   const b = game.battle;
   if (b.table.some((r) => !r.defense)) return { ok: false, error: 'Не всё отбито' };
   for (const row of b.table) {
-    game.discard.push(row.attack);
-    if (row.transferCard) game.discard.push(row.transferCard);
-    if (row.defense) game.discard.push(row.defense);
+    if (row.transferCard && !row.transferDefense) return { ok: false, error: 'Перевод не отбит' };
   }
-  startNextBattle(game);
+  const prevDefenderPid = game.players[game.defenderIndex];
+  for (const row of b.table) {
+    pushTableCardsToDiscard(game, row);
+  }
+  startNextBattle(game, prevDefenderPid);
+  return { ok: true };
+}
+
+/** Выход из партии без завершения для всех. */
+function playingLeave(game, pid) {
+  if (game.phase !== 'playing') return { ok: false, error: 'Не идёт игра' };
+  if (!game.players.includes(pid)) return { ok: false, error: 'Не в игре' };
+
+  const hand = game.hands.get(pid) || [];
+  for (const c of hand) game.discard.push(c);
+  game.hands.delete(pid);
+  delete game.playerNames[pid];
+
+  const oldAttPid = game.players[game.attackerIndex];
+  const oldDefPid = game.players[game.defenderIndex];
+
+  game.players = game.players.filter((x) => x !== pid);
+
+  if (game.players.length === 0) {
+    game.phase = 'ended';
+    game.winnerId = null;
+    game.turnDeadline = 0;
+    game.version++;
+    return { ok: true, empty: true };
+  }
+
+  if (game.initiatorId === pid) game.initiatorId = game.players[0];
+
+  if (game.battle && game.battle.table.length) {
+    for (const row of game.battle.table) {
+      pushTableCardsToDiscard(game, row);
+    }
+    game.battle.table = [];
+    game.battle.subPhase = 'attack';
+  }
+
+  let ai = game.players.indexOf(oldAttPid);
+  if (ai < 0) ai = 0;
+  ai = nextNonEmptyHandIndex(game, ai);
+  game.attackerIndex = ai;
+
+  let di = game.players.indexOf(oldDefPid);
+  if (di < 0 || di === ai) di = nextIndex(ai, game.players.length);
+  di = nextNonEmptyHandIndex(game, di);
+  if (di === ai) di = nextNonEmptyHandIndex(game, nextIndex(di, game.players.length));
+  game.defenderIndex = di;
+
+  game.battle.attackerPid = game.players[game.attackerIndex];
+  game.battle.defenderPid = game.players[game.defenderIndex];
+  game.turnDeadline = Date.now() + game.turnSeconds * 1000;
+  checkGameEnd(game);
+  game.version++;
   return { ok: true };
 }
 
@@ -426,10 +513,11 @@ function processAction(game, pid, action) {
   }
 
   if (type === 'done') {
-    if (pid !== game.players[game.defenderIndex]) return { ok: false, error: 'Только защитник' };
+    if (pid !== game.players[game.attackerIndex]) return { ok: false, error: 'Только атакующий нажимает бито' };
+    if (game.battle.subPhase !== 'toss') return { ok: false, error: 'Сначала отбейтесь' };
     if (game.battle.table.some((r) => !r.defense)) return { ok: false, error: 'Есть неотбитые' };
-    if (game.battle.subPhase === 'toss' && canAnyToss(game)) {
-      return { ok: false, error: 'Ещё можно подкинуть' };
+    for (const row of game.battle.table) {
+      if (row.transferCard && !row.transferDefense) return { ok: false, error: 'Перевод не отбит' };
     }
     return applyBito(game);
   }
@@ -461,7 +549,7 @@ function processAction(game, pid, action) {
       }
       b.leadingRank = rank0;
       for (const cid of cardIds) {
-        b.table.push({ attack: cid, defense: null, beatType: 'attack' });
+        b.table.push({ attack: cid, defense: null, beatType: 'attack', transferCard: null, transferDefense: null });
       }
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
@@ -479,28 +567,26 @@ function processAction(game, pid, action) {
         game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
         return { ok: false, error: 'Ход защитника' };
       }
-      const undef = b.table.filter((r) => !r.defense);
-      if (undef.length === 0) {
+
+      const tgt = nextDefendTarget(b);
+      if (!tgt) {
         game.hands.get(pid).push(cardId);
         game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
         return { ok: false, error: 'Нечего бить' };
       }
-      const target = undef[0];
+      const { row, beatAttack } = tgt;
 
-      if (game.mode === 'perevodnoy' && action.transfer) {
+      if (game.mode === 'perevodnoy' && action.transfer && beatAttack) {
         const tr = parseCard(cardId);
-        const lead = parseCard(target.attack);
+        const lead = parseCard(row.attack);
         if (tr && lead && tr.rank === lead.rank) {
+          row.transferCard = cardId;
+          row.beatType = 'transfer';
           let ni = nextIndex(game.defenderIndex, n);
           let steps = 0;
           while (steps < n && (game.hands.get(game.players[ni]) || []).length === 0) {
             ni = nextIndex(ni, n);
             steps++;
-          }
-          const ti = b.table.indexOf(target);
-          if (ti >= 0) {
-            b.table[ti].transferCard = cardId;
-            b.table[ti].beatType = 'transfer';
           }
           game.defenderIndex = ni;
           b.defenderPid = game.players[game.defenderIndex];
@@ -511,15 +597,22 @@ function processAction(game, pid, action) {
         }
       }
 
-      if (!canBeat(target.attack, cardId, game.trump)) {
+      const attackCard = beatAttack ? row.attack : row.transferCard;
+      if (!canBeat(attackCard, cardId, game.trump)) {
         game.hands.get(pid).push(cardId);
         game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
         return { ok: false, error: 'Этой картой нельзя побить' };
       }
-      target.defense = cardId;
-      target.beatType = 'beat';
-      const moreUndef = b.table.some((r) => !r.defense);
-      if (moreUndef) {
+      if (beatAttack) {
+        row.defense = cardId;
+        row.beatType = row.transferCard ? row.beatType : 'beat';
+      } else {
+        row.transferDefense = cardId;
+        row.beatType = 'beat';
+      }
+
+      const still = nextDefendTarget(b);
+      if (still) {
         game.turnDeadline = Date.now() + game.turnSeconds * 1000;
         game.version++;
         return { ok: true };
@@ -543,7 +636,13 @@ function processAction(game, pid, action) {
         game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
         return { ok: false, error: 'Такой ранг нельзя' };
       }
-      b.table.push({ attack: cardId, defense: null, beatType: 'toss' });
+      b.table.push({
+        attack: cardId,
+        defense: null,
+        beatType: 'toss',
+        transferCard: null,
+        transferDefense: null
+      });
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
       game.version++;
@@ -580,6 +679,7 @@ module.exports = {
   tryStartGame,
   cancelLobby,
   endGameByModerator,
+  playingLeave,
   exportGamePublic,
   processAction,
   tickTurnTimer,
