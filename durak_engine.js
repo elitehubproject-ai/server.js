@@ -779,6 +779,19 @@ function applyBito(game) {
   return { ok: true };
 }
 
+/** Меньше двух игроков в партии — нельзя продолжать (избегаем «игры с собой»). */
+function endGameTooFewPlayers(game) {
+  game.phase = 'ended';
+  game.winnerId = game.players.length === 1 ? game.players[0] : null;
+  game.turnDeadline = 0;
+  game.lastPlay = null;
+  if (game.battle) {
+    game.battle.table = [];
+    game.battle.subPhase = 'attack';
+  }
+  game.version++;
+}
+
 /** Выход из партии без завершения для всех. */
 function playingLeave(game, pid) {
   if (game.phase !== 'playing') return { ok: false, error: 'Не идёт игра' };
@@ -800,6 +813,11 @@ function playingLeave(game, pid) {
     game.turnDeadline = 0;
     game.version++;
     return { ok: true, empty: true };
+  }
+
+  if (game.players.length < 2) {
+    endGameTooFewPlayers(game);
+    return { ok: true };
   }
 
   if (game.initiatorId === pid) game.initiatorId = game.players[0];
@@ -836,6 +854,10 @@ function processAction(game, pid, action) {
   const type = action?.type;
   if (game.phase === 'lobby') return { ok: false, error: 'Игра не началась' };
   if (game.phase === 'ended') return { ok: false, error: 'Игра окончена' };
+  if (game.phase === 'playing' && game.players.length < 2) {
+    endGameTooFewPlayers(game);
+    return { ok: false, error: 'Игра завершена: недостаточно игроков' };
+  }
 
   if (type === 'take') {
     if (game.battle.subPhase !== 'defend') {
@@ -996,7 +1018,12 @@ function processAction(game, pid, action) {
 }
 
 function tickTurnTimer(game) {
-  if (game.phase !== 'playing' || !game.turnDeadline) return null;
+  if (game.phase !== 'playing') return null;
+  if (game.players.length < 2) {
+    endGameTooFewPlayers(game);
+    return { ok: true, ended: true };
+  }
+  if (!game.turnDeadline) return null;
   if (Date.now() < game.turnDeadline) return null;
   const b = game.battle;
   if (b.subPhase === 'defend') {
