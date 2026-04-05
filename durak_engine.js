@@ -384,20 +384,19 @@ function canAnyToss(game) {
   return false;
 }
 
-/** Что отбивать дальше: сначала атака, потом карты перевода по порядку. */
-function nextDefendTarget(battle) {
+/** Есть ли на столе неотбитые атака или карты перевода (порядок отбоя — любой). */
+function hasUnbeatenDefenseTargets(battle) {
   for (const row of battle.table) {
     ensureTransferStack(row);
-    if (!row.defense) return { row, beatAttack: true, transferIndex: null };
-    const ts = row.transferStack;
-    for (let i = 0; i < ts.length; i++) {
-      if (!ts[i].defense) return { row, beatAttack: false, transferIndex: i };
+    if (!row.defense) return true;
+    for (const t of row.transferStack) {
+      if (!t.defense) return true;
     }
   }
-  return null;
+  return false;
 }
 
-/** Все слоты, куда можно положить отбой данной картой (порядок любой). */
+/** Все слоты, куда можно положить отбой данной картой (атака и переводы — в любом порядке). */
 function enumerateBeatTargets(battle, defendCardId, trumpSuit) {
   const out = [];
   for (const row of battle.table) {
@@ -405,13 +404,11 @@ function enumerateBeatTargets(battle, defendCardId, trumpSuit) {
     if (!row.defense && canBeat(row.attack, defendCardId, trumpSuit)) {
       out.push({ row, beatAttack: true, anchor: row.attack, transferIndex: null });
     }
-    if (row.defense) {
-      const ts = row.transferStack;
-      for (let i = 0; i < ts.length; i++) {
-        const t = ts[i];
-        if (!t.defense && canBeat(t.card, defendCardId, trumpSuit)) {
-          out.push({ row, beatAttack: false, anchor: t.card, transferIndex: i });
-        }
+    const ts = row.transferStack;
+    for (let i = 0; i < ts.length; i++) {
+      const t = ts[i];
+      if (!t.defense && canBeat(t.card, defendCardId, trumpSuit)) {
+        out.push({ row, beatAttack: false, anchor: t.card, transferIndex: i });
       }
     }
   }
@@ -885,7 +882,7 @@ function processAction(game, pid, action) {
           row.transferStack[transferIdx].defense = cardId;
           row.beatType = 'beat';
         }
-        const still = nextDefendTarget(b);
+        const still = hasUnbeatenDefenseTargets(b);
         b.attackerPid = game.players[game.attackerIndex];
         if (still) {
           game.turnDeadline = Date.now() + game.turnSeconds * 1000;
