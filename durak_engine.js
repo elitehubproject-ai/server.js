@@ -312,6 +312,7 @@ function exportGamePublic(game, viewerId) {
     attackerIndex: game.attackerIndex,
     defenderIndex: game.defenderIndex,
     firstDealRules: game.firstDealRules,
+    battlesFinished: game.battlesFinished,
     stockEmpty: game.stockEmpty,
     winnerId: game.winnerId,
     turnDeadline: game.turnDeadline,
