@@ -120,8 +120,17 @@ function createEmptyGame(mode) {
     turnSeconds: 60,
     lobbyDeadline: 0,
     lobbyAutoSec: 60,
-    version: 0
+    version: 0,
+    playSeq: 0,
+    lastPlay: null
   };
+}
+
+function bumpLastPlay(game, byPid, cardIds, kind) {
+  const cards = (cardIds || []).map((c) => String(c || '').trim()).filter(Boolean);
+  if (!byPid || !cards.length) return;
+  game.playSeq = (game.playSeq || 0) + 1;
+  game.lastPlay = { by: byPid, cards, kind: kind || 'play', seq: game.playSeq };
 }
 
 function nextIndex(n, len) {
@@ -220,6 +229,7 @@ function dealInitial(game) {
     tosserQueue: [],
     leadingRank: null
   };
+  game.lastPlay = null;
   game.players.forEach((pid) => {
     game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
   });
@@ -269,6 +279,7 @@ function checkGameEnd(game) {
  * тогда взявший не ходит первым: атакует другой игрок, взявший снова защищается.
  */
 function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
+  game.lastPlay = null;
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
   game.battlesFinished++;
@@ -321,6 +332,7 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
 
 /** После «бито»: бывший защитник отбивается и становится атакующим. */
 function startNextBattleAfterBeat(game, prevDefenderPid) {
+  game.lastPlay = null;
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
   game.battlesFinished++;
@@ -661,7 +673,16 @@ function exportGamePublic(game, viewerId) {
     turnSeconds: game.turnSeconds,
     lobbyDeadline: game.lobbyDeadline,
     version: game.version,
-    names: { ...(game.playerNames || {}) }
+    names: { ...(game.playerNames || {}) },
+    playSeq: game.playSeq || 0,
+    lastPlay: game.lastPlay
+      ? {
+          by: game.lastPlay.by,
+          cards: [...game.lastPlay.cards],
+          kind: game.lastPlay.kind,
+          seq: game.lastPlay.seq
+        }
+      : null
   };
   if (viewerId && game.hands.has(viewerId)) {
     out.myHand = [...(game.hands.get(viewerId) || [])];
@@ -789,6 +810,7 @@ function playingLeave(game, pid) {
     }
     game.battle.table = [];
     game.battle.subPhase = 'attack';
+    game.lastPlay = null;
   }
 
   let ai = game.players.indexOf(oldAttPid);
@@ -862,6 +884,7 @@ function processAction(game, pid, action) {
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
       game.version++;
+      bumpLastPlay(game, pid, removed, 'attack');
       checkGameEnd(game);
       return { ok: true };
     }
@@ -926,12 +949,16 @@ function processAction(game, pid, action) {
 
       if (plan.kind === 'transfer') {
         applyTransfer(plan.row);
+        bumpLastPlay(game, pid, [cardId], 'transfer');
         checkGameEnd(game);
         return { ok: true };
       }
       const tidx = plan.beatAttack ? 0 : plan.transferIndex;
       const br = applyBeat(plan.row, plan.beatAttack, tidx);
-      if (br && br.ok) checkGameEnd(game);
+      if (br && br.ok) {
+        bumpLastPlay(game, pid, [cardId], 'beat');
+        checkGameEnd(game);
+      }
       return br;
     }
 
@@ -959,6 +986,7 @@ function processAction(game, pid, action) {
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
       game.version++;
+      bumpLastPlay(game, pid, [cardId], 'toss');
       checkGameEnd(game);
       return { ok: true };
     }
