@@ -263,7 +263,11 @@ function checkGameEnd(game) {
   return false;
 }
 
-/** После «беру»: снова ходит тот же атакующий; защищается тот, кто взял стол. */
+/**
+ * После «беру»: атакует тот, кто вёл атаку в этой схватке; защищается взявший стол.
+ * Если переводной перевели на атакующего (в т.ч. 2 игрока), индекс атакующего и защитника совпадают —
+ * тогда взявший не ходит первым: атакует другой игрок, взявший снова защищается.
+ */
 function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
@@ -271,10 +275,24 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
   if (game.battlesFinished >= 1) game.firstDealRules = false;
   if (checkGameEnd(game)) return;
 
-  let ai = game.players.indexOf(prevAttackerPid);
-  if (ai < 0) ai = 0;
-  let di = game.players.indexOf(prevDefenderPid);
-  if (di < 0) di = nextIndex(ai, n);
+  let ai;
+  let di;
+
+  if (prevAttackerPid === prevDefenderPid) {
+    const takerIdx = Math.max(0, game.players.indexOf(prevDefenderPid));
+    di = takerIdx;
+    ai = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
+    let guard = 0;
+    while (guard < n && ai === di) {
+      ai = nextNonEmptyHandIndex(game, nextIndex(ai, n));
+      guard++;
+    }
+  } else {
+    ai = game.players.indexOf(prevAttackerPid);
+    if (ai < 0) ai = 0;
+    di = game.players.indexOf(prevDefenderPid);
+    if (di < 0) di = nextIndex(ai, n);
+  }
 
   if ((game.hands.get(game.players[ai]) || []).length === 0) {
     ai = nextNonEmptyHandIndex(game, ai);
@@ -498,14 +516,7 @@ function tryDefendPlay(game, cardId, action) {
     if (!row) {
       return { ok: false, error: against ? 'Нельзя перевести эту атаку' : 'Укажите карту для перевода' };
     }
-    const hit = beats.find((t) => t.row === row && t.beatAttack);
-    const amb =
-      hit &&
-      parseCard(cardId) &&
-      parseCard(row.attack) &&
-      parseCard(cardId).rank === parseCard(row.attack).rank &&
-      canBeat(row.attack, cardId, game.trump);
-    if (amb) return { ok: false, error: 'Выберите зону «Побить» или «Перевод»' };
+    /* Явный target=transfer (слот перевода): разрешаем, даже если той же картой можно было бы побить (напр. козырь). */
     const chk = transferAllowedForRow(row);
     if (!chk.ok) return chk;
     return { ok: true, kind: 'transfer', row };
@@ -545,7 +556,9 @@ function tryDefendPlay(game, cardId, action) {
     const rowByAttack = b.table.find((r) => r.attack === against);
     if (rowByAttack && canTransferOnRow(game, rowByAttack, cardId)) {
       const hitA = beats.find((t) => t.anchor === against);
-      if (hitA) return { ok: false, error: 'Выберите «Побить» или «Перевод»' };
+      if (hitA && playTarget !== 'transfer' && !action.transfer) {
+        return { ok: false, error: 'Выберите «Побить» или «Перевод»' };
+      }
       const chk = transferAllowedForRow(rowByAttack);
       if (!chk.ok) return chk;
       return { ok: true, kind: 'transfer', row: rowByAttack };
