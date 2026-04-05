@@ -348,6 +348,167 @@ function nextDefendTarget(battle) {
   return null;
 }
 
+/** Все слоты, куда можно положить отбой данной картой (порядок любой). */
+function enumerateBeatTargets(battle, defendCardId, trumpSuit) {
+  const out = [];
+  for (const row of battle.table) {
+    if (!row.defense && canBeat(row.attack, defendCardId, trumpSuit)) {
+      out.push({ row, beatAttack: true, anchor: row.attack });
+    }
+    if (row.defense && row.transferCard && !row.transferDefense && canBeat(row.transferCard, defendCardId, trumpSuit)) {
+      out.push({ row, beatAttack: false, anchor: row.transferCard });
+    }
+  }
+  return out;
+}
+
+/** Перевод только по непобитой первичной атаке (не подкид, не после отбоя). */
+function canTransferOnRow(game, row, cardId) {
+  if (game.mode !== 'perevodnoy') return false;
+  if (row.defense) return false;
+  if (row.beatType !== 'attack') return false;
+  if (row.transferCard) return false;
+  const tr = parseCard(cardId);
+  const lead = parseCard(row.attack);
+  return !!(tr && lead && tr.rank === lead.rank);
+}
+
+function countUnbeatenSidesAfterTransfer(battle, targetRow, transferCardId) {
+  let n = 0;
+  for (const row of battle.table) {
+    const xfer = row === targetRow ? transferCardId : row.transferCard;
+    if (!row.defense) n++;
+    if (xfer && !row.transferDefense) n++;
+  }
+  return n;
+}
+
+function resolveNextDefenderIndex(game) {
+  const n = game.players.length;
+  let ni = nextIndex(game.defenderIndex, n);
+  let steps = 0;
+  while (steps < n && (game.hands.get(game.players[ni]) || []).length === 0) {
+    ni = nextIndex(ni, n);
+    steps++;
+  }
+  return ni;
+}
+
+/**
+ * Логика защиты: against = id карты на столе (атака или карта перевода), которую бьём/переводим.
+ * target 'beat' | 'transfer' при неоднозначности (та же достоинство + можно и побить).
+ */
+function tryDefendPlay(game, cardId, action) {
+  const b = game.battle;
+  const against = String(action.against || action.attackCard || '').trim();
+  const playTarget =
+    action.target === 'beat' ? 'beat' : action.target === 'transfer' ? 'transfer' : action.transfer ? 'transfer' : null;
+
+  const beats = enumerateBeatTargets(b, cardId, game.trump);
+  const xferRows = b.table.filter((row) => canTransferOnRow(game, row, cardId));
+
+  const pickBeat = () => {
+    if (against) {
+      return beats.find((t) => t.anchor === against) || null;
+    }
+    if (beats.length === 1) return beats[0];
+    return null;
+  };
+
+  const pickTransferRow = () => {
+    if (against) {
+      const row = b.table.find((r) => r.attack === against);
+      if (row && canTransferOnRow(game, row, cardId)) return row;
+      return null;
+    }
+    if (xferRows.length === 1) return xferRows[0];
+    return null;
+  };
+
+  const transferAllowedForRow = (row) => {
+    const ni = resolveNextDefenderIndex(game);
+    const need = countUnbeatenSidesAfterTransfer(b, row, cardId);
+    if ((game.hands.get(game.players[ni]) || []).length < need) {
+      return { ok: false, error: 'У следующего защитника мало карт для перевода' };
+    }
+    return { ok: true, ni };
+  };
+
+  if (playTarget === 'transfer') {
+    const row = pickTransferRow();
+    if (!row) {
+      return { ok: false, error: against ? 'Нельзя перевести эту атаку' : 'Укажите карту для перевода' };
+    }
+    const hit = beats.find((t) => t.row === row && t.beatAttack);
+    const amb =
+      hit &&
+      parseCard(cardId) &&
+      parseCard(row.attack) &&
+      parseCard(cardId).rank === parseCard(row.attack).rank &&
+      canBeat(row.attack, cardId, game.trump);
+    if (amb) return { ok: false, error: 'Выберите зону «Побить» или «Перевод»' };
+    const chk = transferAllowedForRow(row);
+    if (!chk.ok) return chk;
+    return { ok: true, kind: 'transfer', row };
+  }
+
+  if (playTarget === 'beat') {
+    const hit = pickBeat();
+    if (!hit) {
+      return { ok: false, error: against ? 'Нельзя побить эту карту' : 'Укажите, какую карту бьёте' };
+    }
+    return { ok: true, kind: 'beat', row: hit.row, beatAttack: hit.beatAttack };
+  }
+
+  const xfer = pickTransferRow();
+  const hit = pickBeat();
+
+  if (xfer && hit && xfer === hit.row) {
+    const amb =
+      parseCard(cardId) &&
+      parseCard(xfer.attack) &&
+      parseCard(cardId).rank === parseCard(xfer.attack).rank &&
+      canBeat(xfer.attack, cardId, game.trump);
+    if (amb) return { ok: false, error: 'Перетащите в «Побить» или «Перевод»' };
+  }
+
+  if (xfer && hit && xfer !== hit.row && !against) {
+    return { ok: false, error: 'Укажите карту на столе' };
+  }
+
+  if (against) {
+    const rowByAttack = b.table.find((r) => r.attack === against);
+    if (rowByAttack && canTransferOnRow(game, rowByAttack, cardId)) {
+      const hitA = beats.find((t) => t.anchor === against);
+      if (hitA) return { ok: false, error: 'Выберите «Побить» или «Перевод»' };
+      const chk = transferAllowedForRow(rowByAttack);
+      if (!chk.ok) return chk;
+      return { ok: true, kind: 'transfer', row: rowByAttack };
+    }
+    const hitA = beats.find((t) => t.anchor === against);
+    if (hitA) return { ok: true, kind: 'beat', row: hitA.row, beatAttack: hitA.beatAttack };
+    return { ok: false, error: 'Нельзя сходить на эту карту' };
+  }
+
+  if (xfer && !hit) {
+    const chk = transferAllowedForRow(xfer);
+    if (!chk.ok) return chk;
+    return { ok: true, kind: 'transfer', row: xfer };
+  }
+
+  if (hit && !xfer) {
+    return { ok: true, kind: 'beat', row: hit.row, beatAttack: hit.beatAttack };
+  }
+
+  if (!xfer && !hit) {
+    if (beats.length > 1) return { ok: false, error: 'Укажите, какую карту бьёте' };
+    if (xferRows.length > 1) return { ok: false, error: 'Укажите карту для перевода' };
+    return { ok: false, error: 'Невозможный ход' };
+  }
+
+  return { ok: false, error: 'Укажите карту на столе' };
+}
+
 function pushTableCardsToHand(hand, row) {
   hand.push(row.attack);
   if (row.transferCard) hand.push(row.transferCard);
@@ -593,27 +754,16 @@ function processAction(game, pid, action) {
 
     const cardId = String(rawCards[0] || '').trim();
     if (!parseCard(cardId)) return { ok: false, error: 'Неверная карта' };
-    if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
 
     if (b.subPhase === 'defend') {
-      if (pid !== defPid) {
-        game.hands.get(pid).push(cardId);
-        game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
-        return { ok: false, error: 'Ход защитника' };
-      }
+      if (pid !== defPid) return { ok: false, error: 'Ход защитника' };
 
-      const tgt = nextDefendTarget(b);
-      if (!tgt) {
-        game.hands.get(pid).push(cardId);
-        game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
-        return { ok: false, error: 'Нечего бить' };
-      }
-      const { row, beatAttack } = tgt;
+      const plan = tryDefendPlay(game, cardId, action);
+      if (!plan.ok) return { ok: false, error: plan.error };
 
-      const playTarget =
-        action.target === 'beat' ? 'beat' : action.target === 'transfer' ? 'transfer' : action.transfer ? 'transfer' : null;
+      if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
 
-      const applyTransfer = () => {
+      const applyTransfer = (row) => {
         row.transferCard = cardId;
         row.beatType = 'transfer';
         let ni = nextIndex(game.defenderIndex, n);
@@ -624,12 +774,13 @@ function processAction(game, pid, action) {
         }
         game.defenderIndex = ni;
         b.defenderPid = game.players[game.defenderIndex];
+        b.attackerPid = game.players[game.attackerIndex];
         b.subPhase = 'defend';
         game.turnDeadline = Date.now() + game.turnSeconds * 1000;
         game.version++;
       };
 
-      const applyBeat = () => {
+      const applyBeat = (row, beatAttack) => {
         const attackCard = beatAttack ? row.attack : row.transferCard;
         if (!canBeat(attackCard, cardId, game.trump)) {
           game.hands.get(pid).push(cardId);
@@ -644,6 +795,7 @@ function processAction(game, pid, action) {
           row.beatType = 'beat';
         }
         const still = nextDefendTarget(b);
+        b.attackerPid = game.players[game.attackerIndex];
         if (still) {
           game.turnDeadline = Date.now() + game.turnSeconds * 1000;
           game.version++;
@@ -655,31 +807,14 @@ function processAction(game, pid, action) {
         return { ok: true };
       };
 
-      if (game.mode === 'perevodnoy' && beatAttack) {
-        const tr = parseCard(cardId);
-        const lead = parseCard(row.attack);
-        const sameRank = tr && lead && tr.rank === lead.rank;
-        const beatOk = canBeat(row.attack, cardId, game.trump);
-        if (sameRank && beatOk) {
-          if (playTarget === 'transfer') {
-            applyTransfer();
-            return { ok: true };
-          }
-          if (playTarget === 'beat') {
-            return applyBeat();
-          }
-          game.hands.get(pid).push(cardId);
-          game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
-          return { ok: false, error: 'Перетащите карту в «Побить» или «Перевод»' };
-        }
-        if (sameRank && !beatOk) {
-          applyTransfer();
-          return { ok: true };
-        }
+      if (plan.kind === 'transfer') {
+        applyTransfer(plan.row);
+        return { ok: true };
       }
-
-      return applyBeat();
+      return applyBeat(plan.row, plan.beatAttack);
     }
+
+    if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
 
     if (b.subPhase === 'toss') {
       if (!canToss(game, pid)) {
