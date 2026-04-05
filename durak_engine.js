@@ -213,10 +213,14 @@ function refillHands(game) {
   if (game.deck.length === 0) game.stockEmpty = true;
 }
 
+/** Победитель — выложивший все карты; оставшийся с картами — дурак (для 2 игроков). */
 function checkGameEnd(game) {
+  const n = game.players.length;
+  if (n < 2) return false;
   const active = game.players.filter((pid) => (game.hands.get(pid) || []).length > 0);
+  const empty = game.players.filter((pid) => (game.hands.get(pid) || []).length === 0);
   if (active.length <= 1) {
-    game.winnerId = active[0] || null;
+    game.winnerId = empty.length ? empty[empty.length - 1] : active[0] || null;
     game.phase = 'ended';
     game.turnDeadline = 0;
     game.version++;
@@ -225,7 +229,7 @@ function checkGameEnd(game) {
   return false;
 }
 
-/** После «беру»: снова атакует тот же атакующий, защищается тот, кто взял карты. */
+/** После «беру»: снова ходит тот же атакующий; защищается тот, кто взял стол. */
 function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
@@ -235,13 +239,20 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
 
   let ai = game.players.indexOf(prevAttackerPid);
   if (ai < 0) ai = 0;
-  ai = nextNonEmptyHandIndex(game, ai);
-  game.attackerIndex = ai;
-
   let di = game.players.indexOf(prevDefenderPid);
-  if (di < 0) di = nextNonEmptyHandIndex(game, nextIndex(ai, n));
-  di = nextNonEmptyHandIndex(game, di);
-  if (di === ai) di = nextNonEmptyHandIndex(game, nextIndex(di, n));
+  if (di < 0) di = nextIndex(ai, n);
+
+  if ((game.hands.get(game.players[ai]) || []).length === 0) {
+    ai = nextNonEmptyHandIndex(game, ai);
+  }
+  if ((game.hands.get(game.players[di]) || []).length === 0) {
+    di = nextNonEmptyHandIndex(game, nextIndex(ai, n));
+  }
+  if (di === ai) {
+    di = nextNonEmptyHandIndex(game, nextIndex(ai, n));
+  }
+
+  game.attackerIndex = ai;
   game.defenderIndex = di;
 
   game.battle = {
@@ -435,7 +446,24 @@ function tryDefendPlay(game, cardId, action) {
   };
 
   if (playTarget === 'transfer') {
-    const row = pickTransferRow();
+    let row = pickTransferRow();
+    if (!row && against) {
+      const tr = parseCard(cardId);
+      const byRank = xferRows.filter((r) => {
+        const lead = parseCard(r.attack);
+        return tr && lead && tr.rank === lead.rank;
+      });
+      if (byRank.length === 1) row = byRank[0];
+    }
+    if (!row && xferRows.length === 1) row = xferRows[0];
+    if (!row && !against) {
+      const tr = parseCard(cardId);
+      const byRank = xferRows.filter((r) => {
+        const lead = parseCard(r.attack);
+        return tr && lead && tr.rank === lead.rank;
+      });
+      if (byRank.length === 1) row = byRank[0];
+    }
     if (!row) {
       return { ok: false, error: against ? 'Нельзя перевести эту атаку' : 'Укажите карту для перевода' };
     }
@@ -700,8 +728,8 @@ function processAction(game, pid, action) {
   if (game.phase === 'ended') return { ok: false, error: 'Игра окончена' };
 
   if (type === 'take') {
-    if (game.battle.subPhase !== 'defend' && game.battle.subPhase !== 'toss') {
-      return { ok: false, error: 'Сейчас нельзя взять' };
+    if (game.battle.subPhase !== 'defend') {
+      return { ok: false, error: 'Брать можно только пока отбиваетесь' };
     }
     if (pid !== game.players[game.defenderIndex]) return { ok: false, error: 'Только защитник' };
     return applyTake(game);
@@ -749,6 +777,7 @@ function processAction(game, pid, action) {
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
       game.version++;
+      checkGameEnd(game);
       return { ok: true };
     }
 
@@ -809,9 +838,12 @@ function processAction(game, pid, action) {
 
       if (plan.kind === 'transfer') {
         applyTransfer(plan.row);
+        checkGameEnd(game);
         return { ok: true };
       }
-      return applyBeat(plan.row, plan.beatAttack);
+      const br = applyBeat(plan.row, plan.beatAttack);
+      if (br && br.ok) checkGameEnd(game);
+      return br;
     }
 
     if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
@@ -839,6 +871,7 @@ function processAction(game, pid, action) {
       b.subPhase = 'defend';
       game.turnDeadline = Date.now() + game.turnSeconds * 1000;
       game.version++;
+      checkGameEnd(game);
       return { ok: true };
     }
   }
@@ -849,9 +882,12 @@ function processAction(game, pid, action) {
 function tickTurnTimer(game) {
   if (game.phase !== 'playing' || !game.turnDeadline) return null;
   if (Date.now() < game.turnDeadline) return null;
-  const defPid = game.players[game.defenderIndex];
-  if (game.battle.subPhase === 'defend' || game.battle.subPhase === 'toss') {
+  const b = game.battle;
+  if (b.subPhase === 'defend') {
     return applyTake(game);
+  }
+  if (b.subPhase === 'toss') {
+    return applyBito(game);
   }
   game.turnDeadline = Date.now() + game.turnSeconds * 1000;
   game.version++;
