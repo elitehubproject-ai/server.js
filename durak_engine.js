@@ -226,6 +226,7 @@ function dealInitial(game) {
     subPhase: 'attack',
     attackerPid: game.players[game.attackerIndex],
     defenderPid: game.players[game.defenderIndex],
+    maxAttackCards: battleAttackCardsCap(game, game.defenderIndex),
     tosserQueue: [],
     leadingRank: null
   };
@@ -322,6 +323,7 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
     subPhase: 'attack',
     attackerPid: game.players[game.attackerIndex],
     defenderPid: game.players[game.defenderIndex],
+    maxAttackCards: battleAttackCardsCap(game, game.defenderIndex),
     tosserQueue: [],
     leadingRank: null
   };
@@ -355,6 +357,7 @@ function startNextBattleAfterBeat(game, prevDefenderPid) {
     subPhase: 'attack',
     attackerPid: game.players[game.attackerIndex],
     defenderPid: game.players[game.defenderIndex],
+    maxAttackCards: battleAttackCardsCap(game, game.defenderIndex),
     tosserQueue: [],
     leadingRank: null
   };
@@ -403,16 +406,22 @@ function defenderCardCount(game) {
   return (game.hands.get(dpid) || []).length;
 }
 
+function battleAttackCardsCap(game, defenderIdx) {
+  if (!game.firstDealRules) return Number.MAX_SAFE_INTEGER;
+  const pid = game.players[defenderIdx];
+  const handN = (game.hands.get(pid) || []).length;
+  return Math.max(1, Math.min(5, handN));
+}
+
 function maxTossAllowed(game) {
-  const defCount = defenderCardCount(game);
-  return Math.max(0, defCount - game.battle.table.length);
+  const cap = game.battle?.maxAttackCards || Number.MAX_SAFE_INTEGER;
+  return Math.max(0, cap - game.battle.table.length);
 }
 
 function canToss(game, pid) {
   if (game.battle.subPhase !== 'toss') return false;
   if (pid === game.players[game.defenderIndex]) return false;
   if (maxTossAllowed(game) <= 0) return false;
-  if (game.firstDealRules && defenderCardCount(game) < 3) return false;
   return true;
 }
 
@@ -514,6 +523,10 @@ function tryDefendPlay(game, cardId, action) {
   const transferAllowedForRow = (row) => {
     const ni = resolveNextDefenderIndex(game);
     const need = totalCardsInAttackPileAfterOneMoreTransfer(b, row);
+    const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
+    if (need > cap) {
+      return { ok: false, error: 'Лимит карт в этом отбое исчерпан' };
+    }
     if ((game.hands.get(game.players[ni]) || []).length < need) {
       return { ok: false, error: 'У защитника мало карт — перевод невозможен' };
     }
@@ -904,6 +917,8 @@ function processAction(game, pid, action) {
     if (b.subPhase === 'attack') {
       if (pid !== attPid) return { ok: false, error: 'Ход атакующего' };
       const cardIds = rawCards.map((c) => String(c || '').trim()).filter(Boolean);
+      const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
+      if (cardIds.length > cap) return { ok: false, error: 'Превышен лимит карт в отбое' };
       const parsed = cardIds.map((id) => parseCard(id)).filter(Boolean);
       if (parsed.length !== cardIds.length) return { ok: false, error: 'Неверная карта' };
       const rank0 = parsed[0].rank;
