@@ -432,7 +432,7 @@ function canToss(game, pid) {
   const sub = game.battle.subPhase;
   if (sub !== 'toss' && sub !== 'take_toss') return false;
   if (sub === 'take_toss') {
-    if (pid !== game.players[game.attackerIndex]) return false;
+    if (pid !== (game.battle.tossPid || game.players[game.attackerIndex])) return false;
   } else if (pid === game.players[game.defenderIndex]) return false;
   if (maxTossAllowed(game) <= 0) return false;
   return true;
@@ -804,9 +804,23 @@ function collectTableCardIds(battle) {
 function beginTakeToss(game) {
   const b = game.battle;
   const dpid = game.players[game.defenderIndex];
+  const n = game.players.length;
+  const takerIdx = game.defenderIndex;
+  let tossIdx = game.attackerIndex;
+  /* В переводном при переводе на атакующего (особенно 2 игрока) attackerIndex может совпасть с takerIdx.
+     В фазе докидки право докидывать и нажимать "Бито" должно быть у другого игрока, не у взявшего. */
+  if (tossIdx === takerIdx) {
+    tossIdx = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
+    let guard = 0;
+    while (guard < n && tossIdx === takerIdx) {
+      tossIdx = nextNonEmptyHandIndex(game, nextIndex(tossIdx, n));
+      guard++;
+    }
+  }
+  b.tossPid = game.players[tossIdx];
   b.subPhase = 'take_toss';
   b.takePid = dpid;
-  b.attackerPid = game.players[game.attackerIndex];
+  b.attackerPid = b.tossPid || game.players[game.attackerIndex];
   b.defenderPid = dpid;
   if (maxTossAllowed(game) <= 0 || !canAnyToss(game)) {
     return applyTake(game);
@@ -828,6 +842,7 @@ function applyTake(game) {
   }
   game.hands.set(dpid, sortHand(hand, game.trump));
   b.takePid = null;
+  b.tossPid = null;
   startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid);
   if (takenIds.length) {
     bumpLastPlay(game, dpid, takenIds, 'take');
@@ -942,7 +957,8 @@ function processAction(game, pid, action) {
 
   if (type === 'done') {
     if (game.battle.subPhase === 'take_toss') {
-      if (pid !== game.players[game.attackerIndex]) return { ok: false, error: 'Только атакующий нажимает бито' };
+      const tossPid = game.battle.tossPid || game.players[game.attackerIndex];
+      if (pid !== tossPid) return { ok: false, error: 'Только атакующий нажимает бито' };
       return applyTake(game);
     }
     if (pid !== bitoAuthorityPid(game)) return { ok: false, error: 'Только атакующий нажимает бито' };
