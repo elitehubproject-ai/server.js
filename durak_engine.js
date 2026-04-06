@@ -288,21 +288,20 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
 
   let ai;
   let di;
-
-  if (prevAttackerPid === prevDefenderPid) {
-    const takerIdx = Math.max(0, game.players.indexOf(prevDefenderPid));
-    di = takerIdx;
-    ai = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
-    let guard = 0;
-    while (guard < n && ai === di) {
-      ai = nextNonEmptyHandIndex(game, nextIndex(ai, n));
-      guard++;
-    }
-  } else {
+  const takerIdx = Math.max(0, game.players.indexOf(prevDefenderPid));
+  if (n <= 2) {
     ai = game.players.indexOf(prevAttackerPid);
     if (ai < 0) ai = 0;
     di = game.players.indexOf(prevDefenderPid);
     if (di < 0) di = nextIndex(ai, n);
+  } else {
+    ai = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
+    let guardA = 0;
+    while (guardA < n && ai === takerIdx) {
+      ai = nextNonEmptyHandIndex(game, nextIndex(ai, n));
+      guardA++;
+    }
+    di = nextNonEmptyHandIndex(game, nextIndex(ai, n));
   }
 
   if ((game.hands.get(game.players[ai]) || []).length === 0) {
@@ -407,10 +406,10 @@ function defenderCardCount(game) {
 }
 
 function battleAttackCardsCap(game, defenderIdx) {
-  if (!game.firstDealRules) return Number.MAX_SAFE_INTEGER;
   const pid = game.players[defenderIdx];
   const handN = (game.hands.get(pid) || []).length;
-  return Math.max(1, Math.min(5, handN));
+  const hardCap = game.firstDealRules ? 5 : 6;
+  return Math.max(1, Math.min(hardCap, handN));
 }
 
 function maxTossAllowed(game) {
@@ -419,8 +418,11 @@ function maxTossAllowed(game) {
 }
 
 function canToss(game, pid) {
-  if (game.battle.subPhase !== 'toss') return false;
-  if (pid === game.players[game.defenderIndex]) return false;
+  const sub = game.battle.subPhase;
+  if (sub !== 'toss' && sub !== 'take_toss') return false;
+  if (sub === 'take_toss') {
+    if (pid !== game.players[game.attackerIndex]) return false;
+  } else if (pid === game.players[game.defenderIndex]) return false;
   if (maxTossAllowed(game) <= 0) return false;
   return true;
 }
@@ -449,6 +451,18 @@ function hasUnbeatenDefenseTargets(battle) {
   return false;
 }
 
+function hasAnyDefenseOnTable(battle) {
+  if (!battle || !Array.isArray(battle.table)) return false;
+  for (const row of battle.table) {
+    ensureTransferStack(row);
+    if (row.defense) return true;
+    for (const t of row.transferStack) {
+      if (t.defense) return true;
+    }
+  }
+  return false;
+}
+
 /** Все слоты, куда можно положить отбой данной картой (атака и переводы — в любом порядке). */
 function enumerateBeatTargets(battle, defendCardId, trumpSuit) {
   const out = [];
@@ -471,6 +485,7 @@ function enumerateBeatTargets(battle, defendCardId, trumpSuit) {
 /** Перевод по непобитой атаке (цепочка: можно снова перевести тем же достоинством). */
 function canTransferOnRow(game, row, cardId) {
   if (game.mode !== 'perevodnoy') return false;
+  if (hasAnyDefenseOnTable(game.battle)) return false;
   if (row.defense) return false;
   if (row.beatType === 'toss') return false;
   const tr = parseCard(cardId);
@@ -775,9 +790,24 @@ function collectTableCardIds(battle) {
   return out;
 }
 
-function applyTake(game) {
+function beginTakeToss(game) {
   const b = game.battle;
   const dpid = game.players[game.defenderIndex];
+  b.subPhase = 'take_toss';
+  b.takePid = dpid;
+  b.attackerPid = game.players[game.attackerIndex];
+  b.defenderPid = dpid;
+  if (maxTossAllowed(game) <= 0 || !canAnyToss(game)) {
+    return applyTake(game);
+  }
+  game.turnDeadline = Date.now() + 10000;
+  game.version++;
+  return { ok: true };
+}
+
+function applyTake(game) {
+  const b = game.battle;
+  const dpid = b.takePid || game.players[game.defenderIndex];
   const prevAttackerPid = game.players[game.attackerIndex];
   const prevDefenderPid = dpid;
   const takenIds = collectTableCardIds(b);
@@ -786,6 +816,7 @@ function applyTake(game) {
     pushTableCardsToHand(hand, row);
   }
   game.hands.set(dpid, sortHand(hand, game.trump));
+  b.takePid = null;
   startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid);
   if (takenIds.length) {
     bumpLastPlay(game, dpid, takenIds, 'take');
@@ -895,10 +926,14 @@ function processAction(game, pid, action) {
       return { ok: false, error: 'Брать можно только пока отбиваетесь' };
     }
     if (pid !== game.players[game.defenderIndex]) return { ok: false, error: 'Только защитник' };
-    return applyTake(game);
+    return beginTakeToss(game);
   }
 
   if (type === 'done') {
+    if (game.battle.subPhase === 'take_toss') {
+      if (pid !== game.players[game.attackerIndex]) return { ok: false, error: 'Только атакующий нажимает бито' };
+      return applyTake(game);
+    }
     if (pid !== bitoAuthorityPid(game)) return { ok: false, error: 'Только атакующий нажимает бито' };
     if (game.battle.subPhase !== 'toss') return { ok: false, error: 'Сначала отбейтесь' };
     if (game.battle.table.some((r) => !rowFullyDefendedForBito(r))) return { ok: false, error: 'Есть неотбитые' };
@@ -944,7 +979,9 @@ function processAction(game, pid, action) {
       return { ok: true };
     }
 
-    const cardId = String(rawCards[0] || '').trim();
+    const cardIds = rawCards.map((c) => String(c || '').trim()).filter(Boolean);
+    if (!cardIds.length) return { ok: false, error: 'Нет карт' };
+    const cardId = cardIds[0];
     if (!parseCard(cardId)) return { ok: false, error: 'Неверная карта' };
 
     if (b.subPhase === 'defend') {
@@ -1017,34 +1054,53 @@ function processAction(game, pid, action) {
       return br;
     }
 
-    if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
-
-    if (b.subPhase === 'toss') {
+    if (b.subPhase === 'toss' || b.subPhase === 'take_toss') {
+      if (cardIds.some((cid) => !parseCard(cid))) return { ok: false, error: 'Неверная карта' };
       if (!canToss(game, pid)) {
-        game.hands.get(pid).push(cardId);
-        game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
         return { ok: false, error: 'Сейчас нельзя подкинуть' };
       }
-      const pr = parseCard(cardId);
       const allowedRanks = ranksOnTable(b);
-      if (!allowedRanks.has(pr.rank)) {
-        game.hands.get(pid).push(cardId);
-        game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
-        return { ok: false, error: 'Такой ранг нельзя' };
+      for (const cid of cardIds) {
+        const pr = parseCard(cid);
+        if (!pr || !allowedRanks.has(pr.rank)) return { ok: false, error: 'Такой ранг нельзя' };
       }
-      b.table.push({
-        attack: cardId,
-        defense: null,
-        beatType: 'toss',
-        transferStack: []
-      });
-      b.subPhase = 'defend';
-      game.turnDeadline = Date.now() + game.turnSeconds * 1000;
+      const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
+      if (b.table.length + cardIds.length > cap) {
+        return { ok: false, error: 'Превышен лимит карт в отбое' };
+      }
+      const removed = [];
+      for (const cid of cardIds) {
+        if (!removeCardFromHand(game.hands, pid, cid)) {
+          for (const r of removed) game.hands.get(pid).push(r);
+          game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
+          return { ok: false, error: 'Нет карты' };
+        }
+        removed.push(cid);
+      }
+      for (const cid of cardIds) {
+        b.table.push({
+          attack: cid,
+          defense: null,
+          beatType: 'toss',
+          transferStack: []
+        });
+      }
+      if (b.subPhase === 'take_toss') {
+        b.subPhase = 'take_toss';
+        b.attackerPid = game.players[game.attackerIndex];
+        b.defenderPid = b.takePid || game.players[game.defenderIndex];
+        game.turnDeadline = Date.now() + 10000;
+      } else {
+        b.subPhase = 'defend';
+        game.turnDeadline = Date.now() + game.turnSeconds * 1000;
+      }
       game.version++;
-      bumpLastPlay(game, pid, [cardId], 'toss');
+      bumpLastPlay(game, pid, removed, b.subPhase === 'take_toss' ? 'take_toss' : 'toss');
       checkGameEnd(game);
       return { ok: true };
     }
+
+    if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
   }
 
   return { ok: false, error: 'Неизвестное действие' };
@@ -1060,6 +1116,9 @@ function tickTurnTimer(game) {
   if (Date.now() < game.turnDeadline) return null;
   const b = game.battle;
   if (b.subPhase === 'defend') {
+    return beginTakeToss(game);
+  }
+  if (b.subPhase === 'take_toss') {
     return applyTake(game);
   }
   if (b.subPhase === 'toss') {
