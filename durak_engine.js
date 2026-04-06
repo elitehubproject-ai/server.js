@@ -279,7 +279,6 @@ function checkGameEnd(game) {
  * тогда взявший не ходит первым: атакует другой игрок, взявший снова защищается.
  */
 function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
-  game.lastPlay = null;
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
   game.battlesFinished++;
@@ -748,17 +747,36 @@ function endGameByModerator(game) {
   return { ok: true };
 }
 
+function collectTableCardIds(battle) {
+  const out = [];
+  if (!battle || !Array.isArray(battle.table)) return out;
+  for (const row of battle.table) {
+    ensureTransferStack(row);
+    if (row.attack) out.push(row.attack);
+    if (row.defense) out.push(row.defense);
+    for (const t of row.transferStack) {
+      if (t.card) out.push(t.card);
+      if (t.defense) out.push(t.defense);
+    }
+  }
+  return out;
+}
+
 function applyTake(game) {
   const b = game.battle;
   const dpid = game.players[game.defenderIndex];
   const prevAttackerPid = game.players[game.attackerIndex];
   const prevDefenderPid = dpid;
+  const takenIds = collectTableCardIds(b);
   const hand = game.hands.get(dpid) || [];
   for (const row of b.table) {
     pushTableCardsToHand(hand, row);
   }
   game.hands.set(dpid, sortHand(hand, game.trump));
   startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid);
+  if (takenIds.length) {
+    bumpLastPlay(game, dpid, takenIds, 'take');
+  }
   return { ok: true };
 }
 
