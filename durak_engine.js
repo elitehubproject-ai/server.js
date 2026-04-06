@@ -244,7 +244,8 @@ function dealInitial(game) {
     defenderPid: game.players[game.defenderIndex],
     maxAttackCards: battleAttackCardsCap(game, game.defenderIndex),
     tosserQueue: [],
-    leadingRank: null
+    leadingRank: null,
+    firstAttackerPid: null
   };
   game.lastPlay = null;
   game.players.forEach((pid) => {
@@ -351,7 +352,8 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
     defenderPid: game.players[game.defenderIndex],
     maxAttackCards: battleAttackCardsCap(game, game.defenderIndex),
     tosserQueue: [],
-    leadingRank: null
+    leadingRank: null,
+    firstAttackerPid: null
   };
   game.turnDeadline = Date.now() + game.turnSeconds * 1000;
   game.version++;
@@ -385,7 +387,8 @@ function startNextBattleAfterBeat(game, prevDefenderPid) {
     defenderPid: game.players[game.defenderIndex],
     maxAttackCards: battleAttackCardsCap(game, game.defenderIndex),
     tosserQueue: [],
-    leadingRank: null
+    leadingRank: null,
+    firstAttackerPid: null
   };
   game.turnDeadline = Date.now() + game.turnSeconds * 1000;
   game.version++;
@@ -459,7 +462,7 @@ function canToss(game, pid) {
   const sub = game.battle.subPhase;
   if (sub !== 'toss' && sub !== 'take_toss') return false;
   if (sub === 'take_toss') {
-    if (pid !== (game.battle.tossPid || game.players[game.attackerIndex])) return false;
+    if (pid !== (game.battle.tossPid || game.battle.firstAttackerPid || game.players[game.attackerIndex])) return false;
   } else if (pid === game.players[game.defenderIndex]) return false;
   if (maxTossAllowed(game) <= 0) return false;
   return true;
@@ -833,9 +836,11 @@ function beginTakeToss(game) {
   const dpid = game.players[game.defenderIndex];
   const n = game.players.length;
   const takerIdx = game.defenderIndex;
-  let tossIdx = game.attackerIndex;
-  /* В переводном при переводе на атакующего (особенно 2 игрока) attackerIndex может совпасть с takerIdx.
-     В фазе докидки право докидывать и нажимать "Бито" должно быть у другого игрока, не у взявшего. */
+  const leaderPid = b.firstAttackerPid || game.players[game.attackerIndex];
+  let tossIdx = game.players.indexOf(leaderPid);
+  if (tossIdx < 0) tossIdx = game.attackerIndex;
+  /* В переводном при переводе на атакующего (в т.ч. 2 игрока) первый атакующий может совпасть с взявшим.
+     Тогда «Бито»/докидка — у другого живого игрока, не у взявшего стол. */
   if (tossIdx === takerIdx) {
     tossIdx = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
     let guard = 0;
@@ -844,10 +849,17 @@ function beginTakeToss(game) {
       guard++;
     }
   }
+  {
+    let guard2 = 0;
+    while (guard2 < n && game.players[tossIdx] === dpid) {
+      tossIdx = nextNonEmptyHandIndex(game, nextIndex(tossIdx, n));
+      guard2++;
+    }
+  }
   b.tossPid = game.players[tossIdx];
   b.subPhase = 'take_toss';
   b.takePid = dpid;
-  b.attackerPid = b.tossPid || game.players[game.attackerIndex];
+  b.attackerPid = b.tossPid || b.firstAttackerPid || game.players[game.attackerIndex];
   b.defenderPid = dpid;
   if (maxTossAllowed(game) <= 0 || !canAnyToss(game)) {
     return applyTake(game);
@@ -860,7 +872,7 @@ function beginTakeToss(game) {
 function applyTake(game) {
   const b = game.battle;
   const dpid = b.takePid || game.players[game.defenderIndex];
-  const prevAttackerPid = game.players[game.attackerIndex];
+  const prevAttackerPid = b.firstAttackerPid || game.players[game.attackerIndex];
   const prevDefenderPid = dpid;
   const takenIds = collectTableCardIds(b);
   const hand = game.hands.get(dpid) || [];
@@ -984,7 +996,8 @@ function processAction(game, pid, action) {
 
   if (type === 'done') {
     if (game.battle.subPhase === 'take_toss') {
-      const tossPid = game.battle.tossPid || game.players[game.attackerIndex];
+      const tossPid =
+        game.battle.tossPid || game.battle.firstAttackerPid || game.players[game.attackerIndex];
       if (pid !== tossPid) return { ok: false, error: 'Только атакующий нажимает бито' };
       return applyTake(game);
     }
@@ -1023,6 +1036,7 @@ function processAction(game, pid, action) {
         removed.push(cid);
       }
       b.leadingRank = rank0;
+      if (!b.table.length) b.firstAttackerPid = pid;
       for (const cid of cardIds) {
         b.table.push({ attack: cid, defense: null, beatType: 'attack', transferStack: [] });
       }
@@ -1144,7 +1158,7 @@ function processAction(game, pid, action) {
       }
       if (b.subPhase === 'take_toss') {
         b.subPhase = 'take_toss';
-        b.attackerPid = b.tossPid || game.players[game.attackerIndex];
+        b.attackerPid = b.tossPid || b.firstAttackerPid || game.players[game.attackerIndex];
         b.defenderPid = b.takePid || game.players[game.defenderIndex];
         game.turnDeadline = Date.now() + 10000;
       } else {
