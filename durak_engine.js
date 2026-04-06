@@ -290,10 +290,21 @@ function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
   let di;
   const takerIdx = Math.max(0, game.players.indexOf(prevDefenderPid));
   if (n <= 2) {
-    ai = game.players.indexOf(prevAttackerPid);
-    if (ai < 0) ai = 0;
-    di = game.players.indexOf(prevDefenderPid);
-    if (di < 0) di = nextIndex(ai, n);
+    const ai0 = game.players.indexOf(prevAttackerPid);
+    const di0 = game.players.indexOf(prevDefenderPid);
+    ai = ai0 < 0 ? 0 : ai0;
+    di = di0 < 0 ? nextIndex(ai, n) : di0;
+    /* Перевод на атакующего (2 игрока): атакующий стал защитником и взял.
+       В таком случае взявший снова защищается, а атакует другой игрок. */
+    if (ai === di) {
+      di = ai;
+      ai = nextNonEmptyHandIndex(game, nextIndex(di, n));
+      let guard = 0;
+      while (guard < n && ai === di) {
+        ai = nextNonEmptyHandIndex(game, nextIndex(ai, n));
+        guard++;
+      }
+    }
   } else {
     ai = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
     let guardA = 0;
