@@ -171,6 +171,22 @@ function totalCardsInAttackPileAfterOneMoreTransfer(battle, targetRow) {
   return n;
 }
 
+/** Все карты на столе: атаки, отбои, переводы и отбои по ним (для лимита подкидывания и «вдогонку»). */
+function countAllCardsOnTable(battle) {
+  if (!battle || !Array.isArray(battle.table)) return 0;
+  let n = 0;
+  for (const row of battle.table) {
+    ensureTransferStack(row);
+    if (row.attack) n++;
+    if (row.defense) n++;
+    for (const t of row.transferStack) {
+      if (t.card) n++;
+      if (t.defense) n++;
+    }
+  }
+  return n;
+}
+
 function removeCardFromHand(hands, pid, cardId) {
   const h = hands.get(pid);
   if (!h) return false;
@@ -423,9 +439,20 @@ function battleAttackCardsCap(game, defenderIdx) {
   return Math.max(1, Math.min(hardCap, handN));
 }
 
+/** Лимит карт в текущем отбое: min(5|6, рука защитника). Обновлять при смене защитника (перевод). */
+function syncMaxTableCardsFromDefenderHand(game) {
+  const b = game.battle;
+  if (!b) return;
+  const dPid = game.players[game.defenderIndex];
+  const dHand = (game.hands.get(dPid) || []).length;
+  const hardCap = game.firstDealRules ? 5 : 6;
+  b.maxAttackCards = Math.max(1, Math.min(hardCap, dHand));
+}
+
 function maxTossAllowed(game) {
   const cap = game.battle?.maxAttackCards || Number.MAX_SAFE_INTEGER;
-  return Math.max(0, cap - game.battle.table.length);
+  const onTable = countAllCardsOnTable(game.battle);
+  return Math.max(0, cap - onTable);
 }
 
 function canToss(game, pid) {
@@ -550,7 +577,7 @@ function tryDefendPlay(game, cardId, action) {
     const ni = resolveNextDefenderIndex(game);
     const need = totalCardsInAttackPileAfterOneMoreTransfer(b, row);
     const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
-    if (need > cap) {
+    if (countAllCardsOnTable(b) + 1 > cap) {
       return { ok: false, error: 'Лимит карт в этом отбое исчерпан' };
     }
     if ((game.hands.get(game.players[ni]) || []).length < need) {
@@ -979,6 +1006,7 @@ function processAction(game, pid, action) {
     if (b.subPhase === 'attack') {
       if (pid !== attPid) return { ok: false, error: 'Ход атакующего' };
       const cardIds = rawCards.map((c) => String(c || '').trim()).filter(Boolean);
+      syncMaxTableCardsFromDefenderHand(game);
       const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
       if (cardIds.length > cap) return { ok: false, error: 'Превышен лимит карт в отбое' };
       const parsed = cardIds.map((id) => parseCard(id)).filter(Boolean);
@@ -1032,6 +1060,7 @@ function processAction(game, pid, action) {
         game.defenderIndex = ni;
         b.defenderPid = game.players[game.defenderIndex];
         b.attackerPid = game.players[game.attackerIndex];
+        syncMaxTableCardsFromDefenderHand(game);
         b.subPhase = 'defend';
         game.turnDeadline = Date.now() + game.turnSeconds * 1000;
         game.version++;
@@ -1092,7 +1121,8 @@ function processAction(game, pid, action) {
         if (!pr || !allowedRanks.has(pr.rank)) return { ok: false, error: 'Такой ранг нельзя' };
       }
       const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
-      if (b.table.length + cardIds.length > cap) {
+      const onTable = countAllCardsOnTable(b);
+      if (onTable + cardIds.length > cap) {
         return { ok: false, error: 'Превышен лимит карт в отбое' };
       }
       const removed = [];
@@ -1114,7 +1144,7 @@ function processAction(game, pid, action) {
       }
       if (b.subPhase === 'take_toss') {
         b.subPhase = 'take_toss';
-        b.attackerPid = game.players[game.attackerIndex];
+        b.attackerPid = b.tossPid || game.players[game.attackerIndex];
         b.defenderPid = b.takePid || game.players[game.defenderIndex];
         game.turnDeadline = Date.now() + 10000;
       } else {
