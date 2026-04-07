@@ -969,7 +969,7 @@ function beginTakeToss(game) {
   b.takePid = dpid;
   b.attackerPid = b.tossPid || b.firstAttackerPid || game.players[game.attackerIndex];
   b.defenderPid = dpid;
-  game.turnDeadline = Date.now() + 10000;
+  game.turnDeadline = Date.now() + 30000;
   game.version++;
   return { ok: true };
 }
