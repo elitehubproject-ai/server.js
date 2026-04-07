@@ -1688,6 +1688,7 @@ wss.on('connection', (ws) => {
                 case 'toggle-audio':
                 case 'speaking':
                 case 'camera-facing':
+                case 'cam-fx':
                     {
                         const room = rooms.get(currentRoom);
                         if (!room) return;
