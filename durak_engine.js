@@ -115,6 +115,7 @@ function createEmptyGame(mode) {
     stockEmpty: false,
     firstDealRules: true,
     battlesFinished: 0,
+    finishOrder: [],
     winnerId: null,
     turnDeadline: 0,
     turnSeconds: 60,
@@ -135,6 +136,9 @@ function bumpLastPlay(game, byPid, cardIds, kind) {
 
 function nextIndex(n, len) {
   return (n + 1) % len;
+}
+function prevIndex(n, len) {
+  return (n - 1 + len) % len;
 }
 
 /** Цепочка переводов: [{ card, defense }]. Совместимость со старым transferCard. */
@@ -187,6 +191,20 @@ function countAllCardsOnTable(battle) {
   return n;
 }
 
+/** Кол-во атакующих слотов (без отбоя): для лимита "сколько должен отбить/взять защитник". */
+function countAttackSlotsOnTable(battle) {
+  if (!battle || !Array.isArray(battle.table)) return 0;
+  let n = 0;
+  for (const row of battle.table) {
+    ensureTransferStack(row);
+    if (row.attack) n++;
+    for (const t of row.transferStack) {
+      if (t.card) n++;
+    }
+  }
+  return n;
+}
+
 function removeCardFromHand(hands, pid, cardId) {
   const h = hands.get(pid);
   if (!h) return false;
@@ -233,6 +251,7 @@ function dealInitial(game) {
   game.stockEmpty = false;
   game.firstDealRules = true;
   game.battlesFinished = 0;
+  game.finishOrder = [];
   const firstPid = lowestTrumpFirstAttacker(game.players, game.hands, game.trump);
   game.attackerIndex = Math.max(0, game.players.indexOf(firstPid));
   game.defenderIndex = nextNonEmptyHandIndex(game, nextIndex(game.attackerIndex, n));
@@ -279,6 +298,13 @@ function refillHands(game) {
 function checkGameEnd(game) {
   const n = game.players.length;
   if (n < 2) return false;
+  if (game.stockEmpty) {
+    const fo = Array.isArray(game.finishOrder) ? game.finishOrder : [];
+    for (const pid of game.players) {
+      if ((game.hands.get(pid) || []).length === 0 && !fo.includes(pid)) fo.push(pid);
+    }
+    game.finishOrder = fo;
+  }
   const active = game.players.filter((pid) => (game.hands.get(pid) || []).length > 0);
   const empty = game.players.filter((pid) => (game.hands.get(pid) || []).length === 0);
   if (active.length <= 1) {
@@ -291,6 +317,19 @@ function checkGameEnd(game) {
   return false;
 }
 
+/** После опустошения колоды игроки с 0 карт покидают активную ротацию. */
+function pruneFinishedPlayers(game) {
+  if (!game.stockEmpty) return;
+  // Игроки с 0 карт остаются в списке для UI-мест, но исключаются из активного хода.
+  if (game.players.length < 2) return;
+  let ai = nextNonEmptyHandIndex(game, game.attackerIndex);
+  if ((game.hands.get(game.players[ai]) || []).length === 0) return;
+  game.attackerIndex = ai;
+  let di = nextNonEmptyHandIndex(game, nextIndex(ai, game.players.length));
+  if (di === ai) di = nextNonEmptyHandIndex(game, nextIndex(di, game.players.length));
+  game.defenderIndex = di;
+}
+
 /**
  * После «беру»: атакует тот, кто вёл атаку в этой схватке; защищается взявший стол.
  * Если переводной перевели на атакующего (в т.ч. 2 игрока), индекс атакующего и защитника совпадают —
@@ -299,6 +338,7 @@ function checkGameEnd(game) {
 function startNextBattleAfterTake(game, prevAttackerPid, prevDefenderPid) {
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
+  pruneFinishedPlayers(game);
   game.battlesFinished++;
   if (game.battlesFinished >= 1) game.firstDealRules = false;
   if (checkGameEnd(game)) return;
@@ -364,6 +404,7 @@ function startNextBattleAfterBeat(game, prevDefenderPid) {
   game.lastPlay = null;
   const n = game.players.length;
   if (!game.stockEmpty) refillHands(game);
+  pruneFinishedPlayers(game);
   game.battlesFinished++;
   if (game.battlesFinished >= 1) game.firstDealRules = false;
   if (checkGameEnd(game)) return;
@@ -438,7 +479,7 @@ function defenderCardCount(game) {
 function battleAttackCardsCap(game, defenderIdx) {
   const pid = game.players[defenderIdx];
   const handN = (game.hands.get(pid) || []).length;
-  const hardCap = game.firstDealRules ? 5 : 6;
+  const hardCap = game.firstDealRules ? 5 : Number.MAX_SAFE_INTEGER;
   return Math.max(1, Math.min(hardCap, handN));
 }
 
@@ -448,22 +489,35 @@ function syncMaxTableCardsFromDefenderHand(game) {
   if (!b) return;
   const dPid = game.players[game.defenderIndex];
   const dHand = (game.hands.get(dPid) || []).length;
-  const hardCap = game.firstDealRules ? 5 : 6;
+  const hardCap = game.firstDealRules ? 5 : Number.MAX_SAFE_INTEGER;
   b.maxAttackCards = Math.max(1, Math.min(hardCap, dHand));
 }
 
 function maxTossAllowed(game) {
   const cap = game.battle?.maxAttackCards || Number.MAX_SAFE_INTEGER;
-  const onTable = countAllCardsOnTable(game.battle);
+  const onTable = countAttackSlotsOnTable(game.battle);
   return Math.max(0, cap - onTable);
+}
+
+function defenderNeighborPids(game) {
+  const n = game.players.length;
+  if (n < 2) return [];
+  const di = game.defenderIndex;
+  const left = game.players[prevIndex(di, n)];
+  const right = game.players[nextIndex(di, n)];
+  if (!left && !right) return [];
+  if (left === right) return left ? [left] : [];
+  return [left, right].filter(Boolean);
+}
+
+function getDoneEligiblePids(game) {
+  return defenderNeighborPids(game).filter((pid) => (game.hands.get(pid) || []).length > 0);
 }
 
 function canToss(game, pid) {
   const sub = game.battle.subPhase;
   if (sub !== 'toss' && sub !== 'take_toss') return false;
-  if (sub === 'take_toss') {
-    if (pid !== (game.battle.tossPid || game.battle.firstAttackerPid || game.players[game.attackerIndex])) return false;
-  } else if (pid === game.players[game.defenderIndex]) return false;
+  if (!getDoneEligiblePids(game).includes(pid)) return false;
   if (maxTossAllowed(game) <= 0) return false;
   return true;
 }
@@ -735,6 +789,7 @@ function exportGamePublic(game, viewerId) {
     defenderIndex: game.defenderIndex,
     firstDealRules: game.firstDealRules,
     battlesFinished: game.battlesFinished,
+    finishOrder: [...(game.finishOrder || [])],
     stockEmpty: game.stockEmpty,
     winnerId: game.winnerId,
     turnDeadline: game.turnDeadline,
@@ -834,36 +889,14 @@ function collectTableCardIds(battle) {
 function beginTakeToss(game) {
   const b = game.battle;
   const dpid = game.players[game.defenderIndex];
-  const n = game.players.length;
-  const takerIdx = game.defenderIndex;
-  const leaderPid = b.firstAttackerPid || game.players[game.attackerIndex];
-  let tossIdx = game.players.indexOf(leaderPid);
-  if (tossIdx < 0) tossIdx = game.attackerIndex;
-  /* В переводном при переводе на атакующего (в т.ч. 2 игрока) первый атакующий может совпасть с взявшим.
-     Тогда «Бито»/докидка — у другого живого игрока, не у взявшего стол. */
-  if (tossIdx === takerIdx) {
-    tossIdx = nextNonEmptyHandIndex(game, nextIndex(takerIdx, n));
-    let guard = 0;
-    while (guard < n && tossIdx === takerIdx) {
-      tossIdx = nextNonEmptyHandIndex(game, nextIndex(tossIdx, n));
-      guard++;
-    }
-  }
-  {
-    let guard2 = 0;
-    while (guard2 < n && game.players[tossIdx] === dpid) {
-      tossIdx = nextNonEmptyHandIndex(game, nextIndex(tossIdx, n));
-      guard2++;
-    }
-  }
-  b.tossPid = game.players[tossIdx];
+  const tosserPids = defenderNeighborPids(game);
+  b.tossPids = tosserPids;
+  b.doneBy = [];
+  b.tossPid = tosserPids[0] || null;
   b.subPhase = 'take_toss';
   b.takePid = dpid;
   b.attackerPid = b.tossPid || b.firstAttackerPid || game.players[game.attackerIndex];
   b.defenderPid = dpid;
-  if (maxTossAllowed(game) <= 0 || !canAnyToss(game)) {
-    return applyTake(game);
-  }
   game.turnDeadline = Date.now() + 10000;
   game.version++;
   return { ok: true };
@@ -995,16 +1028,22 @@ function processAction(game, pid, action) {
   }
 
   if (type === 'done') {
-    if (game.battle.subPhase === 'take_toss') {
-      const tossPid =
-        game.battle.tossPid || game.battle.firstAttackerPid || game.players[game.attackerIndex];
-      if (pid !== tossPid) return { ok: false, error: 'Только атакующий нажимает бито' };
-      return applyTake(game);
+    if (game.battle.subPhase === 'take_toss' || game.battle.subPhase === 'toss') {
+      const b = game.battle;
+      const eligible = getDoneEligiblePids(game);
+      if (!eligible.includes(pid)) return { ok: false, error: 'Только соседи защитника' };
+      const doneBy = new Set(Array.isArray(b.doneBy) ? b.doneBy : []);
+      doneBy.add(pid);
+      b.doneBy = [...doneBy];
+      game.version++;
+      const allDone = eligible.every((x) => doneBy.has(x));
+      if (!allDone) return { ok: true, wait: true };
+      if (game.battle.subPhase === 'take_toss') return applyTake(game);
+      if (game.battle.table.some((r) => !rowFullyDefendedForBito(r))) return { ok: false, error: 'Есть неотбитые' };
+      return applyBito(game);
     }
     if (pid !== bitoAuthorityPid(game)) return { ok: false, error: 'Только атакующий нажимает бито' };
-    if (game.battle.subPhase !== 'toss') return { ok: false, error: 'Сначала отбейтесь' };
-    if (game.battle.table.some((r) => !rowFullyDefendedForBito(r))) return { ok: false, error: 'Есть неотбитые' };
-    return applyBito(game);
+    return { ok: false, error: 'Сначала отбейтесь' };
   }
 
   if (type === 'play') {
@@ -1104,6 +1143,7 @@ function processAction(game, pid, action) {
         }
         b.subPhase = 'toss';
         b.attackerPid = bitoAuthorityPid(game);
+        b.doneBy = [];
         game.turnDeadline = Date.now() + game.turnSeconds * 1000;
         game.version++;
         return { ok: true };
@@ -1160,6 +1200,7 @@ function processAction(game, pid, action) {
         b.subPhase = 'take_toss';
         b.attackerPid = b.tossPid || b.firstAttackerPid || game.players[game.attackerIndex];
         b.defenderPid = b.takePid || game.players[game.defenderIndex];
+        b.doneBy = [];
         game.turnDeadline = Date.now() + 10000;
       } else {
         b.subPhase = 'defend';
