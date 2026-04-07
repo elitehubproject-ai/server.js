@@ -574,7 +574,7 @@ function applyTossPlay(game, pid, cardIds, fromTakeToss) {
     b.attackerPid = b.tossPid || b.firstAttackerPid || game.players[game.attackerIndex];
     b.defenderPid = b.takePid || game.players[game.defenderIndex];
     b.doneBy = [];
-    game.turnDeadline = Date.now() + 10000;
+    game.turnDeadline = Date.now() + 30000;
   } else {
     b.subPhase = 'defend';
     game.turnDeadline = Date.now() + game.turnSeconds * 1000;
