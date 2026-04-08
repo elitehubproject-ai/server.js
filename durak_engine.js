@@ -531,6 +531,25 @@ function maxTossAllowed(game) {
   const b = game.battle;
   if (!b) return 0;
   
+  // V faze take_toss zashitnik uzhe reshil vzyat' karty, no sosedi mogut eshche podkinut'
+  if (b.subPhase === 'take_toss') {
+    const dPid = game.players[game.defenderIndex];
+    const dHand = (game.hands.get(dPid) || []).length;
+    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
+    
+    if (game.firstDealRules) {
+      const hardCap = 5;
+      const maxDefendable = Math.min(hardCap, dHand);
+      const result = Math.max(0, maxDefendable - unbeatenOnTable);
+      console.log(`[DEBUG] take_toss firstDeal: dHand=${dHand}, unbeaten=${unbeatenOnTable}, maxDefendable=${maxDefendable}, result=${result}`);
+      return result;
+    } else {
+      const result = Math.max(0, dHand - unbeatenOnTable);
+      console.log(`[DEBUG] take_toss subsequent: dHand=${dHand}, unbeaten=${unbeatenOnTable}, result=${result}`);
+      return result;
+    }
+  }
+  
   if (game.firstDealRules) {
     // Pervyy otboy: uchityvaem, chto posle perevoda zashitnik menyaetsya
     const dPid = game.players[game.defenderIndex];
@@ -545,7 +564,9 @@ function maxTossAllowed(game) {
     
     // Mozhno podkinut' do (maxDefendable - unbeatenOnTable) kart
     // Esli unbeatenOnTable > maxDefendable, to zashitnik uzhe ne spravitsya i podkinut' nel'zya
-    return Math.max(0, maxDefendable - unbeatenOnTable);
+    const result = Math.max(0, maxDefendable - unbeatenOnTable);
+    console.log(`[DEBUG] toss firstDeal: dHand=${dHand}, unbeaten=${unbeatenOnTable}, maxDefendable=${maxDefendable}, result=${result}`);
+    return result;
   } else {
     // Posleduyushchiy otboy: mozhno podkinut' stol'ko, chtoby u zashitnika ostalos' ne bol'she kart chem v ruke
     const dPid = game.players[game.defenderIndex];
@@ -555,11 +576,14 @@ function maxTossAllowed(game) {
     // Zashitnik mozhet otbit' ne bol'she chem dHand kart
     // Esli uzhe ne beatenOnTable > dHand, to podkinut' bol'she nel'zya
     if (unbeatenOnTable >= dHand) {
+      console.log(`[DEBUG] toss subsequent: unbeaten=${unbeatenOnTable} >= dHand=${dHand}, returning 0`);
       return 0;
     }
     
     // Mozhno podkinut' do (dHand - unbeatenOnTable) kart
-    return Math.max(0, dHand - unbeatenOnTable);
+    const result = Math.max(0, dHand - unbeatenOnTable);
+    console.log(`[DEBUG] toss subsequent: dHand=${dHand}, unbeaten=${unbeatenOnTable}, result=${result}`);
+    return result;
   }
 }
 
@@ -582,7 +606,8 @@ function canToss(game, pid) {
   const sub = game.battle.subPhase;
   if (sub !== 'toss' && sub !== 'take_toss') return false;
   if (!getDoneEligiblePids(game).includes(pid)) return false;
-  if (maxTossAllowed(game) <= 0) return false;
+  const allowed = maxTossAllowed(game);
+  if (allowed <= 0) return false;
   return true;
 }
 
