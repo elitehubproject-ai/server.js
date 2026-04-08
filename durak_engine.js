@@ -205,6 +205,20 @@ function countAttackSlotsOnTable(battle) {
   return n;
 }
 
+/** Кол-во НЕ ОТБИТЫХ атакующих карт на столе: для лимита подкидывания. */
+function countUnbeatenAttackSlotsOnTable(battle) {
+  if (!battle || !Array.isArray(battle.table)) return 0;
+  let n = 0;
+  for (const row of battle.table) {
+    ensureTransferStack(row);
+    if (row.attack && !row.defense) n++;
+    for (const t of row.transferStack) {
+      if (t.card && !t.defense) n++;
+    }
+  }
+  return n;
+}
+
 function removeCardFromHand(hands, pid, cardId) {
   const h = hands.get(pid);
   if (!h) return false;
@@ -483,7 +497,8 @@ function battleAttackCardsCap(game, defenderIdx) {
   const pid = game.players[defenderIdx];
   const handN = (game.hands.get(pid) || []).length;
   const hardCap = game.firstDealRules ? 5 : Number.MAX_SAFE_INTEGER;
-  return Math.max(1, Math.min(hardCap, handN));
+  const unbeatenCardsOnTable = countUnbeatenAttackSlotsOnTable(game.battle);
+  return Math.max(1, Math.min(hardCap, handN, unbeatenCardsOnTable));
 }
 
 /** Лимит карт в текущем отбое: min(5|6, рука защитника). Обновлять при смене защитника (перевод). */
@@ -492,14 +507,43 @@ function syncMaxTableCardsFromDefenderHand(game) {
   if (!b) return;
   const dPid = game.players[game.defenderIndex];
   const dHand = (game.hands.get(dPid) || []).length;
-  const hardCap = game.firstDealRules ? 5 : Number.MAX_SAFE_INTEGER;
-  b.maxAttackCards = Math.max(1, Math.min(hardCap, dHand));
+  
+  if (game.firstDealRules) {
+    // Pervyy otboy: ne bol'she 5 kart i ne bol'she chem kart v ruke
+    const hardCap = 5;
+    b.maxAttackCards = Math.max(1, Math.min(hardCap, dHand));
+  } else {
+    // Posleduyushchiy otboy: zashitnik mozhet otbit' stol'ko kart, skol'ko u nego v ruke
+    // NO ne bol'she chem uzhe NE OTBITYkh kart na stole + novye podkidnye
+    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
+    b.maxAttackCards = Math.max(1, Math.min(dHand, unbeatenOnTable + dHand));
+  }
 }
 
 function maxTossAllowed(game) {
-  const cap = game.battle?.maxAttackCards || Number.MAX_SAFE_INTEGER;
-  const onTable = countAttackSlotsOnTable(game.battle);
-  return Math.max(0, cap - onTable);
+  const b = game.battle;
+  if (!b) return 0;
+  
+  if (game.firstDealRules) {
+    // Pervyy otboy: standartnaya logika
+    const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
+    const onTable = countAttackSlotsOnTable(b);
+    return Math.max(0, cap - onTable);
+  } else {
+    // Posleduyushchiy otboy: mozhno podkinut' stol'ko, chtoby u zashitnika ostalos' ne bol'she kart chem v ruke
+    const dPid = game.players[game.defenderIndex];
+    const dHand = (game.hands.get(dPid) || []).length;
+    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
+    
+    // Zashitnik mozhet otbit' ne bol'she chem dHand kart
+    // Esli uzhe ne beatenOnTable > dHand, to podkinut' bol'she nel'zya
+    if (unbeatenOnTable >= dHand) {
+      return 0;
+    }
+    
+    // Mozhno podkinut' do (dHand - unbeatenOnTable) kart
+    return Math.max(0, dHand - unbeatenOnTable);
+  }
 }
 
 function defenderNeighborPids(game) {
