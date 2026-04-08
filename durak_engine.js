@@ -543,12 +543,8 @@ function maxTossAllowed(game) {
     // Zashitnik mozhet otbit' ne bol'she chem min(5, dHand) kart
     const maxDefendable = Math.min(hardCap, dHand);
     
-    // Esli uzhe ne beatenOnTable >= maxDefendable, to podkinut' bol'she nel'zya
-    if (unbeatenOnTable >= maxDefendable) {
-      return 0;
-    }
-    
     // Mozhno podkinut' do (maxDefendable - unbeatenOnTable) kart
+    // Esli unbeatenOnTable > maxDefendable, to zashitnik uzhe ne spravitsya i podkinut' nel'zya
     return Math.max(0, maxDefendable - unbeatenOnTable);
   } else {
     // Posleduyushchiy otboy: mozhno podkinut' stol'ko, chtoby u zashitnika ostalos' ne bol'she kart chem v ruke
@@ -1245,7 +1241,7 @@ function processAction(game, pid, action) {
           if (!pr || !allowedRanks.has(pr.rank)) return { ok: false, error: 'Такой ранг нельзя' };
         }
         const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
-        const slots = countAttackSlotsOnTable(b);
+        const slots = countUnbeatenAttackSlotsOnTable(b);
         if (slots + cardIds.length > cap) {
           return { ok: false, error: 'Превышен лимит карт в отбое' };
         }
@@ -1336,7 +1332,7 @@ function processAction(game, pid, action) {
       }
       syncMaxTableCardsFromDefenderHand(game);
       const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
-      const slots = countAttackSlotsOnTable(b);
+      const slots = countUnbeatenAttackSlotsOnTable(b);
       if (slots + cardIds.length > cap) {
         return { ok: false, error: 'Превышен лимит карт в отбое' };
       }
