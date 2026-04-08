@@ -866,6 +866,7 @@ function exportGamePublic(game, viewerId) {
     turnDeadline: game.turnDeadline,
     turnSeconds: game.turnSeconds,
     lobbyDeadline: game.lobbyDeadline,
+    cardPack: game.cardPack || 'classic',
     version: game.version,
     names: { ...(game.playerNames || {}) },
     playSeq: game.playSeq || 0,
@@ -884,11 +885,12 @@ function exportGamePublic(game, viewerId) {
   return out;
 }
 
-function createLobby(initiatorId, initiatorName, mode) {
+function createLobby(initiatorId, initiatorName, mode, cardPack = 'classic') {
   const g = createEmptyGame(mode);
   g.phase = 'lobby';
   g.initiatorId = initiatorId;
-  g.playerNames[initiatorId] = String(initiatorName || 'Игрок').slice(0, 40);
+  g.cardPack = cardPack;
+  g.playerNames[initiatorId] = String(initiatorName || 'Choose your card pack').slice(0, 40);
   g.players = [initiatorId];
   g.lobbyDeadline = Date.now() + g.lobbyAutoSec * 1000;
   g.version = 1;
