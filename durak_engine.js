@@ -509,9 +509,16 @@ function syncMaxTableCardsFromDefenderHand(game) {
   const dHand = (game.hands.get(dPid) || []).length;
   
   if (game.firstDealRules) {
-    // Pervyy otboy: ne bol'she 5 kart i ne bol'she chem kart v ruke
+    // Pervyy otboy: zashitnik mozhet otbit' ne bol'she chem min(5, dHand) kart
     const hardCap = 5;
-    b.maxAttackCards = Math.max(1, Math.min(hardCap, dHand));
+    const maxDefendable = Math.min(hardCap, dHand);
+    
+    // Uchityvaem tol'ko NE OTBITYE karty na stole
+    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
+    
+    // MaxAttackCards - eto maksimalnoe kolichestvo kart, kotorye mogut byt' na stole v otboe
+    // Ne bol'she chem maxDefendable (skol'ko zashitnik mozhet otbit')
+    b.maxAttackCards = Math.max(1, Math.min(maxDefendable, unbeatenOnTable + maxDefendable));
   } else {
     // Posleduyushchiy otboy: zashitnik mozhet otbit' stol'ko kart, skol'ko u nego v ruke
     // NO ne bol'she chem uzhe NE OTBITYkh kart na stole + novye podkidnye
@@ -525,10 +532,24 @@ function maxTossAllowed(game) {
   if (!b) return 0;
   
   if (game.firstDealRules) {
-    // Pervyy otboy: standartnaya logika
-    const cap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
-    const onTable = countAttackSlotsOnTable(b);
-    return Math.max(0, cap - onTable);
+    // Pervyy otboy: uchityvaem, chto posle perevoda zashitnik menyaetsya
+    const dPid = game.players[game.defenderIndex];
+    const dHand = (game.hands.get(dPid) || []).length;
+    const hardCap = 5; // V pervom otboe ne bol'she 5 kart
+    
+    // Schitaem tol'ko NE OTBITYE karty, kotorye nuzhno otbit' tekushchemu zashitniku
+    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
+    
+    // Zashitnik mozhet otbit' ne bol'she chem min(5, dHand) kart
+    const maxDefendable = Math.min(hardCap, dHand);
+    
+    // Esli uzhe ne beatenOnTable >= maxDefendable, to podkinut' bol'she nel'zya
+    if (unbeatenOnTable >= maxDefendable) {
+      return 0;
+    }
+    
+    // Mozhno podkinut' do (maxDefendable - unbeatenOnTable) kart
+    return Math.max(0, maxDefendable - unbeatenOnTable);
   } else {
     // Posleduyushchiy otboy: mozhno podkinut' stol'ko, chtoby u zashitnika ostalos' ne bol'she kart chem v ruke
     const dPid = game.players[game.defenderIndex];
