@@ -1981,7 +1981,8 @@ wss.on('connection', (ws) => {
                         if (data.type === 'durak-propose') {
                             if (room.durak) return;
                             const mode = data.mode === 'perevodnoy' ? 'perevodnoy' : 'podkidnoy';
-                            room.durak = durakEngine.createLobby(senderId, userName, mode);
+                            const cardPack = data.cardPack || 'classic';
+                            room.durak = durakEngine.createLobby(senderId, userName, mode, cardPack);
                             broadcastDurak(room);
                             broadcastRoomState(room);
                             return;
