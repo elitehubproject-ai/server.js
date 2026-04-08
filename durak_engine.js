@@ -645,8 +645,10 @@ function applyTossPlay(game, pid, cardIds, fromTakeToss) {
     }
     removed.push(cid);
   }
-  const neigh = defenderNeighborPids(game).filter((x) => x !== pid);
-  b.tossBlockPid = neigh.length === 1 ? neigh[0] : null;
+  const allNeighbors = defenderNeighborPids(game);
+  // Blokiruem tol'ko esli vsego odin sosed (igra 2kh igrokov)
+  // Inache oba soseda mogut podkinut' karty
+  b.tossBlockPid = allNeighbors.length === 1 ? allNeighbors[0] : null;
   for (const cid of cardIds) {
     b.table.push({
       attack: cid,
