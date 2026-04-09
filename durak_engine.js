@@ -598,8 +598,19 @@ function defenderNeighborPids(game) {
   return [left, right].filter(Boolean);
 }
 
+function tossBaseEligiblePids(game) {
+  const b = game.battle || {};
+  const defPid = game.players[game.defenderIndex];
+  const set = new Set(defenderNeighborPids(game));
+  // Важно: атакующий, начавший текущий бой, всегда должен иметь право на подкидывание,
+  // даже если после внутренних сдвигов индексов он временно "выпал" из соседей.
+  const firstAtk = String(b.firstAttackerPid || '').trim();
+  if (firstAtk && firstAtk !== String(defPid || '')) set.add(firstAtk);
+  return [...set].filter((pid) => game.players.includes(pid) && pid !== defPid);
+}
+
 function getDoneEligiblePids(game) {
-  return defenderNeighborPids(game).filter((pid) => (game.hands.get(pid) || []).length > 0);
+  return tossBaseEligiblePids(game).filter((pid) => (game.hands.get(pid) || []).length > 0);
 }
 
 function canToss(game, pid) {
