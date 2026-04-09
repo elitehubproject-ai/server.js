@@ -23,8 +23,10 @@ const DEFAULT_ICE_SERVERS = [
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
-const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 15000;
+const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 90000;
+const EMPTY_ROOM_GRACE_MS = process.env.EMPTY_ROOM_GRACE_MS ? parseInt(process.env.EMPTY_ROOM_GRACE_MS, 10) : 10 * 60 * 1000;
 const pendingDisconnects = new Map();
+const emptyRoomCleanupTimers = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
 const messengerMysql = require('./messenger_pg');
 const durakEngine = require('./durak_engine');
@@ -879,6 +881,7 @@ function assignOwner(room, preferredOwnerId = null) {
 function closeRoom(room, closedById = null, closedByName = '') {
     if (!room) return;
     const roomId = room.id;
+    cancelRoomEmptyCleanup(roomId);
     clearRoomPendingDisconnects(roomId);
     const participants = Array.from(room.participants.values());
     const pending = Array.from(room.joinRequests.values());
@@ -930,6 +933,34 @@ function clearRoomPendingDisconnects(roomId) {
     });
 }
 
+function cancelRoomEmptyCleanup(roomId) {
+    if (!roomId) return;
+    const timerId = emptyRoomCleanupTimers.get(roomId);
+    if (!timerId) return;
+    clearTimeout(timerId);
+    emptyRoomCleanupTimers.delete(roomId);
+}
+
+function scheduleRoomEmptyCleanup(roomId) {
+    if (!roomId) return;
+    cancelRoomEmptyCleanup(roomId);
+    const timerId = setTimeout(() => {
+        emptyRoomCleanupTimers.delete(roomId);
+        const room = rooms.get(roomId);
+        if (!room) return;
+        if (room.participants.size > 0) return;
+        room.joinRequests.forEach((request) => {
+            safeSend(request.ws, { type: 'room-closed', roomId });
+            try { request.ws.close(); } catch (_) {}
+        });
+        room.joinRequests.clear();
+        clearRoomPendingDisconnects(roomId);
+        rooms.delete(roomId);
+        console.log(`🏠 Room closed by idle timeout: ${roomId}`);
+    }, Math.max(10000, EMPTY_ROOM_GRACE_MS));
+    emptyRoomCleanupTimers.set(roomId, timerId);
+}
+
 function finalizeParticipantDisconnect(clientId, roomId) {
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -953,18 +984,11 @@ function finalizeParticipantDisconnect(clientId, roomId) {
     }
     
     if (room.participants.size === 0) {
-        room.joinRequests.forEach((request) => {
-            safeSend(request.ws, {
-                type: 'room-closed',
-                roomId
-            });
-            try { request.ws.close(); } catch (_) {}
-        });
-        room.joinRequests.clear();
-        clearRoomPendingDisconnects(roomId);
-        rooms.delete(roomId);
-        console.log(`🏠 Room closed: ${roomId}`);
+        // Даем всем участникам время на массовое переподключение.
+        scheduleRoomEmptyCleanup(roomId);
+        console.log(`⏳ Room became empty, waiting reconnect grace: ${roomId}`);
     } else {
+        cancelRoomEmptyCleanup(roomId);
         const ownerLeft = room.ownerId === clientId || !room.participants.has(room.ownerId);
         if (ownerLeft) {
             assignOwner(room);
@@ -1497,10 +1521,6 @@ wss.on('connection', (ws) => {
                     }
 
                     if (!rooms.has(currentRoom)) {
-                        if (!isCreating) {
-                            safeSend(ws, { type: 'error', message: 'Такой комнаты не существует' });
-                            return;
-                        }
                         rooms.set(currentRoom, {
                             id: currentRoom,
                             participants: new Map(),
@@ -1514,6 +1534,7 @@ wss.on('connection', (ws) => {
                         });
                     }
                     const room = rooms.get(currentRoom);
+                    cancelRoomEmptyCleanup(currentRoom);
                     const reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
                     if (!isCreating && room.isFriendCall && isInvitedFriendForRoom(room, appUserId) && !reconnectTargetId) {
                         const ownerPart = room.ownerId ? room.participants.get(room.ownerId) : null;
@@ -2094,17 +2115,8 @@ function handleDisconnect(clientId, roomId, options = {}) {
             byModerator: false
         });
         if (room.participants.size === 0) {
-            room.joinRequests.forEach((request) => {
-                safeSend(request.ws, {
-                    type: 'room-closed',
-                    roomId
-                });
-                try { request.ws.close(); } catch (_) {}
-            });
-            room.joinRequests.clear();
-            clearRoomPendingDisconnects(roomId);
-            rooms.delete(roomId);
-            console.log(`🏠 Room closed: ${roomId}`);
+            scheduleRoomEmptyCleanup(roomId);
+            console.log(`⏳ Room join-request only, waiting reconnect grace: ${roomId}`);
         }
         return;
     }
