@@ -20,10 +20,15 @@ const DEFAULT_ICE_SERVERS = [
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 // maxPayload ограничивает размер одного сообщения WebSocket (в байтах).
 // Медиа-сообщения кладутся в JSON (base64), поэтому лимит должен быть существенно выше.
+// Голос в звонке идёт по WebRTC (SRTP между браузерами); WebSocket — сигналинг и чат, не «труба» для RTP-аудио.
 const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
-const RECONNECT_GRACE_MS = process.env.RECONNECT_GRACE_MS ? parseInt(process.env.RECONNECT_GRACE_MS, 10) : 90000;
+// Долгая пауза: кратковременный обрыв WebSocket (прокси, сон вкладки) не должен «выкидывать» из комнаты.
+const _reconnectGraceParsed = parseInt(process.env.RECONNECT_GRACE_MS || '', 10);
+const RECONNECT_GRACE_MS = Number.isFinite(_reconnectGraceParsed) && _reconnectGraceParsed > 0
+    ? _reconnectGraceParsed
+    : 24 * 60 * 60 * 1000;
 const EMPTY_ROOM_GRACE_MS = process.env.EMPTY_ROOM_GRACE_MS ? parseInt(process.env.EMPTY_ROOM_GRACE_MS, 10) : 10 * 60 * 1000;
 const pendingDisconnects = new Map();
 const emptyRoomCleanupTimers = new Map();
