@@ -149,7 +149,10 @@ async function initMessengerMysql() {
       max: Number(env('PG_POOL_MAX', '10')) || 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
-      family: 4
+      family: 4,
+      ssl: {
+        rejectUnauthorized: false
+      }
     };
     
     pool = new Pool(poolOpts);
