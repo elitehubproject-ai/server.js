@@ -110,8 +110,9 @@ async function initMessengerMysql() {
   if (directUrl) {
     // Use direct PostgreSQL connection string
     try {
+      console.log('[messenger_mysql] Trying DATABASE_URL:', directUrl.replace(/:[^@]+@/, ':***@'));
       const poolOpts = {
-        connectionString: directUrl.includes('sslmode') ? directUrl : `${directUrl}?sslmode=disable`,
+        connectionString: directUrl,
         max: Number(env('PG_POOL_MAX', '10')) || 10,
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
@@ -168,10 +169,20 @@ async function initMessengerMysql() {
     try {
       console.log('[messenger_mysql] Trying REST API connection...');
       // Use HTTPS URL for REST API, not PostgreSQL URL
-      const restUrl = supabaseUrl.startsWith('postgresql://') 
-        ? `https://${new URL(supabaseUrl).hostname}/rest/v1/`
-        : `${supabaseUrl}/rest/v1/`;
+      let restUrl;
+      if (supabaseUrl.startsWith('postgresql://')) {
+        try {
+          const url = new URL(supabaseUrl);
+          restUrl = `https://${url.hostname}/rest/v1/`;
+        } catch (e) {
+          console.error('[messenger_mysql] Failed to parse PostgreSQL URL:', e.message);
+          restUrl = supabaseUrl.replace('postgresql://', 'https://').split('@')[1] + '/rest/v1/';
+        }
+      } else {
+        restUrl = `${supabaseUrl}/rest/v1/`;
+      }
       
+      console.log('[messenger_mysql] REST API URL:', restUrl);
       const testResponse = await fetch(`${restUrl}users?select=id&limit=1`, {
         headers: {
           'apikey': supabaseKey,
