@@ -116,13 +116,16 @@ async function initMessengerMysql() {
   try {
     // Parse Supabase URL to get connection details
     const url = new URL(supabaseUrl);
-    const connectionString = `${supabaseUrl}/postgres?apikey=${supabaseKey}`;
+    // Force IPv4 connection with direct PostgreSQL format
+    const connectionString = `postgresql://postgres.${url.hostname}:5432/postgres?apikey=${supabaseKey}&sslmode=require`;
     
     const poolOpts = {
       connectionString: connectionString,
       max: Number(env('PG_POOL_MAX', '10')) || 10,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000
+      connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
+      // Force IPv4
+      family: 4
     };
     
     pool = new Pool(poolOpts);
