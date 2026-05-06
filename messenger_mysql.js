@@ -111,11 +111,14 @@ async function initMessengerMysql() {
     // Use direct PostgreSQL connection string
     try {
       const poolOpts = {
-        connectionString: directUrl,
+        connectionString: directUrl.includes('sslmode') ? directUrl : `${directUrl}?sslmode=disable`,
         max: Number(env('PG_POOL_MAX', '10')) || 10,
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
-        family: 4
+        family: 4,
+        ssl: {
+          rejectUnauthorized: false
+        }
       };
       
       pool = new Pool(poolOpts);
@@ -161,7 +164,11 @@ async function initMessengerMysql() {
     // Fallback: Try REST API approach
     try {
       console.log('[messenger_mysql] Trying REST API connection...');
-      const restUrl = `${supabaseUrl}/rest/v1/`;
+      // Use HTTPS URL for REST API, not PostgreSQL URL
+      const restUrl = supabaseUrl.startsWith('postgresql://') 
+        ? `https://${new URL(supabaseUrl).hostname}/rest/v1/`
+        : `${supabaseUrl}/rest/v1/`;
+      
       const testResponse = await fetch(`${restUrl}users?select=id&limit=1`, {
         headers: {
           'apikey': supabaseKey,
