@@ -7,6 +7,7 @@ let enabled = false;
 
 function env(name, def = '') {
   const v = process.env[name];
+  console.log(`[messenger_mysql] DEBUG: env(${name}) = ${v ? 'SET' : 'NOT SET'}`);
   if (v == null) return def;
   const t = String(v).trim();
   return t.length ? t : def;
