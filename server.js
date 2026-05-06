@@ -33,15 +33,15 @@ const EMPTY_ROOM_GRACE_MS = process.env.EMPTY_ROOM_GRACE_MS ? parseInt(process.e
 const pendingDisconnects = new Map();
 const emptyRoomCleanupTimers = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
-const messengerMysql = require('./messenger_pg');
+const messengerMysql = require('./messenger_mysql');
 const durakEngine = require('./durak_engine');
 // Для медиа-сообщений ограничиваем длину base64-строки на сервере.
 // Ориентир: 50MB файл => ~67MB base64 символов.
 const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
-    console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
+    console.log('[messenger] storage backend:', ok ? 'mysql' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('DATABASE_URL');
+    const needDb = !!e('MYSQL_DATABASE');
     const exitOnFail = e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1';
     if (!ok && needDb && exitOnFail) {
         process.exit(1);
@@ -49,7 +49,7 @@ const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     return ok;
 }).catch((err) => {
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('DATABASE_URL');
+    const needDb = !!e('MYSQL_DATABASE');
     if (needDb && e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1') process.exit(1);
     return false;
 });
