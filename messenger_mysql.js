@@ -129,6 +129,7 @@ async function initMessengerMysql() {
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
       family: 4,
+      host: 'db.uovhvvimiomytxckzlpf.supabase.co',
       ssl: {
         rejectUnauthorized: false
       }
@@ -147,9 +148,8 @@ async function initMessengerMysql() {
   // Fallback: Try REST API approach
   try {
     console.log('[messenger_mysql] Trying REST API connection...');
-    // Extract hostname from DATABASE_URL for REST API
-    const url = new URL(directUrl);
-    const restUrl = `https://${url.hostname}/rest/v1/`;
+    // Use IPv4 hostname for REST API
+    const restUrl = 'https://db.uovhvvimiomytxckzlpf.supabase.co/rest/v1/';
     
     console.log('[messenger_mysql] REST API URL:', restUrl);
     // Try to create users table first via REST API
