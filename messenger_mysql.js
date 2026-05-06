@@ -1,6 +1,6 @@
 'use strict';
 
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 
 let pool = null;
 let enabled = false;
@@ -25,7 +25,6 @@ function directChatId(a, b) {
 }
 
 async function ensureTables() {
-  // Create users table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id VARCHAR(120) PRIMARY KEY,
@@ -35,15 +34,14 @@ async function ensureTables() {
       password_hash TEXT,
       status VARCHAR(500) NOT NULL DEFAULT '',
       last_seen BIGINT NOT NULL DEFAULT 0,
-      blacklist_json JSON NOT NULL DEFAULT ('[]'),
-      blacklist_meta_json JSON NOT NULL DEFAULT ('{}'),
-      friend_ids_json JSON NOT NULL DEFAULT ('[]'),
+      blacklist_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      blacklist_meta_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      friend_ids_json JSONB NOT NULL DEFAULT '[]'::jsonb,
       online BOOLEAN NOT NULL DEFAULT false,
       updated_at BIGINT NOT NULL DEFAULT 0
     )
   `);
 
-  // Create settings table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS settings (
       user_id VARCHAR(120) PRIMARY KEY,
@@ -56,21 +54,19 @@ async function ensureTables() {
     )
   `);
 
-  // Create chats table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS chats (
       id VARCHAR(220) PRIMARY KEY,
       user1_id VARCHAR(120) NOT NULL,
       user2_id VARCHAR(120) NOT NULL,
       last_message_id VARCHAR(100),
-      last_message_preview JSON,
-      meta_json JSON NOT NULL DEFAULT ('{}'),
+      last_message_preview JSONB,
+      meta_json JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at BIGINT NOT NULL DEFAULT 0,
-      UNIQUE KEY chats_pair_uniq (user1_id, user2_id)
+      CONSTRAINT chats_pair_uniq UNIQUE (user1_id, user2_id)
     )
   `);
 
-  // Create messages table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id VARCHAR(100) PRIMARY KEY,
@@ -85,78 +81,55 @@ async function ensureTables() {
       duration_ms INT NOT NULL DEFAULT 0,
       reply_to VARCHAR(100) NOT NULL DEFAULT '',
       forwarded_from VARCHAR(100) NOT NULL DEFAULT '',
-      delivered_by JSON NOT NULL DEFAULT ('[]'),
-      read_by JSON NOT NULL DEFAULT ('[]'),
+      delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb,
+      read_by JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at BIGINT NOT NULL,
       edited_at BIGINT NOT NULL DEFAULT 0,
       deleted_at BIGINT NOT NULL DEFAULT 0
     )
   `);
 
-  // Add columns if they don't exist (for existing tables)
-  try {
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_mime VARCHAR(80) NOT NULL DEFAULT ''`);
-  } catch (_) {}
-  
-  try {
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_by JSON NOT NULL DEFAULT ('[]')`);
-  } catch (_) {}
-  
-  try {
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSON NOT NULL DEFAULT ('[]')`);
-  } catch (_) {}
+  // На случай уже существующей таблицы (если у вас код обновился, а БД нет).
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_mime VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
 
-  // Create indexes
-  try {
-    await pool.query(`CREATE INDEX idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0`);
-  } catch (_) {}
-  
-  try {
-    await pool.query(`CREATE INDEX idx_chats_u1 ON chats(user1_id)`);
-  } catch (_) {}
-  
-  try {
-    await pool.query(`CREATE INDEX idx_chats_u2 ON chats(user2_id)`);
-  } catch (_) {}
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
+  );
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u1 ON chats(user1_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u2 ON chats(user2_id)');
 }
 
 async function initMessengerMysql() {
-  // For external connection from Render to frontend server
-  const host = env('MYSQL_HOST') || env('FRONTEND_MYSQL_HOST'); // Frontend server MySQL host
-  const port = env('MYSQL_PORT', '3306');
-  const user = env('MYSQL_USER') || env('FRONTEND_MYSQL_USER'); // Frontend MySQL user
-  const password = env('MYSQL_PASSWORD') || env('FRONTEND_MYSQL_PASSWORD'); // Frontend MySQL password
-  const database = env('MYSQL_DATABASE') || env('FRONTEND_MYSQL_DATABASE'); // Frontend MySQL database
+  // For Supabase PostgreSQL connection
+  const supabaseUrl = env('SUPABASE_URL');
+  const supabaseKey = env('SUPABASE_KEY');
   
-  if (!host || !user || !database) {
-    console.warn('[messenger_mysql] Missing required MySQL connection parameters');
-    console.warn('[messenger_mysql] Required: MYSQL_HOST/FRONTEND_MYSQL_HOST, MYSQL_USER/FRONTEND_MYSQL_USER, MYSQL_DATABASE/FRONTEND_MYSQL_DATABASE');
-    console.warn('[messenger_mysql] Optional: MYSQL_PORT, MYSQL_PASSWORD/FRONTEND_MYSQL_PASSWORD');
-    console.warn('[messenger_mysql] Example: FRONTEND_MYSQL_HOST=your-frontend-server.com');
+  if (!supabaseUrl || !supabaseKey) {
+    console.warn('[messenger_mysql] Missing required Supabase connection parameters');
+    console.warn('[messenger_mysql] Required: SUPABASE_URL, SUPABASE_KEY');
+    console.warn('[messenger_mysql] Example: SUPABASE_URL=https://your-project.supabase.co');
     return false;
   }
 
   try {
-    pool = mysql.createPool({
-      host,
-      port: parseInt(port) || 3306,
-      user,
-      password,
-      database,
-      waitForConnections: true,
-      connectionLimit: Number(env('MYSQL_POOL_MAX', '10')) || 10,
-      queueLimit: 0,
-      acquireTimeout: Number(env('MYSQL_CONNECT_TIMEOUT_MS', '20000')) || 20000,
-      timeout: Number(env('MYSQL_TIMEOUT_MS', '60000')) || 60000,
-      reconnect: true,
-      charset: 'utf8mb4'
-    });
-
-    // Test connection
+    // Parse Supabase URL to get connection details
+    const url = new URL(supabaseUrl);
+    const connectionString = `${supabaseUrl}/postgres?apikey=${supabaseKey}`;
+    
+    const poolOpts = {
+      connectionString: connectionString,
+      max: Number(env('PG_POOL_MAX', '10')) || 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000
+    };
+    
+    pool = new Pool(poolOpts);
     await pool.query('SELECT 1');
     await ensureTables();
     enabled = true;
-    console.log('[messenger_mysql] connected (MySQL)');
+    console.log('[messenger_mysql] connected (Supabase PostgreSQL)');
     return true;
   } catch (err) {
     console.error('[messenger_mysql] init failed:', err && err.message);
@@ -244,18 +217,18 @@ async function upsertProfile(userId, patch) {
 
   await pool.query(
     `INSERT INTO users (id, username, display_name, avatar_url, password_hash, status, last_seen, blacklist_json, blacklist_meta_json, friend_ids_json, online, updated_at)
-     VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE
-       username = VALUES(username),
-       display_name = VALUES(display_name),
-       avatar_url = VALUES(avatar_url),
-       status = VALUES(status),
-       last_seen = VALUES(last_seen),
-       blacklist_json = VALUES(blacklist_json),
-       blacklist_meta_json = VALUES(blacklist_meta_json),
-       friend_ids_json = VALUES(friend_ids_json),
-       online = VALUES(online),
-       updated_at = VALUES(updated_at)`,
+     VALUES ($1,$2,$3,$4,NULL,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11)
+     ON CONFLICT (id) DO UPDATE SET
+       username = EXCLUDED.username,
+       display_name = EXCLUDED.display_name,
+       avatar_url = EXCLUDED.avatar_url,
+       status = EXCLUDED.status,
+       last_seen = EXCLUDED.last_seen,
+       blacklist_json = EXCLUDED.blacklist_json,
+       blacklist_meta_json = EXCLUDED.blacklist_meta_json,
+       friend_ids_json = EXCLUDED.friend_ids_json,
+       online = EXCLUDED.online,
+       updated_at = EXCLUDED.updated_at`,
     [
       userId,
       merged.username,
@@ -284,24 +257,24 @@ async function upsertSettings(userId, privacy) {
   
   await pool.query(
     `INSERT INTO settings (user_id, who_can_write, who_can_call, who_can_see_profile)
-     VALUES (?,?,?,?)
-     ON DUPLICATE KEY UPDATE
-       who_can_write = VALUES(who_can_write),
-       who_can_call = VALUES(who_can_call),
-       who_can_see_profile = VALUES(who_can_see_profile)`,
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (user_id) DO UPDATE SET
+       who_can_write = EXCLUDED.who_can_write,
+       who_can_call = EXCLUDED.who_can_call,
+       who_can_see_profile = EXCLUDED.who_can_see_profile`,
     [userId, w, c, p]
   );
 }
 
 async function listAllUserIds() {
-  const [rows] = await pool.query('SELECT id FROM users');
+  const { rows } = await pool.query('SELECT id FROM users');
   return rows.map((r) => r.id);
 }
 
 async function findDirectChat(a, b) {
   const [u1, u2] = sortedPair(String(a), String(b));
-  const [rows] = await pool.query(
-    'SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats WHERE user1_id = ? AND user2_id = ? LIMIT 1',
+  const { rows } = await pool.query(
+    'SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats WHERE user1_id = $1 AND user2_id = $2 LIMIT 1',
     [u1, u2]
   );
   if (!rows[0]) return null;
@@ -325,7 +298,7 @@ async function getOrCreateChat(a, b) {
   };
   
   await pool.query(
-    'INSERT INTO chats (id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json) VALUES (?,?,?,?,?,?,?)',
+    'INSERT INTO chats (id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)',
     [id, u1, u2, null, null, now, JSON.stringify(meta)]
   );
   return { id, members: [u1, u2], meta, lastMessage: null, updatedAt: now };
@@ -365,7 +338,7 @@ function rowToChat(row, u1, u2) {
 }
 
 async function updateChatMeta(chatId, meta) {
-  await pool.query('UPDATE chats SET meta_json = ?, updated_at = ? WHERE id = ?', [
+  await pool.query('UPDATE chats SET meta_json = $1::jsonb, updated_at = $2 WHERE id = $3', [
     JSON.stringify(meta),
     Date.now(),
     chatId
@@ -376,7 +349,7 @@ async function updateLastMessagePreview(chatId, lastMessageObj, updatedAt) {
   const lm = lastMessageObj == null ? null : JSON.stringify(lastMessageObj);
   const mid = lastMessageObj && lastMessageObj.id ? lastMessageObj.id : null;
   await pool.query(
-    'UPDATE chats SET last_message_preview = ?, last_message_id = ?, updated_at = ? WHERE id = ?',
+    'UPDATE chats SET last_message_preview = $1::jsonb, last_message_id = $2, updated_at = $3 WHERE id = $4',
     [lm, mid, updatedAt, chatId]
   );
 }
@@ -446,7 +419,7 @@ async function insertMessage(msg) {
   
   await pool.query(
     `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, delivered_by, read_by, created_at, edited_at, deleted_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15,$16,$17)`,
     [
       msg.id,
       msg.chatId,
@@ -471,8 +444,8 @@ async function insertMessage(msg) {
 
 async function getLatestMessageInChatAfter(chatId, clearedAfterTs = 0) {
   const t = Math.max(0, Number(clearedAfterTs) || 0);
-  const [rows] = await pool.query(
-    'SELECT * FROM messages WHERE chat_id = ? AND deleted_at = 0 AND created_at >= ? ORDER BY created_at DESC LIMIT 1',
+  const { rows } = await pool.query(
+    'SELECT * FROM messages WHERE chat_id = $1 AND deleted_at = 0 AND created_at >= $2 ORDER BY created_at DESC LIMIT 1',
     [chatId, t]
   );
   return rows[0] ? rowToMessage(rows[0]) : null;
@@ -481,58 +454,59 @@ async function getLatestMessageInChatAfter(chatId, clearedAfterTs = 0) {
 async function listMessagesForChat(chatId, clearedAfterTs = 0, limit = 500) {
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 2000);
   const cleared = Math.max(0, Number(clearedAfterTs) || 0);
-  const [rows] = await pool.query(
-    `SELECT * FROM messages WHERE chat_id = ? AND deleted_at = 0 AND created_at >= ? ORDER BY created_at ASC LIMIT ?`,
+  const { rows } = await pool.query(
+    `SELECT * FROM messages WHERE chat_id = $1 AND deleted_at = 0 AND created_at >= $2 ORDER BY created_at ASC LIMIT $3`,
     [chatId, cleared, lim]
   );
   return rows.map(rowToMessage);
 }
 
 async function getMessageById(id) {
-  const [rows] = await pool.query('SELECT * FROM messages WHERE id = ? LIMIT 1', [id]);
+  const { rows } = await pool.query('SELECT * FROM messages WHERE id = $1 LIMIT 1', [id]);
   return rows[0] ? rowToMessage(rows[0]) : null;
 }
 
 async function deleteMessageByIdHard(id) {
-  await pool.query('DELETE FROM messages WHERE id = ?', [id]);
+  await pool.query('DELETE FROM messages WHERE id = $1', [id]);
 }
 
 async function addMessageReadBy(messageId, readerUserId) {
   const mid = String(messageId || '').trim();
   const rid = String(readerUserId || '').trim();
   if (!mid || !rid) return false;
-  const [rows] = await pool.query('SELECT read_by FROM messages WHERE id = ? LIMIT 1', [mid]);
+  const { rows } = await pool.query('SELECT read_by FROM messages WHERE id = $1 LIMIT 1', [mid]);
   const prev = rows[0] && Array.isArray(rows[0].read_by) ? rows[0].read_by : [];
   const already = prev.some((x) => String(x) === rid);
   if (already) return false;
   const next = [...prev.map(String), rid];
-  await pool.query('UPDATE messages SET read_by = ? WHERE id = ?', [JSON.stringify(next), mid]);
+  await pool.query('UPDATE messages SET read_by = $1::jsonb WHERE id = $2', [JSON.stringify(next), mid]);
   return true;
 }
 
 async function updateMessageFields(id, patch) {
   const sets = [];
   const vals = [];
+  let n = 1;
   if (patch.text !== undefined) {
-    sets.push('text = ?');
+    sets.push(`text = $${n++}`);
     vals.push(patch.text);
   }
   if (patch.editedAt !== undefined) {
-    sets.push('edited_at = ?');
+    sets.push(`edited_at = $${n++}`);
     vals.push(patch.editedAt);
   }
   if (patch.deletedAt !== undefined) {
-    sets.push('deleted_at = ?');
+    sets.push(`deleted_at = $${n++}`);
     vals.push(patch.deletedAt);
   }
   if (!sets.length) return;
   vals.push(id);
-  await pool.query(`UPDATE messages SET ${sets.join(', ')} WHERE id = ?`, vals);
+  await pool.query(`UPDATE messages SET ${sets.join(', ')} WHERE id = $${n}`, vals);
 }
 
 async function getChatById(chatId) {
-  const [rows] = await pool.query(
-    'SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats WHERE id = ? LIMIT 1',
+  const { rows } = await pool.query(
+    'SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats WHERE id = $1 LIMIT 1',
     [chatId]
   );
   if (!rows[0]) return null;
@@ -546,23 +520,23 @@ async function loadChatMeta(chatId) {
 
 async function listChatsForUser(userId) {
   const uid = String(userId);
-  const [rows] = await pool.query(
+  const { rows } = await pool.query(
     `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats
-     WHERE user1_id = ? OR user2_id = ? ORDER BY updated_at DESC`,
-    [uid, uid]
+     WHERE user1_id = $1 OR user2_id = $1 ORDER BY updated_at DESC`,
+    [uid]
   );
   return rows.map((r) => rowToChat(r));
 }
 
 async function deleteChatRow(chatId) {
-  await pool.query('DELETE FROM messages WHERE chat_id = ?', [chatId]);
-  await pool.query('DELETE FROM chats WHERE id = ?', [chatId]);
+  await pool.query('DELETE FROM messages WHERE chat_id = $1', [chatId]);
+  await pool.query('DELETE FROM chats WHERE id = $1', [chatId]);
 }
 
 async function setUserOnlineFlags(userId, online) {
   const now = Date.now();
   await pool.query(
-    'UPDATE users SET online = ?, last_seen = ?, updated_at = ? WHERE id = ?',
+    'UPDATE users SET online = $1, last_seen = $2, updated_at = $3 WHERE id = $4',
     [online, now, now, userId]
   );
 }
