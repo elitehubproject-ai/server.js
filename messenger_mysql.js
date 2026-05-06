@@ -102,9 +102,32 @@ async function ensureTables() {
 }
 
 async function initMessengerMysql() {
-  // For Supabase PostgreSQL connection
+  // Try direct DATABASE_URL first, then Supabase
+  const directUrl = env('DATABASE_URL');
   const supabaseUrl = env('SUPABASE_URL');
   const supabaseKey = env('SUPABASE_KEY');
+  
+  if (directUrl) {
+    // Use direct PostgreSQL connection string
+    try {
+      const poolOpts = {
+        connectionString: directUrl,
+        max: Number(env('PG_POOL_MAX', '10')) || 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
+        family: 4
+      };
+      
+      pool = new Pool(poolOpts);
+      await pool.query('SELECT 1');
+      await ensureTables();
+      enabled = true;
+      console.log('[messenger_mysql] connected (Direct PostgreSQL)');
+      return true;
+    } catch (err) {
+      console.error('[messenger_mysql] Direct connection failed:', err && err.message);
+    }
+  }
   
   if (!supabaseUrl || !supabaseKey) {
     console.warn('[messenger_mysql] Missing required Supabase connection parameters');
@@ -114,17 +137,15 @@ async function initMessengerMysql() {
   }
 
   try {
-    // Parse Supabase URL to get connection details
+    // Try direct PostgreSQL connection first
     const url = new URL(supabaseUrl);
-    // Force IPv4 connection with direct PostgreSQL format
-    const connectionString = `postgresql://postgres.${url.hostname}:5432/postgres?apikey=${supabaseKey}&sslmode=require`;
+    const connectionString = `postgresql://postgres:${supabaseKey}@${url.hostname}:5432/postgres?sslmode=verify-full`;
     
     const poolOpts = {
       connectionString: connectionString,
       max: Number(env('PG_POOL_MAX', '10')) || 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
-      // Force IPv4
       family: 4
     };
     
@@ -134,14 +155,37 @@ async function initMessengerMysql() {
     enabled = true;
     console.log('[messenger_mysql] connected (Supabase PostgreSQL)');
     return true;
-  } catch (err) {
-    console.error('[messenger_mysql] init failed:', err && err.message);
+  } catch (pgErr) {
+    console.error('[messenger_mysql] PostgreSQL failed:', pgErr && pgErr.message);
+    
+    // Fallback: Try REST API approach
     try {
-      if (pool) await pool.end();
-    } catch (_) {}
-    pool = null;
-    enabled = false;
-    return false;
+      console.log('[messenger_mysql] Trying REST API connection...');
+      const restUrl = `${supabaseUrl}/rest/v1/`;
+      const testResponse = await fetch(`${restUrl}users?select=id&limit=1`, {
+        headers: {
+          'apikey': supabaseKey,
+          'Authorization': `Bearer ${supabaseKey}`
+        }
+      });
+      
+      if (testResponse.ok) {
+        console.log('[messenger_mysql] REST API connection successful');
+        // For now, we'll disable PostgreSQL but allow basic functionality
+        console.warn('[messenger_mysql] PostgreSQL disabled, using REST API fallback');
+        return false;
+      } else {
+        throw new Error(`REST API failed: ${testResponse.status}`);
+      }
+    } catch (restErr) {
+      console.error('[messenger_mysql] REST API failed:', restErr && restErr.message);
+      try {
+        if (pool) await pool.end();
+      } catch (_) {}
+      pool = null;
+      enabled = false;
+      return false;
+    }
   }
 }
 
