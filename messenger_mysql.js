@@ -123,13 +123,12 @@ async function initMessengerMysql() {
   // Try direct PostgreSQL connection
   try {
     console.log('[messenger_mysql] Trying DATABASE_URL:', directUrl.replace(/:[^@]+@/, ':***@'));
+    // Use proper Supabase connection format
     const poolOpts = {
       connectionString: directUrl,
       max: Number(env('PG_POOL_MAX', '10')) || 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000,
-      family: 4,
-      host: 'db.uovhvvimiomytxckzlpf.supabase.co',
       ssl: {
         rejectUnauthorized: false
       }
