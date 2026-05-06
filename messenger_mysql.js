@@ -103,9 +103,15 @@ async function ensureTables() {
 }
 
 async function initMessengerMysql() {
-  // Use DATABASE_URL for connection and SUPABASE_KEY for REST API fallback
-  const directUrl = env('DATABASE_URL');
+  // Wait a bit for environment variables to load
+  await new Promise(resolve => setTimeout(resolve, 100));
+  
+  // Use DATABASE_URL or POSTGRES_URL for connection and SUPABASE_KEY for REST API fallback
+  const directUrl = env('DATABASE_URL') || env('POSTGRES_URL');
   const supabaseKey = env('SUPABASE_KEY');
+  
+  // Debug: Show all environment variables
+  console.log('[messenger_mysql] All env vars:', Object.keys(process.env).filter(k => k.includes('DATABASE') || k.includes('SUPABASE')));
   
   if (!directUrl || !supabaseKey) {
     console.warn('[messenger_mysql] Missing required connection parameters');
@@ -146,7 +152,19 @@ async function initMessengerMysql() {
     const restUrl = `https://${url.hostname}/rest/v1/`;
     
     console.log('[messenger_mysql] REST API URL:', restUrl);
-    const testResponse = await fetch(`${restUrl}users?select=id&limit=1`, {
+    // Try to create users table first via REST API
+    const createTableResponse = await fetch(`${restUrl}rpc/create_users_table`, {
+      method: 'POST',
+      headers: {
+        'apikey': supabaseKey,
+        'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({})
+    });
+    
+    // If table creation fails, try simple test
+    const testResponse = createTableResponse.ok ? createTableResponse : await fetch(`${restUrl}users?select=id&limit=1`, {
       headers: {
         'apikey': supabaseKey,
         'Authorization': `Bearer ${supabaseKey}`
