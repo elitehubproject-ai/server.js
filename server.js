@@ -39,9 +39,9 @@ const durakEngine = require('./durak_engine');
 // Ориентир: 50MB файл => ~67MB base64 символов.
 const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
-    console.log('[messenger] storage backend:', ok ? 'mysql' : 'unavailable');
+    console.log('[messenger] storage backend:', ok ? 'supabase-postgresql' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('MYSQL_DATABASE');
+    const needDb = !!e('SUPABASE_URL');
     const exitOnFail = e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1';
     if (!ok && needDb && exitOnFail) {
         process.exit(1);
@@ -49,7 +49,7 @@ const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     return ok;
 }).catch((err) => {
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('MYSQL_DATABASE');
+    const needDb = !!e('SUPABASE_URL');
     if (needDb && e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1') process.exit(1);
     return false;
 });
