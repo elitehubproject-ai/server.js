@@ -664,16 +664,7 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
     } catch (_) {}
     const id = normalizeAccountId(appUserId);
     if (!id) return;
-    if (!messengerMysql.isEnabled()) {
-        sendToUserSessions(id, {
-            type: 'messenger-sync',
-            reason,
-            userId: id,
-            chats: [],
-            messengerStorageError: 'storage_unavailable'
-        });
-        return;
-    }
+    // JSON API работает всегда, нет ошибок хранения
     await ensureProfilesLoaded(id);
     const chats = await buildChatListForUserMysql(id);
     sendToUserSessions(id, {
@@ -1084,14 +1075,7 @@ wss.on('connection', (ws) => {
                             try {
                                 await mysqlBoot;
                             } catch (_) {}
-                            if (!messengerMysql.isEnabled()) {
-                                safeSend(ws, {
-                                    type: 'messenger-error',
-                                    code: 'storage_unavailable',
-                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
-                                });
-                                return;
-                            }
+                            // JSON API работает всегда
                             const chat = await messengerMysql.findDirectChat(currentAppUserId, withUserId);
                             const chatId = chat?.id || createDirectChatId(currentAppUserId, withUserId);
                             if (!chatId) return;
@@ -1142,14 +1126,7 @@ wss.on('connection', (ws) => {
                                 await mysqlBoot;
                             } catch (_) {}
                             await ensureProfilesLoaded(currentAppUserId, toUserId);
-                            if (!messengerMysql.isEnabled()) {
-                                safeSend(ws, {
-                                    type: 'messenger-error',
-                                    code: 'storage_unavailable',
-                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
-                                });
-                                return;
-                            }
+                            // JSON API работает всегда
                             const gate = directMessageGate(currentAppUserId, toUserId);
                             if (!gate.ok) {
                                 safeSend(ws, {
