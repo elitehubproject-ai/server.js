@@ -4,7 +4,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
 const DEFAULT_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -53,7 +53,7 @@ const healthServer = http.createServer((req, res) => {
 });
 
 // Используем другой порт для health check
-const HEALTH_PORT = PORT + 1;
+const HEALTH_PORT = parseInt(PORT) + 1;
 healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
 
 function safeSend(ws, payload) {
