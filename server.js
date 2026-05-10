@@ -33,26 +33,14 @@ const EMPTY_ROOM_GRACE_MS = process.env.EMPTY_ROOM_GRACE_MS ? parseInt(process.e
 const pendingDisconnects = new Map();
 const emptyRoomCleanupTimers = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
-const messengerMysql = require('./messenger_pg');
+const JSON_API_URL = 'https://seych-call.gt.tc/backend/json_api.php';
+// PostgreSQL отключен - используем JSON API
+const messengerMysql = { isEnabled: () => false };
 const durakEngine = require('./durak_engine');
 // Для медиа-сообщений ограничиваем длину base64-строки на сервере.
 // Ориентир: 50MB файл => ~67MB base64 символов.
 const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
-const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
-    console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
-    const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('DATABASE_URL');
-    const exitOnFail = e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1';
-    if (!ok && needDb && exitOnFail) {
-        process.exit(1);
-    }
-    return ok;
-}).catch((err) => {
-    const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
-    const needDb = !!e('DATABASE_URL');
-    if (needDb && e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1') process.exit(1);
-    return false;
-});
+const mysqlBoot = Promise.resolve(true); // JSON API работает всегда
 /** @type {Map<string, object>} */
 const messengerProfileMem = new Map();
 
@@ -115,7 +103,7 @@ function writeJson(filePath, value) {
     }
 }
 
-console.log('[messenger] friends store (friends only):', FRIENDS_STORE_PATH);
+console.log('[messenger] storage backend: json-api');
 
 function normalizeAccountId(value) {
     return typeof value === 'string' ? value.trim().slice(0, 120) : '';
@@ -161,7 +149,7 @@ function computeUserInitials(name, accountId) {
 }
 
 /** Профиль для UI: MySQL (messengerProfileMem) или friends_store как fallback имени. */
-function getFormattedUser(userId) {
+async function getFormattedUser(userId) {
     const id = normalizeAccountId(userId);
     if (!id) {
         return {
@@ -177,7 +165,7 @@ function getFormattedUser(userId) {
         };
     }
     const memRow = messengerProfileMem.get(id);
-    const friends = getUserProfileFromFriendsStore(id);
+    const friends = await getUserProfileFromFriendsStore(id);
     const rowChats = memRow
         ? {
               name: memRow.name,
@@ -224,85 +212,52 @@ function enrichMessageWithSender(msg) {
     };
 }
 
-async function upsertUserPresenceProfileMysql(appUserId, profile) {
+async function upsertUserPresenceProfileJson(appUserId, profile) {
     const userId = normalizeAccountId(appUserId);
     if (!userId) return;
-    const prev =
-        messengerProfileMem.get(userId) ||
-        (await messengerMysql.getProfile(userId)) ||
-        {
+    
+    try {
+        // Save to JSON API
+        await fetch(`${JSON_API_URL}/users`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: userId,
+                name: profile?.name || '',
+                avatar: profile?.avatar || '',
+                username: profile?.username || '',
+                statusText: profile?.statusText || '',
+                online: profile?.online !== undefined ? !!profile.online : true,
+                lastSeenAt: profile?.lastSeenAt || Date.now()
+            })
+        });
+        
+        // Update memory
+        messengerProfileMem.set(userId, {
             id: userId,
-            name: '',
-            avatar: '',
-            username: '',
-            statusText: '',
-            online: false,
-            lastSeenAt: 0,
-            privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all' },
-            blacklist: [],
-            blacklistMeta: {},
-            friendIds: []
-        };
-    const next = {
-        name: profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
-        avatar: profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
-        username: profile?.username != null ? normalizeUsername(profile.username) : prev.username,
-        statusText: profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
-        online: profile?.online !== undefined ? !!profile.online : true,
-        lastSeenAt: profile?.lastSeenAt != null ? Number(profile.lastSeenAt) : Date.now(),
-        privacy: {
-            canWrite:
-                profile?.privacy?.canWrite !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canWrite)
-                    ? profile.privacy.canWrite
-                    : prev.privacy?.canWrite || 'all',
-            canCall:
-                profile?.privacy?.canCall !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canCall)
-                    ? profile.privacy.canCall
-                    : prev.privacy?.canCall || 'all',
-            canViewProfile:
-                profile?.privacy?.canViewProfile !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canViewProfile)
-                    ? profile.privacy.canViewProfile
-                    : prev.privacy?.canViewProfile || 'all'
-        },
-        blacklist: Array.isArray(profile?.blacklist)
-            ? profile.blacklist.map((v) => normalizeAccountId(v)).filter(Boolean)
-            : Array.isArray(prev.blacklist)
-              ? prev.blacklist
-              : [],
-        blacklistMeta:
-            typeof profile?.blacklistMeta === 'object' && profile.blacklistMeta
-                ? profile.blacklistMeta
-                : typeof prev.blacklistMeta === 'object' && prev.blacklistMeta
-                  ? prev.blacklistMeta
-                  : {},
-        friendIds: Array.isArray(profile?.friendIds)
-            ? profile.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean)
-            : Array.isArray(prev.friendIds)
-              ? prev.friendIds
-              : []
-    };
-    const saved = await messengerMysql.upsertProfile(userId, {
-        name: next.name,
-        avatar: next.avatar,
-        username: next.username,
-        statusText: next.statusText,
-        blacklist: next.blacklist,
-        blacklistMeta: next.blacklistMeta,
-        friendIds: next.friendIds,
-        online: next.online,
-        lastSeenAt: next.lastSeenAt,
-        privacy: next.privacy
-    });
-    messengerProfileMem.set(userId, saved);
+            name: profile?.name || '',
+            avatar: profile?.avatar || '',
+            username: profile?.username || '',
+            statusText: profile?.statusText || '',
+            online: profile?.online !== undefined ? !!profile.online : true,
+            lastSeenAt: profile?.lastSeenAt || Date.now()
+        });
+    } catch (err) {
+        console.log('[messenger] Failed to save user profile:', err.message);
+    }
 }
 
 async function ensureProfilesLoaded(...ids) {
     const todo = [...new Set(ids.map((x) => normalizeAccountId(x)).filter(Boolean))];
-    if (!messengerMysql.isEnabled()) return;
     for (const uid of todo) {
         try {
-            const p = await messengerMysql.getProfile(uid);
-            if (p) messengerProfileMem.set(uid, p);
+            // Try to get from JSON API
+            const response = await fetch(`${JSON_API_URL}/users?user_id=${uid}`);
+            if (response.ok) {
+                const users = await response.json();
+                const user = users.find(u => normalizeAccountId(u?.id) === uid);
+                if (user) messengerProfileMem.set(uid, user);
+            }
         } catch (_) {}
     }
 }
@@ -312,13 +267,28 @@ function setUserOffline(appUserId) {
     if (!userId) return;
     void (async () => {
         try {
-            await mysqlBoot;
-        } catch (_) {}
-        if (messengerMysql.isEnabled()) {
-            await messengerMysql.setUserOnlineFlags(userId, false);
-            const p = await messengerMysql.getProfile(userId);
-            if (p) messengerProfileMem.set(userId, p);
-            broadcastMessengerPresence(userId, false, p?.lastSeenAt || Date.now());
+            // Update user in JSON API
+            await fetch(`${JSON_API_URL}/users`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: userId,
+                    online: false,
+                    lastSeenAt: Date.now()
+                })
+            });
+            
+            // Update memory
+            const user = messengerProfileMem.get(userId);
+            if (user) {
+                user.online = false;
+                user.lastSeenAt = Date.now();
+                messengerProfileMem.set(userId, user);
+            }
+            
+            broadcastMessengerPresence(userId, false, Date.now());
+        } catch (err) {
+            console.log('[messenger] Failed to set user offline:', err.message);
         }
     })();
 }
@@ -330,9 +300,23 @@ function getUserProfile(appUserId) {
     return null;
 }
 
-function getUserProfileFromFriendsStore(targetUserId) {
+async function getUserProfileFromFriendsStore(targetUserId) {
     const targetId = normalizeAccountId(targetUserId);
     if (!targetId) return null;
+    
+    try {
+        // Try to get from JSON API first
+        const response = await fetch(`${JSON_API_URL}/users?user_id=${targetId}`);
+        if (response.ok) {
+            const users = await response.json();
+            const user = users.find(u => normalizeAccountId(u?.id) === targetId);
+            if (user) return user;
+        }
+    } catch (err) {
+        console.log('[messenger] JSON API error, falling back to local file:', err.message);
+    }
+    
+    // Fallback to local file
     const store = readJson(FRIENDS_STORE_PATH, { users: [] });
     const list = Array.isArray(store?.users) ? store.users : [];
     const row = list.find((u) => normalizeAccountId(u?.id) === targetId);
@@ -351,18 +335,36 @@ function getUserProfileFromFriendsStore(targetUserId) {
     };
 }
 
-function areFriendsForMessenger(userA, userB) {
+async function areFriends(userA, userB) {
     const a = normalizeAccountId(userA);
     const b = normalizeAccountId(userB);
     if (!a || !b) return false;
+    
+    try {
+        // Try to check via JSON API first
+        const response = await fetch(`${JSON_API_URL}/friends?user_id=${a}`);
+        if (response.ok) {
+            const friends = await response.json();
+            const isFriend = friends.some(f => {
+                const fa = normalizeAccountId(f?.user1_id);
+                const fb = normalizeAccountId(f?.user2_id);
+                return (fa === a && fb === b) || (fa === b && fb === a);
+            });
+            if (isFriend) return true;
+        }
+    } catch (err) {
+        console.log('[messenger] JSON API error, falling back to local file:', err.message);
+    }
+    
+    // Fallback to local file
     const store = readJson(FRIENDS_STORE_PATH, { friends: [] });
     const list = Array.isArray(store?.friends) ? store.friends : [];
     const key = [a, b].sort().join('::');
     const inStoreFile = list.some((row) => {
-        const left = normalizeAccountId(row?.a);
-        const right = normalizeAccountId(row?.b);
-        if (!left || !right) return false;
-        return [left, right].sort().join('::') === key;
+        const ra = normalizeAccountId(row?.userA);
+        const rb = normalizeAccountId(row?.userB);
+        if (!ra || !rb) return false;
+        return [ra, rb].sort().join('::') === key;
     });
     if (inStoreFile) return true;
     const pa = getUserProfile(a);
