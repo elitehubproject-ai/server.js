@@ -20,8 +20,14 @@ const DEFAULT_ICE_SERVERS = [
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 // maxPayload ограничивает размер одного сообщения WebSocket (в байтах).
 // Медиа-сообщения кладутся в JSON (base64), поэтому лимит должен быть существенно выше.
-// Голос в звонке идёт по WebRTC (SRTP между браузерами); WebSocket — сигналинг и чат, не «труба» для RTP-аудио.
-const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
+// Голос в звонке идёт по WebRTC (SRTP между браузерами); WebSocket — сигалинг и чат, не «труба» для RTP-аудио.
+// Render проксирует только один порт — объединяем HTTP + WebSocket
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('WebSocket server is running');
+});
+const wss = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Server running on http://0.0.0.0:${PORT}`));
 const rooms = new Map();
 const userSessions = new Map();
 // Долгая пауза: кратковременный обрыв WebSocket (прокси, сон вкладки) не должен «выкидывать» из комнаты.
@@ -44,17 +50,7 @@ const mysqlBoot = Promise.resolve(true); // JSON API работает всегд
 /** @type {Map<string, object>} */
 const messengerProfileMem = new Map();
 
-console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
-
-// Health check сервер - тоже слушаем на 0.0.0.0
-const healthServer = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('WebSocket server is running');
-});
-
-// Используем другой порт для health check
-const HEALTH_PORT = parseInt(PORT) + 1;
-healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
+// HTTP + WebSocket на одном порту (выше)
 
 function safeSend(ws, payload) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
