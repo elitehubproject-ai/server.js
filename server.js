@@ -1601,6 +1601,28 @@ wss.on('connection', (ws) => {
                         });
                     })();
                     break;
+                case 'messenger-check-story-like':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) {
+                            safeSend(ws, { type: 'error', message: 'База данных недоступна' });
+                            return;
+                        }
+                        
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+                        
+                        const result = await messengerMysql.checkStoryLike(storyId, currentAppUserId);
+                        safeSend(ws, { 
+                            type: 'messenger-story-like-status', 
+                            storyId,
+                            liked: result.liked 
+                        });
+                    })();
+                    break;
                 case 'messenger-get-story-views':
                     if (!currentAppUserId) return;
                     void (async () => {
