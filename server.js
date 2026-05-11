@@ -240,7 +240,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile) {
             statusText: '',
             online: false,
             lastSeenAt: 0,
-            privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all' },
+            privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends' },
             blacklist: [],
             blacklistMeta: {},
             friendIds: []
@@ -264,7 +264,11 @@ async function upsertUserPresenceProfileMysql(appUserId, profile) {
             canViewProfile:
                 profile?.privacy?.canViewProfile !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canViewProfile)
                     ? profile.privacy.canViewProfile
-                    : prev.privacy?.canViewProfile || 'all'
+                    : prev.privacy?.canViewProfile || 'all',
+            canSeeStories:
+                profile?.privacy?.canSeeStories !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canSeeStories)
+                    ? profile.privacy.canSeeStories
+                    : prev.privacy?.canSeeStories || 'friends'
         },
         blacklist: Array.isArray(profile?.blacklist)
             ? profile.blacklist.map((v) => normalizeAccountId(v)).filter(Boolean)
@@ -349,7 +353,7 @@ function getUserProfileFromFriendsStore(targetUserId) {
         lastSeenAt: 0,
         blacklist: [],
         blacklistMeta: {},
-        privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all' }
+        privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends' }
     };
 }
 
@@ -456,6 +460,19 @@ function broadcastMessengerProfilePatch(targetUserId) {
             online: !!fmt.online,
             lastSeenAt: Number(fmt.lastSeenAt || 0)
         }
+    };
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) safeSend(client, payload);
+    });
+}
+
+function broadcastStoryStateChanged(ownerUserId, reason = 'updated') {
+    const ownerId = normalizeAccountId(ownerUserId);
+    if (!ownerId) return;
+    const payload = {
+        type: 'messenger-story-state-changed',
+        ownerUserId: ownerId,
+        reason
     };
     wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) safeSend(client, payload);
@@ -1543,11 +1560,12 @@ wss.on('connection', (ws) => {
                             durationMs,
                             thumbnailUrl,
                             caption,
-                            privacy: data.privacy || 'friends'
+                            privacy: ['all', 'friends', 'nobody'].includes(data.privacy) ? data.privacy : 'friends'
                         };
                         
                         await messengerMysql.createStory(story);
                         emitMessengerSync(currentAppUserId, 'story-uploaded');
+                        broadcastStoryStateChanged(currentAppUserId, 'uploaded');
                         safeSend(ws, { type: 'messenger-story-uploaded', storyId });
                     })();
                     break;
@@ -1712,6 +1730,29 @@ wss.on('connection', (ws) => {
                         });
                     })();
                     break;
+                case 'messenger-update-story-privacy':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        const privacy = ['all', 'friends', 'nobody'].includes(data.privacy) ? data.privacy : 'friends';
+                        if (!storyId) return;
+
+                        const success = await messengerMysql.updateStoryPrivacy(storyId, currentAppUserId, privacy);
+                        if (!success) {
+                            safeSend(ws, { type: 'error', message: 'Не удалось сохранить приватность истории' });
+                            return;
+                        }
+
+                        emitMessengerSync(currentAppUserId, 'story-privacy-updated');
+                        broadcastStoryStateChanged(currentAppUserId, 'privacy-updated');
+                        safeSend(ws, { type: 'messenger-story-privacy-updated', storyId, privacy });
+                    })();
+                    break;
                 case 'messenger-delete-story':
                     if (!currentAppUserId) return;
                     void (async () => {
@@ -1726,6 +1767,7 @@ wss.on('connection', (ws) => {
                         const success = await messengerMysql.deleteStory(storyId, currentAppUserId);
                         if (success) {
                             emitMessengerSync(currentAppUserId, 'story-deleted');
+                            broadcastStoryStateChanged(currentAppUserId, 'deleted');
                             safeSend(ws, { type: 'messenger-story-deleted', storyId });
                         } else {
                             safeSend(ws, { type: 'error', message: 'История не найдена' });
