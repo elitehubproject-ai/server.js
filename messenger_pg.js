@@ -617,16 +617,14 @@ async function getStoriesForUser(userId, viewerId = null) {
   
   // Filter by privacy if viewer is specified
   if (viewerId && viewerId !== userId) {
-    const userProfile = await getProfile(userId);
     const userFriends = await getUserFriends(userId);
     const isFriend = userFriends.includes(viewerId);
-    const privacyLevel = userProfile.privacy.canSeeStories;
     
     return stories.filter(story => {
-      if (privacyLevel === 'nobody') return false;
-      if (privacyLevel === 'all') return true;
-      if (privacyLevel === 'friends') return isFriend;
-      return false;
+      if (story.privacy === 'nobody') return false;
+      if (story.privacy === 'all') return true;
+      if (story.privacy === 'friends') return isFriend;
+      return false; // Default to friends if privacy is not set
     });
   }
   
