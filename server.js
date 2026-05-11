@@ -226,13 +226,15 @@ function enrichMessageWithSender(msg) {
     };
 }
 
-async function upsertUserPresenceProfileMysql(appUserId, profile) {
+async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) {
     const userId = normalizeAccountId(appUserId);
     if (!userId) return;
-    
+
     const existingFromDb = await messengerMysql.getProfile(userId);
     const isNewUser = !existingFromDb;
-    
+    const canOverwriteIdentity = isNewUser || options.overwriteExistingIdentity !== false;
+    const canOverwritePrivacy = isNewUser || options.overwriteExistingPrivacy !== false;
+
     const prev =
         messengerProfileMem.get(userId) ||
         existingFromDb ||
@@ -249,29 +251,29 @@ async function upsertUserPresenceProfileMysql(appUserId, profile) {
             blacklistMeta: {},
             friendIds: []
         };
-    
+
     const next = {
-        name: isNewUser && profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
-        avatar: isNewUser && profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
-        username: isNewUser && profile?.username != null ? normalizeUsername(profile.username) : prev.username,
-        statusText: isNewUser && profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
+        name: canOverwriteIdentity && profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
+        avatar: canOverwriteIdentity && profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
+        username: canOverwriteIdentity && profile?.username != null ? normalizeUsername(profile.username) : prev.username,
+        statusText: canOverwriteIdentity && profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
         online: profile?.online !== undefined ? !!profile.online : true,
         lastSeenAt: profile?.lastSeenAt != null ? Number(profile.lastSeenAt) : Date.now(),
         privacy: {
             canWrite:
-                profile?.privacy?.canWrite !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canWrite)
+                canOverwritePrivacy && profile?.privacy?.canWrite !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canWrite)
                     ? profile.privacy.canWrite
                     : prev.privacy?.canWrite || 'all',
             canCall:
-                profile?.privacy?.canCall !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canCall)
+                canOverwritePrivacy && profile?.privacy?.canCall !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canCall)
                     ? profile.privacy.canCall
                     : prev.privacy?.canCall || 'all',
             canViewProfile:
-                profile?.privacy?.canViewProfile !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canViewProfile)
+                canOverwritePrivacy && profile?.privacy?.canViewProfile !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canViewProfile)
                     ? profile.privacy.canViewProfile
                     : prev.privacy?.canViewProfile || 'all',
             canSeeStories:
-                profile?.privacy?.canSeeStories !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canSeeStories)
+                canOverwritePrivacy && profile?.privacy?.canSeeStories !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canSeeStories)
                     ? profile.privacy.canSeeStories
                     : prev.privacy?.canSeeStories || 'friends'
         },
@@ -697,12 +699,27 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
         return;
     }
     await ensureProfilesLoaded(id);
+    let selfProfile = getUserProfile(id);
+    if (!selfProfile) {
+        try {
+            selfProfile = await messengerMysql.getProfile(id);
+            if (selfProfile) messengerProfileMem.set(id, selfProfile);
+        } catch (_) {}
+    }
     const chats = await buildChatListForUserMysql(id);
     sendToUserSessions(id, {
         type: 'messenger-sync',
         reason,
         userId: id,
-        chats
+        chats,
+        selfProfile: selfProfile
+            ? {
+                  username: selfProfile.username || '',
+                  statusText: selfProfile.statusText || '',
+                  privacy: selfProfile.privacy || { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends' },
+                  blacklist: Array.isArray(selfProfile.blacklist) ? selfProfile.blacklist : []
+              }
+            : null
     });
 }
 
@@ -1086,7 +1103,10 @@ wss.on('connection', (ws) => {
                                 blacklist: data.blacklist || null
                             };
                             if (messengerMysql.isEnabled()) {
-                                await upsertUserPresenceProfileMysql(accountId, patch);
+                                await upsertUserPresenceProfileMysql(accountId, patch, {
+                                    overwriteExistingIdentity: false,
+                                    overwriteExistingPrivacy: false
+                                });
                             }
                             emitMessengerSync(accountId, 'init');
                             broadcastMessengerPresence(accountId, true, Date.now());
@@ -1497,6 +1517,15 @@ wss.on('connection', (ws) => {
                         // Разошлем патч профиля всем подключенным клиентам,
                         // чтобы аватары/имена обновлялись без перезагрузки.
                         broadcastMessengerProfilePatch(currentAppUserId);
+                        if (messengerMysql.isEnabled()) {
+                            const chats = await messengerMysql.listChatsForUser(normalizeAccountId(currentAppUserId));
+                            for (const ch of (chats || [])) {
+                                const members = Array.isArray(ch.members) ? ch.members : [];
+                                const peerId = members.find((m) => m !== normalizeAccountId(currentAppUserId)) || '';
+                                if (!peerId) continue;
+                                emitMessengerSync(peerId, 'peer-profile-updated');
+                            }
+                        }
                     })();
                     break;
                 case 'messenger-update-privacy':
