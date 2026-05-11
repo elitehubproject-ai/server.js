@@ -672,6 +672,24 @@ async function toggleStoryLike(storyId, userId) {
   }
 }
 
+async function checkStoryLike(storyId, userId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM story_likes WHERE story_id = $1 AND user_id = $2',
+    [storyId, userId]
+  );
+  
+  return { liked: !!rows[0] };
+}
+
+async function updateStoryPrivacy(storyId, userId, privacy) {
+  const { rows } = await pool.query(
+    'UPDATE stories SET privacy = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
+    [privacy, storyId, userId]
+  );
+  
+  return rows.length > 0;
+}
+
 async function getStoryViews(storyId) {
   const { rows } = await pool.query(
     `SELECT sv.viewer_id, sv.viewed_at, u.display_name, u.avatar_url, u.username
@@ -782,6 +800,8 @@ module.exports = {
   getStoriesForUser,
   addStoryView,
   toggleStoryLike,
+  checkStoryLike,
+  updateStoryPrivacy,
   getStoryViews,
   deleteStory,
   cleanupExpiredStories,
