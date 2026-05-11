@@ -23,11 +23,12 @@ const DEFAULT_ICE_SERVERS = [
 // Голос в звонке идёт по WebRTC (SRTP между браузерами); WebSocket — сигалинг и чат, не «труба» для RTP-аудио.
 // Render проксирует только один порт — объединяем HTTP + WebSocket
 const server = http.createServer((req, res) => {
+    console.log(`📥 HTTP request: ${req.method} ${req.url} from ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('WebSocket server is running');
 });
 const wss = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Server running on http://0.0.0.0:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Server running on http://0.0.0.0:${PORT} (env PORT=${process.env.PORT})`));
 const rooms = new Map();
 const userSessions = new Map();
 // Долгая пауза: кратковременный обрыв WebSocket (прокси, сон вкладки) не должен «выкидывать» из комнаты.
