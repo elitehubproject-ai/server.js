@@ -4,7 +4,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const DEFAULT_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -20,15 +20,8 @@ const DEFAULT_ICE_SERVERS = [
 // ВАЖНО: для Render нужно слушать на 0.0.0.0, а не на 127.0.0.1
 // maxPayload ограничивает размер одного сообщения WebSocket (в байтах).
 // Медиа-сообщения кладутся в JSON (base64), поэтому лимит должен быть существенно выше.
-// Голос в звонке идёт по WebRTC (SRTP между браузерами); WebSocket — сигалинг и чат, не «труба» для RTP-аудио.
-// Render проксирует только один порт — объединяем HTTP + WebSocket
-const server = http.createServer((req, res) => {
-    console.log(`📥 HTTP request: ${req.method} ${req.url} from ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('WebSocket server is running');
-});
-const wss = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Server running on http://0.0.0.0:${PORT} (env PORT=${process.env.PORT})`));
+// Голос в звонке идёт по WebRTC (SRTP между браузерами); WebSocket — сигналинг и чат, не «труба» для RTP-аудио.
+const wss = new WebSocket.Server({ host: '0.0.0.0', port: PORT, perMessageDeflate: false, maxPayload: 120 * 1024 * 1024 });
 const rooms = new Map();
 const userSessions = new Map();
 // Долгая пауза: кратковременный обрыв WebSocket (прокси, сон вкладки) не должен «выкидывать» из комнаты.
@@ -40,18 +33,40 @@ const EMPTY_ROOM_GRACE_MS = process.env.EMPTY_ROOM_GRACE_MS ? parseInt(process.e
 const pendingDisconnects = new Map();
 const emptyRoomCleanupTimers = new Map();
 const FRIENDS_STORE_PATH = path.join(__dirname, 'friends_store.json');
-const JSON_API_URL = 'https://seych-call.gt.tc/backend/json_api.php';
-// PostgreSQL отключен - используем JSON API
-const messengerMysql = { isEnabled: () => false };
+const messengerMysql = require('./messenger_pg');
 const durakEngine = require('./durak_engine');
 // Для медиа-сообщений ограничиваем длину base64-строки на сервере.
 // Ориентир: 50MB файл => ~67MB base64 символов.
 const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
-const mysqlBoot = Promise.resolve(true); // JSON API работает всегда
+const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
+    console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
+    const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
+    const needDb = !!e('DATABASE_URL');
+    const exitOnFail = e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1';
+    if (!ok && needDb && exitOnFail) {
+        process.exit(1);
+    }
+    return ok;
+}).catch((err) => {
+    const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
+    const needDb = !!e('DATABASE_URL');
+    if (needDb && e('MESSENGER_MYSQL_EXIT_ON_FAIL') === '1') process.exit(1);
+    return false;
+});
 /** @type {Map<string, object>} */
 const messengerProfileMem = new Map();
 
-// HTTP + WebSocket на одном порту (выше)
+console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
+
+// Health check сервер - тоже слушаем на 0.0.0.0
+const healthServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('WebSocket server is running');
+});
+
+// Используем другой порт для health check
+const HEALTH_PORT = parseInt(PORT) + 1;
+healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`✅ Health check on http://0.0.0.0:${HEALTH_PORT}`));
 
 function safeSend(ws, payload) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -100,7 +115,7 @@ function writeJson(filePath, value) {
     }
 }
 
-console.log('[messenger] storage backend: json-api');
+console.log('[messenger] friends store (friends only):', FRIENDS_STORE_PATH);
 
 function normalizeAccountId(value) {
     return typeof value === 'string' ? value.trim().slice(0, 120) : '';
@@ -146,7 +161,7 @@ function computeUserInitials(name, accountId) {
 }
 
 /** Профиль для UI: MySQL (messengerProfileMem) или friends_store как fallback имени. */
-async function getFormattedUser(userId) {
+function getFormattedUser(userId) {
     const id = normalizeAccountId(userId);
     if (!id) {
         return {
@@ -162,7 +177,7 @@ async function getFormattedUser(userId) {
         };
     }
     const memRow = messengerProfileMem.get(id);
-    const friends = await getUserProfileFromFriendsStore(id);
+    const friends = getUserProfileFromFriendsStore(id);
     const rowChats = memRow
         ? {
               name: memRow.name,
@@ -209,52 +224,85 @@ function enrichMessageWithSender(msg) {
     };
 }
 
-async function upsertUserPresenceProfileJson(appUserId, profile) {
+async function upsertUserPresenceProfileMysql(appUserId, profile) {
     const userId = normalizeAccountId(appUserId);
     if (!userId) return;
-    
-    try {
-        // Save to JSON API
-        await fetch(`${JSON_API_URL}/users`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                id: userId,
-                name: profile?.name || '',
-                avatar: profile?.avatar || '',
-                username: profile?.username || '',
-                statusText: profile?.statusText || '',
-                online: profile?.online !== undefined ? !!profile.online : true,
-                lastSeenAt: profile?.lastSeenAt || Date.now()
-            })
-        });
-        
-        // Update memory
-        messengerProfileMem.set(userId, {
+    const prev =
+        messengerProfileMem.get(userId) ||
+        (await messengerMysql.getProfile(userId)) ||
+        {
             id: userId,
-            name: profile?.name || '',
-            avatar: profile?.avatar || '',
-            username: profile?.username || '',
-            statusText: profile?.statusText || '',
-            online: profile?.online !== undefined ? !!profile.online : true,
-            lastSeenAt: profile?.lastSeenAt || Date.now()
-        });
-    } catch (err) {
-        console.log('[messenger] Failed to save user profile:', err.message);
-    }
+            name: '',
+            avatar: '',
+            username: '',
+            statusText: '',
+            online: false,
+            lastSeenAt: 0,
+            privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all' },
+            blacklist: [],
+            blacklistMeta: {},
+            friendIds: []
+        };
+    const next = {
+        name: profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
+        avatar: profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
+        username: profile?.username != null ? normalizeUsername(profile.username) : prev.username,
+        statusText: profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
+        online: profile?.online !== undefined ? !!profile.online : true,
+        lastSeenAt: profile?.lastSeenAt != null ? Number(profile.lastSeenAt) : Date.now(),
+        privacy: {
+            canWrite:
+                profile?.privacy?.canWrite !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canWrite)
+                    ? profile.privacy.canWrite
+                    : prev.privacy?.canWrite || 'all',
+            canCall:
+                profile?.privacy?.canCall !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canCall)
+                    ? profile.privacy.canCall
+                    : prev.privacy?.canCall || 'all',
+            canViewProfile:
+                profile?.privacy?.canViewProfile !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canViewProfile)
+                    ? profile.privacy.canViewProfile
+                    : prev.privacy?.canViewProfile || 'all'
+        },
+        blacklist: Array.isArray(profile?.blacklist)
+            ? profile.blacklist.map((v) => normalizeAccountId(v)).filter(Boolean)
+            : Array.isArray(prev.blacklist)
+              ? prev.blacklist
+              : [],
+        blacklistMeta:
+            typeof profile?.blacklistMeta === 'object' && profile.blacklistMeta
+                ? profile.blacklistMeta
+                : typeof prev.blacklistMeta === 'object' && prev.blacklistMeta
+                  ? prev.blacklistMeta
+                  : {},
+        friendIds: Array.isArray(profile?.friendIds)
+            ? profile.friendIds.map((v) => normalizeAccountId(v)).filter(Boolean)
+            : Array.isArray(prev.friendIds)
+              ? prev.friendIds
+              : []
+    };
+    const saved = await messengerMysql.upsertProfile(userId, {
+        name: next.name,
+        avatar: next.avatar,
+        username: next.username,
+        statusText: next.statusText,
+        blacklist: next.blacklist,
+        blacklistMeta: next.blacklistMeta,
+        friendIds: next.friendIds,
+        online: next.online,
+        lastSeenAt: next.lastSeenAt,
+        privacy: next.privacy
+    });
+    messengerProfileMem.set(userId, saved);
 }
 
 async function ensureProfilesLoaded(...ids) {
     const todo = [...new Set(ids.map((x) => normalizeAccountId(x)).filter(Boolean))];
+    if (!messengerMysql.isEnabled()) return;
     for (const uid of todo) {
         try {
-            // Try to get from JSON API
-            const response = await fetch(`${JSON_API_URL}/users?user_id=${uid}`);
-            if (response.ok) {
-                const users = await response.json();
-                const user = users.find(u => normalizeAccountId(u?.id) === uid);
-                if (user) messengerProfileMem.set(uid, user);
-            }
+            const p = await messengerMysql.getProfile(uid);
+            if (p) messengerProfileMem.set(uid, p);
         } catch (_) {}
     }
 }
@@ -264,28 +312,13 @@ function setUserOffline(appUserId) {
     if (!userId) return;
     void (async () => {
         try {
-            // Update user in JSON API
-            await fetch(`${JSON_API_URL}/users`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    id: userId,
-                    online: false,
-                    lastSeenAt: Date.now()
-                })
-            });
-            
-            // Update memory
-            const user = messengerProfileMem.get(userId);
-            if (user) {
-                user.online = false;
-                user.lastSeenAt = Date.now();
-                messengerProfileMem.set(userId, user);
-            }
-            
-            broadcastMessengerPresence(userId, false, Date.now());
-        } catch (err) {
-            console.log('[messenger] Failed to set user offline:', err.message);
+            await mysqlBoot;
+        } catch (_) {}
+        if (messengerMysql.isEnabled()) {
+            await messengerMysql.setUserOnlineFlags(userId, false);
+            const p = await messengerMysql.getProfile(userId);
+            if (p) messengerProfileMem.set(userId, p);
+            broadcastMessengerPresence(userId, false, p?.lastSeenAt || Date.now());
         }
     })();
 }
@@ -297,23 +330,9 @@ function getUserProfile(appUserId) {
     return null;
 }
 
-async function getUserProfileFromFriendsStore(targetUserId) {
+function getUserProfileFromFriendsStore(targetUserId) {
     const targetId = normalizeAccountId(targetUserId);
     if (!targetId) return null;
-    
-    try {
-        // Try to get from JSON API first
-        const response = await fetch(`${JSON_API_URL}/users?user_id=${targetId}`);
-        if (response.ok) {
-            const users = await response.json();
-            const user = users.find(u => normalizeAccountId(u?.id) === targetId);
-            if (user) return user;
-        }
-    } catch (err) {
-        console.log('[messenger] JSON API error, falling back to local file:', err.message);
-    }
-    
-    // Fallback to local file
     const store = readJson(FRIENDS_STORE_PATH, { users: [] });
     const list = Array.isArray(store?.users) ? store.users : [];
     const row = list.find((u) => normalizeAccountId(u?.id) === targetId);
@@ -332,36 +351,18 @@ async function getUserProfileFromFriendsStore(targetUserId) {
     };
 }
 
-async function areFriends(userA, userB) {
+function areFriendsForMessenger(userA, userB) {
     const a = normalizeAccountId(userA);
     const b = normalizeAccountId(userB);
     if (!a || !b) return false;
-    
-    try {
-        // Try to check via JSON API first
-        const response = await fetch(`${JSON_API_URL}/friends?user_id=${a}`);
-        if (response.ok) {
-            const friends = await response.json();
-            const isFriend = friends.some(f => {
-                const fa = normalizeAccountId(f?.user1_id);
-                const fb = normalizeAccountId(f?.user2_id);
-                return (fa === a && fb === b) || (fa === b && fb === a);
-            });
-            if (isFriend) return true;
-        }
-    } catch (err) {
-        console.log('[messenger] JSON API error, falling back to local file:', err.message);
-    }
-    
-    // Fallback to local file
     const store = readJson(FRIENDS_STORE_PATH, { friends: [] });
     const list = Array.isArray(store?.friends) ? store.friends : [];
     const key = [a, b].sort().join('::');
     const inStoreFile = list.some((row) => {
-        const ra = normalizeAccountId(row?.userA);
-        const rb = normalizeAccountId(row?.userB);
-        if (!ra || !rb) return false;
-        return [ra, rb].sort().join('::') === key;
+        const left = normalizeAccountId(row?.a);
+        const right = normalizeAccountId(row?.b);
+        if (!left || !right) return false;
+        return [left, right].sort().join('::') === key;
     });
     if (inStoreFile) return true;
     const pa = getUserProfile(a);
@@ -661,7 +662,16 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
     } catch (_) {}
     const id = normalizeAccountId(appUserId);
     if (!id) return;
-    // JSON API работает всегда, нет ошибок хранения
+    if (!messengerMysql.isEnabled()) {
+        sendToUserSessions(id, {
+            type: 'messenger-sync',
+            reason,
+            userId: id,
+            chats: [],
+            messengerStorageError: 'storage_unavailable'
+        });
+        return;
+    }
     await ensureProfilesLoaded(id);
     const chats = await buildChatListForUserMysql(id);
     sendToUserSessions(id, {
@@ -1072,7 +1082,14 @@ wss.on('connection', (ws) => {
                             try {
                                 await mysqlBoot;
                             } catch (_) {}
-                            // JSON API работает всегда
+                            if (!messengerMysql.isEnabled()) {
+                                safeSend(ws, {
+                                    type: 'messenger-error',
+                                    code: 'storage_unavailable',
+                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
+                                });
+                                return;
+                            }
                             const chat = await messengerMysql.findDirectChat(currentAppUserId, withUserId);
                             const chatId = chat?.id || createDirectChatId(currentAppUserId, withUserId);
                             if (!chatId) return;
@@ -1123,7 +1140,14 @@ wss.on('connection', (ws) => {
                                 await mysqlBoot;
                             } catch (_) {}
                             await ensureProfilesLoaded(currentAppUserId, toUserId);
-                            // JSON API работает всегда
+                            if (!messengerMysql.isEnabled()) {
+                                safeSend(ws, {
+                                    type: 'messenger-error',
+                                    code: 'storage_unavailable',
+                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
+                                });
+                                return;
+                            }
                             const gate = directMessageGate(currentAppUserId, toUserId);
                             if (!gate.ok) {
                                 safeSend(ws, {
