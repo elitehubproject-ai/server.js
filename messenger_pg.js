@@ -613,7 +613,13 @@ async function getStoriesForUser(userId, viewerId = null) {
     [userId, now]
   );
   
-  const stories = rows.map(rowToStory);
+  const owner = await getProfile(userId);
+  const stories = rows.map(row => ({
+    ...rowToStory(row),
+    userDisplayName: owner?.displayName || owner?.name || userId,
+    userAvatar: owner?.avatar || '',
+    userInitials: owner?.initials || ''
+  }));
   
   // Filter by privacy if viewer is specified
   if (viewerId && viewerId !== userId) {
