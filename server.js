@@ -1212,6 +1212,9 @@ wss.on('connection', (ws) => {
                                 deletedAt: 0,
                                 replyTo: normalizeText(data.replyTo || '', 64),
                                 forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64),
+                                storyReplyId,
+                                storyReplyCaption,
+                                storyReplyThumbnail,
                                 // Галочки: 1) доставлено получателю (после рассылки в его сессии)
                                 // 2) прочитано — когда получатель открыл диалог.
                                 deliveredBy: [toUserId],
@@ -1565,39 +1568,6 @@ wss.on('connection', (ws) => {
                             type: 'messenger-stories', 
                             targetUserId,
                             stories 
-                        });
-                    })();
-                    break;
-                case 'messenger-view-story':
-                    if (!currentAppUserId) return;
-                    void (async () => {
-                        try {
-                            await mysqlBoot;
-                        } catch (_) {}
-                        if (!messengerMysql.isEnabled()) return;
-                        
-                        const storyId = normalizeText(data.storyId || '', 100);
-                        if (!storyId) return;
-                        
-                        await messengerMysql.addStoryView(storyId, currentAppUserId);
-                    })();
-                    break;
-                case 'messenger-like-story':
-                    if (!currentAppUserId) return;
-                    void (async () => {
-                        try {
-                            await mysqlBoot;
-                        } catch (_) {}
-                        if (!messengerMysql.isEnabled()) return;
-                        
-                        const storyId = normalizeText(data.storyId || '', 100);
-                        if (!storyId) return;
-                        
-                        const result = await messengerMysql.toggleStoryLike(storyId, currentAppUserId);
-                        safeSend(ws, { 
-                            type: 'messenger-story-like-result', 
-                            storyId,
-                            liked: result.liked 
                         });
                     })();
                     break;
