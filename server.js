@@ -714,6 +714,8 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
         chats,
         selfProfile: selfProfile
             ? {
+                  name: selfProfile.name || '',
+                  avatar: selfProfile.avatar || '',
                   username: selfProfile.username || '',
                   statusText: selfProfile.statusText || '',
                   privacy: selfProfile.privacy || { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends' },
