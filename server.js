@@ -1595,6 +1595,98 @@ wss.on('connection', (ws) => {
                         });
                     })();
                     break;
+                case 'messenger-view-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+
+                        const story = await messengerMysql.getStoryById(storyId);
+                        if (!story) return;
+                        const visibleStories = await messengerMysql.getStoriesForUser(story.userId, currentAppUserId);
+                        const canAccess = String(story.userId || '') === String(currentAppUserId || '')
+                            || visibleStories.some((item) => String(item.id || '') === storyId);
+                        if (!canAccess) {
+                            safeSend(ws, { type: 'error', message: 'Доступ к истории запрещен' });
+                            return;
+                        }
+                        if (String(story.userId || '') !== String(currentAppUserId || '')) {
+                            await messengerMysql.addStoryView(storyId, currentAppUserId);
+                        }
+                        safeSend(ws, { type: 'messenger-story-view-result', storyId, ok: true });
+                    })();
+                    break;
+                case 'messenger-like-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+
+                        const story = await messengerMysql.getStoryById(storyId);
+                        if (!story) return;
+                        const visibleStories = await messengerMysql.getStoriesForUser(story.userId, currentAppUserId);
+                        const canAccess = String(story.userId || '') === String(currentAppUserId || '')
+                            || visibleStories.some((item) => String(item.id || '') === storyId);
+                        if (!canAccess) {
+                            safeSend(ws, { type: 'error', message: 'Доступ к истории запрещен' });
+                            return;
+                        }
+                        if (String(story.userId || '') === String(currentAppUserId || '')) {
+                            safeSend(ws, { type: 'error', message: 'Нельзя лайкать свою историю' });
+                            return;
+                        }
+                        await messengerMysql.addStoryView(storyId, currentAppUserId);
+                        const result = await messengerMysql.toggleStoryLike(storyId, currentAppUserId);
+                        safeSend(ws, {
+                            type: 'messenger-story-like-result',
+                            storyId,
+                            liked: result.liked
+                        });
+                    })();
+                    break;
+                case 'messenger-comment-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        const comment = normalizeText(data.comment || '', 500);
+                        if (!storyId || !comment) return;
+
+                        const story = await messengerMysql.getStoryById(storyId);
+                        if (!story) return;
+                        const visibleStories = await messengerMysql.getStoriesForUser(story.userId, currentAppUserId);
+                        const canAccess = String(story.userId || '') === String(currentAppUserId || '')
+                            || visibleStories.some((item) => String(item.id || '') === storyId);
+                        if (!canAccess) {
+                            safeSend(ws, { type: 'error', message: 'Доступ к истории запрещен' });
+                            return;
+                        }
+                        if (String(story.userId || '') === String(currentAppUserId || '')) {
+                            safeSend(ws, { type: 'error', message: 'Нельзя комментировать свою историю' });
+                            return;
+                        }
+                        await messengerMysql.addStoryComment(storyId, currentAppUserId, comment);
+                        safeSend(ws, {
+                            type: 'messenger-story-comment-result',
+                            storyId,
+                            comment
+                        });
+                    })();
+                    break;
                 case 'messenger-get-story-views':
                     if (!currentAppUserId) return;
                     void (async () => {
