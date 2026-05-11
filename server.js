@@ -1479,7 +1479,8 @@ wss.on('connection', (ws) => {
                             privacy: {
                                 canWrite: data.canWrite,
                                 canCall: data.canCall,
-                                canViewProfile: data.canViewProfile
+                                canViewProfile: data.canViewProfile,
+                                canSeeStories: data.canSeeStories
                             }
                         };
                         if (messengerMysql.isEnabled()) {
@@ -1496,6 +1497,152 @@ wss.on('connection', (ws) => {
                                 if (!peerId) continue;
                                 emitMessengerComposeStatus(peerId, currentAppUserId);
                             }
+                        }
+                    })();
+                    break;
+                case 'messenger-upload-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) {
+                            safeSend(ws, { type: 'error', message: 'База данных недоступна' });
+                            return;
+                        }
+                        
+                        const videoUrl = normalizeText(data.videoUrl || '', 2000);
+                        const videoMime = normalizeText(data.videoMime || 'video/mp4', 80);
+                        const durationMs = Math.max(0, Math.min(20000, Number(data.durationMs) || 0)); // Max 20 seconds
+                        const thumbnailUrl = normalizeText(data.thumbnailUrl || '', 2000);
+                        const caption = normalizeText(data.caption || '', 500);
+                        
+                        if (!videoUrl) {
+                            safeSend(ws, { type: 'error', message: 'Видео обязательно' });
+                            return;
+                        }
+                        
+                        // Check story limit (max 5 active stories)
+                        const activeCount = await messengerMysql.getActiveStoriesCount(currentAppUserId);
+                        if (activeCount >= 5) {
+                            safeSend(ws, { type: 'error', message: 'Максимум 5 активных историй' });
+                            return;
+                        }
+                        
+                        const storyId = 'story_' + uuidv4();
+                        const story = {
+                            id: storyId,
+                            userId: currentAppUserId,
+                            videoUrl,
+                            videoMime,
+                            durationMs,
+                            thumbnailUrl,
+                            caption,
+                            privacy: data.privacy || 'friends'
+                        };
+                        
+                        await messengerMysql.createStory(story);
+                        emitMessengerSync(currentAppUserId, 'story-uploaded');
+                        safeSend(ws, { type: 'messenger-story-uploaded', storyId });
+                    })();
+                    break;
+                case 'messenger-get-stories':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) {
+                            safeSend(ws, { type: 'error', message: 'База данных недоступна' });
+                            return;
+                        }
+                        
+                        const targetUserId = normalizeAccountId(data.targetUserId);
+                        if (!targetUserId) return;
+                        
+                        const stories = await messengerMysql.getStoriesForUser(targetUserId, currentAppUserId);
+                        safeSend(ws, { 
+                            type: 'messenger-stories', 
+                            targetUserId,
+                            stories 
+                        });
+                    })();
+                    break;
+                case 'messenger-view-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+                        
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+                        
+                        await messengerMysql.addStoryView(storyId, currentAppUserId);
+                    })();
+                    break;
+                case 'messenger-like-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+                        
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+                        
+                        const result = await messengerMysql.toggleStoryLike(storyId, currentAppUserId);
+                        safeSend(ws, { 
+                            type: 'messenger-story-like-result', 
+                            storyId,
+                            liked: result.liked 
+                        });
+                    })();
+                    break;
+                case 'messenger-get-story-views':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+                        
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+                        
+                        const story = await messengerMysql.getStoryById(storyId);
+                        if (!story || story.userId !== currentAppUserId) {
+                            safeSend(ws, { type: 'error', message: 'Доступ запрещен' });
+                            return;
+                        }
+                        
+                        const views = await messengerMysql.getStoryViews(storyId);
+                        safeSend(ws, { 
+                            type: 'messenger-story-views', 
+                            storyId,
+                            views 
+                        });
+                    })();
+                    break;
+                case 'messenger-delete-story':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+                        
+                        const storyId = normalizeText(data.storyId || '', 100);
+                        if (!storyId) return;
+                        
+                        const success = await messengerMysql.deleteStory(storyId, currentAppUserId);
+                        if (success) {
+                            emitMessengerSync(currentAppUserId, 'story-deleted');
+                            safeSend(ws, { type: 'messenger-story-deleted', storyId });
+                        } else {
+                            safeSend(ws, { type: 'error', message: 'История не найдена' });
                         }
                     })();
                     break;
@@ -2168,5 +2315,19 @@ const keepAlive = () => {
 // Запускаем авто-пинг каждые 4 минуты
 setInterval(keepAlive, 4 * 60 * 1000);
 console.log('✅ Keep-alive enabled (ping every 4 minutes)');
+
+// Очистка истекших историй каждые 5 минут
+setInterval(async () => {
+    try {
+        await mysqlBoot;
+    } catch (_) {}
+    if (messengerMysql.isEnabled()) {
+        const deleted = await messengerMysql.cleanupExpiredStories();
+        if (deleted > 0) {
+            console.log(`🗑️ Cleaned up ${deleted} expired stories`);
+        }
+    }
+}, 5 * 60 * 1000);
+console.log('✅ Story cleanup enabled (every 5 minutes)');
 
 setInterval(tickDurakRooms, 2000);
