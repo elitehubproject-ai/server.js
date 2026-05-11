@@ -132,6 +132,8 @@ function normalizeText(value, max = 4000) {
 
 /** Аватары часто data URL (base64) — короткий лимит ломал src и давал «мигание» в чатах. */
 const MAX_AVATAR_URL_LENGTH = 750000;
+const MAX_STORY_VIDEO_URL_LENGTH = 75000000;
+const MAX_STORY_THUMBNAIL_URL_LENGTH = 5000000;
 function normalizeAvatarUrl(value) {
     return normalizeText(typeof value === 'string' ? value : value == null ? '' : String(value), MAX_AVATAR_URL_LENGTH);
 }
@@ -1514,10 +1516,10 @@ wss.on('connection', (ws) => {
                             return;
                         }
                         
-                        const videoUrl = normalizeText(data.videoUrl || '', 2000);
+                        const videoUrl = normalizeText(data.videoUrl || '', MAX_STORY_VIDEO_URL_LENGTH);
                         const videoMime = normalizeText(data.videoMime || 'video/mp4', 80);
                         const durationMs = Math.max(0, Math.min(20000, Number(data.durationMs) || 0)); // Max 20 seconds
-                        const thumbnailUrl = normalizeText(data.thumbnailUrl || '', 2000);
+                        const thumbnailUrl = normalizeText(data.thumbnailUrl || '', MAX_STORY_THUMBNAIL_URL_LENGTH);
                         const caption = normalizeText(data.caption || '', 500);
                         
                         if (!videoUrl) {
