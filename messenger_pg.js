@@ -314,6 +314,10 @@ async function listAllUserIds() {
   return rows.map((r) => r.id);
 }
 
+function normalizeStoryPrivacy(privacy) {
+  return ['all', 'friends', 'nobody'].includes(privacy) ? privacy : 'friends';
+}
+
 async function findDirectChat(a, b) {
   const [u1, u2] = sortedPair(String(a), String(b));
   const { rows } = await pool.query(
@@ -586,6 +590,7 @@ async function setUserOnlineFlags(userId, online) {
 async function createStory(story) {
   const now = Date.now();
   const expiresAt = now + (24 * 60 * 60 * 1000); // 24 hours
+  const privacy = normalizeStoryPrivacy(story.privacy);
   
   await pool.query(
     `INSERT INTO stories (id, user_id, video_url, video_mime, duration_ms, thumbnail_url, caption, created_at, expires_at, privacy)
@@ -600,7 +605,7 @@ async function createStory(story) {
       story.caption || '',
       now,
       expiresAt,
-      story.privacy || 'friends'
+      privacy
     ]
   );
   return getStoryById(story.id);
@@ -630,11 +635,16 @@ async function getStoriesForUser(userId, viewerId = null) {
   if (viewerId && viewerId !== userId) {
     const userFriends = await getUserFriends(userId);
     const isFriend = userFriends.includes(viewerId);
+    const storiesPolicy = owner?.privacy?.canSeeStories || 'friends';
+
+    if (storiesPolicy === 'nobody') return [];
+    if (storiesPolicy === 'friends' && !isFriend) return [];
     
     return stories.filter(story => {
-      if (story.privacy === 'nobody') return false;
-      if (story.privacy === 'all') return true;
-      if (story.privacy === 'friends') return isFriend;
+      const storyPrivacy = normalizeStoryPrivacy(story.privacy);
+      if (storyPrivacy === 'nobody') return false;
+      if (storyPrivacy === 'all') return true;
+      if (storyPrivacy === 'friends') return isFriend;
       return false; // Default to friends if privacy is not set
     });
   }
@@ -703,9 +713,10 @@ async function checkStoryLike(storyId, userId) {
 }
 
 async function updateStoryPrivacy(storyId, userId, privacy) {
+  const nextPrivacy = normalizeStoryPrivacy(privacy);
   const { rows } = await pool.query(
     'UPDATE stories SET privacy = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
-    [privacy, storyId, userId]
+    [nextPrivacy, storyId, userId]
   );
   
   return rows.length > 0;
@@ -786,7 +797,7 @@ function rowToStory(row) {
     caption: row.caption || '',
     createdAt: Number(row.created_at) || 0,
     expiresAt: Number(row.expires_at) || 0,
-    privacy: row.privacy || 'friends'
+    privacy: normalizeStoryPrivacy(row.privacy)
   };
 }
 
