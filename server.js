@@ -229,9 +229,13 @@ function enrichMessageWithSender(msg) {
 async function upsertUserPresenceProfileMysql(appUserId, profile) {
     const userId = normalizeAccountId(appUserId);
     if (!userId) return;
+    
+    const existingFromDb = await messengerMysql.getProfile(userId);
+    const isNewUser = !existingFromDb;
+    
     const prev =
         messengerProfileMem.get(userId) ||
-        (await messengerMysql.getProfile(userId)) ||
+        existingFromDb ||
         {
             id: userId,
             name: '',
@@ -245,11 +249,12 @@ async function upsertUserPresenceProfileMysql(appUserId, profile) {
             blacklistMeta: {},
             friendIds: []
         };
+    
     const next = {
-        name: profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
-        avatar: profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
-        username: profile?.username != null ? normalizeUsername(profile.username) : prev.username,
-        statusText: profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
+        name: isNewUser && profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
+        avatar: isNewUser && profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
+        username: isNewUser && profile?.username != null ? normalizeUsername(profile.username) : prev.username,
+        statusText: isNewUser && profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
         online: profile?.online !== undefined ? !!profile.online : true,
         lastSeenAt: profile?.lastSeenAt != null ? Number(profile.lastSeenAt) : Date.now(),
         privacy: {
@@ -1207,6 +1212,9 @@ wss.on('connection', (ws) => {
                             if (isVoice) messageKind = 'voice';
                             else if (isImage) messageKind = 'image';
                             else if (isVideo) messageKind = 'video';
+                            const storyReplyId = normalizeText(data.storyReplyId || '', 100);
+                            const storyReplyCaption = normalizeText(data.storyReplyCaption || '', 4000);
+                            const storyReplyThumbnail = normalizeAvatarUrl(data.storyReplyThumbnail || '');
                             const message = {
                                 id: messageId,
                                 chatId: chat.id,
