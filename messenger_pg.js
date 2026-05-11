@@ -125,9 +125,14 @@ async function ensureTables() {
       story_id VARCHAR(100) NOT NULL,
       viewer_id VARCHAR(120) NOT NULL,
       viewed_at BIGINT NOT NULL,
+      comment_text TEXT NOT NULL DEFAULT '',
+      commented_at BIGINT NOT NULL DEFAULT 0,
       PRIMARY KEY (story_id, viewer_id)
     )
   `);
+
+  await pool.query(`ALTER TABLE story_views ADD COLUMN IF NOT EXISTS comment_text TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE story_views ADD COLUMN IF NOT EXISTS commented_at BIGINT NOT NULL DEFAULT 0`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS story_likes (
@@ -652,6 +657,18 @@ async function addStoryView(storyId, viewerId) {
   );
 }
 
+async function addStoryComment(storyId, viewerId, commentText) {
+  const now = Date.now();
+  await pool.query(
+    `INSERT INTO story_views (story_id, viewer_id, viewed_at, comment_text, commented_at)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (story_id, viewer_id) DO UPDATE
+     SET comment_text = EXCLUDED.comment_text,
+         commented_at = EXCLUDED.commented_at`,
+    [storyId, viewerId, now, commentText || '', now]
+  );
+}
+
 async function toggleStoryLike(storyId, userId) {
   const { rows } = await pool.query(
     'SELECT * FROM story_likes WHERE story_id = $1 AND user_id = $2',
@@ -696,7 +713,7 @@ async function updateStoryPrivacy(storyId, userId, privacy) {
 
 async function getStoryViews(storyId) {
   const { rows } = await pool.query(
-    `SELECT sv.viewer_id, sv.viewed_at, u.display_name, u.avatar_url, u.username
+    `SELECT sv.viewer_id, sv.viewed_at, sv.comment_text, sv.commented_at, u.display_name, u.avatar_url, u.username
      FROM story_views sv
      LEFT JOIN users u ON sv.viewer_id = u.id
      WHERE sv.story_id = $1
@@ -717,7 +734,9 @@ async function getStoryViews(storyId) {
     displayName: row.display_name || row.viewer_id,
     avatar: row.avatar_url || '',
     username: row.username || '',
-    liked: likedUserIds.has(row.viewer_id)
+    liked: likedUserIds.has(row.viewer_id),
+    comment: row.comment_text || '',
+    commentedAt: Number(row.commented_at) || 0
   }));
 }
 
@@ -803,6 +822,7 @@ module.exports = {
   getStoryById,
   getStoriesForUser,
   addStoryView,
+  addStoryComment,
   toggleStoryLike,
   checkStoryLike,
   updateStoryPrivacy,
