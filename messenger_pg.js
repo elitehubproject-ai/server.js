@@ -48,9 +48,11 @@ async function ensureTables() {
       who_can_write VARCHAR(16) NOT NULL DEFAULT 'all',
       who_can_call VARCHAR(16) NOT NULL DEFAULT 'all',
       who_can_see_profile VARCHAR(16) NOT NULL DEFAULT 'all',
+      who_can_see_stories VARCHAR(16) NOT NULL DEFAULT 'friends',
       CONSTRAINT settings_write_chk CHECK (who_can_write IN ('all','friends','nobody')),
       CONSTRAINT settings_call_chk CHECK (who_can_call IN ('all','friends','nobody')),
-      CONSTRAINT settings_profile_chk CHECK (who_can_see_profile IN ('all','friends','nobody'))
+      CONSTRAINT settings_profile_chk CHECK (who_can_see_profile IN ('all','friends','nobody')),
+      CONSTRAINT settings_stories_chk CHECK (who_can_see_stories IN ('all','friends','nobody'))
     )
   `);
 
@@ -93,12 +95,54 @@ async function ensureTables() {
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_mime VARCHAR(80) NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_see_stories VARCHAR(16) NOT NULL DEFAULT 'friends'`);
 
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
   );
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u1 ON chats(user1_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u2 ON chats(user2_id)');
+
+  // Stories tables
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stories (
+      id VARCHAR(100) PRIMARY KEY,
+      user_id VARCHAR(120) NOT NULL,
+      video_url TEXT NOT NULL,
+      video_mime VARCHAR(80) NOT NULL DEFAULT 'video/mp4',
+      duration_ms INT NOT NULL DEFAULT 0,
+      thumbnail_url TEXT,
+      caption TEXT,
+      created_at BIGINT NOT NULL,
+      expires_at BIGINT NOT NULL,
+      privacy VARCHAR(16) NOT NULL DEFAULT 'friends',
+      CONSTRAINT stories_privacy_chk CHECK (privacy IN ('all','friends','nobody'))
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS story_views (
+      story_id VARCHAR(100) NOT NULL,
+      viewer_id VARCHAR(120) NOT NULL,
+      viewed_at BIGINT NOT NULL,
+      PRIMARY KEY (story_id, viewer_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS story_likes (
+      story_id VARCHAR(100) NOT NULL,
+      user_id VARCHAR(120) NOT NULL,
+      liked_at BIGINT NOT NULL,
+      PRIMARY KEY (story_id, user_id)
+    )
+  `);
+
+  // Indexes for stories
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_stories_user_time ON stories(user_id, created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_stories_expires ON stories(expires_at)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_story_views_story ON story_views(story_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_story_likes_story ON story_likes(story_id)');
 }
 
 async function initMessengerPostgres() {
@@ -166,7 +210,8 @@ function rowToServerProfile(userId, userRow, settingsRow) {
     privacy: {
       canWrite: settingsRow?.who_can_write || 'all',
       canCall: settingsRow?.who_can_call || 'all',
-      canViewProfile: settingsRow?.who_can_see_profile || 'all'
+      canViewProfile: settingsRow?.who_can_see_profile || 'all',
+      canSeeStories: settingsRow?.who_can_see_stories || 'friends'
     }
   };
 }
@@ -181,7 +226,7 @@ function safeJson(s, def) {
 
 async function getSettingsRow(userId) {
   const { rows } = await pool.query(
-    'SELECT who_can_write, who_can_call, who_can_see_profile FROM settings WHERE user_id = $1 LIMIT 1',
+    'SELECT who_can_write, who_can_call, who_can_see_profile, who_can_see_stories FROM settings WHERE user_id = $1 LIMIT 1',
     [userId]
   );
   return rows[0] || null;
@@ -246,14 +291,16 @@ async function upsertSettings(userId, privacy) {
   const w = privacy.canWrite || privacy.whoCanWrite || 'all';
   const c = privacy.canCall || privacy.whoCanCall || 'all';
   const p = privacy.canViewProfile || privacy.whoCanSeeProfile || 'all';
+  const s = privacy.canSeeStories || privacy.whoCanSeeStories || 'friends';
   await pool.query(
-    `INSERT INTO settings (user_id, who_can_write, who_can_call, who_can_see_profile)
-     VALUES ($1,$2,$3,$4)
+    `INSERT INTO settings (user_id, who_can_write, who_can_call, who_can_see_profile, who_can_see_stories)
+     VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (user_id) DO UPDATE SET
        who_can_write = EXCLUDED.who_can_write,
        who_can_call = EXCLUDED.who_can_call,
-       who_can_see_profile = EXCLUDED.who_can_see_profile`,
-    [userId, w, c, p]
+       who_can_see_profile = EXCLUDED.who_can_see_profile,
+       who_can_see_stories = EXCLUDED.who_can_see_stories`,
+    [userId, w, c, p, s]
   );
 }
 
@@ -530,6 +577,178 @@ async function setUserOnlineFlags(userId, online) {
   );
 }
 
+// Story-related functions
+async function createStory(story) {
+  const now = Date.now();
+  const expiresAt = now + (24 * 60 * 60 * 1000); // 24 hours
+  
+  await pool.query(
+    `INSERT INTO stories (id, user_id, video_url, video_mime, duration_ms, thumbnail_url, caption, created_at, expires_at, privacy)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [
+      story.id,
+      story.userId,
+      story.videoUrl,
+      story.videoMime || 'video/mp4',
+      story.durationMs || 0,
+      story.thumbnailUrl || '',
+      story.caption || '',
+      now,
+      expiresAt,
+      story.privacy || 'friends'
+    ]
+  );
+  return getStoryById(story.id);
+}
+
+async function getStoryById(storyId) {
+  const { rows } = await pool.query('SELECT * FROM stories WHERE id = $1 LIMIT 1', [storyId]);
+  return rows[0] ? rowToStory(rows[0]) : null;
+}
+
+async function getStoriesForUser(userId, viewerId = null) {
+  const now = Date.now();
+  const { rows } = await pool.query(
+    `SELECT * FROM stories WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at ASC`,
+    [userId, now]
+  );
+  
+  const stories = rows.map(rowToStory);
+  
+  // Filter by privacy if viewer is specified
+  if (viewerId && viewerId !== userId) {
+    const userProfile = await getProfile(userId);
+    const userFriends = await getUserFriends(userId);
+    const isFriend = userFriends.includes(viewerId);
+    const privacyLevel = userProfile.privacy.canSeeStories;
+    
+    return stories.filter(story => {
+      if (privacyLevel === 'nobody') return false;
+      if (privacyLevel === 'all') return true;
+      if (privacyLevel === 'friends') return isFriend;
+      return false;
+    });
+  }
+  
+  return stories;
+}
+
+async function getUserFriends(userId) {
+  const profile = await getProfile(userId);
+  return profile?.friendIds || [];
+}
+
+async function addStoryView(storyId, viewerId) {
+  const now = Date.now();
+  await pool.query(
+    `INSERT INTO story_views (story_id, viewer_id, viewed_at) 
+     VALUES ($1,$2,$3) 
+     ON CONFLICT (story_id, viewer_id) DO NOTHING`,
+    [storyId, viewerId, now]
+  );
+}
+
+async function toggleStoryLike(storyId, userId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM story_likes WHERE story_id = $1 AND user_id = $2',
+    [storyId, userId]
+  );
+  
+  if (rows[0]) {
+    // Unlike
+    await pool.query(
+      'DELETE FROM story_likes WHERE story_id = $1 AND user_id = $2',
+      [storyId, userId]
+    );
+    return { liked: false };
+  } else {
+    // Like
+    const now = Date.now();
+    await pool.query(
+      'INSERT INTO story_likes (story_id, user_id, liked_at) VALUES ($1,$2,$3)',
+      [storyId, userId, now]
+    );
+    return { liked: true };
+  }
+}
+
+async function getStoryViews(storyId) {
+  const { rows } = await pool.query(
+    `SELECT sv.viewer_id, sv.viewed_at, u.display_name, u.avatar_url, u.username
+     FROM story_views sv
+     LEFT JOIN users u ON sv.viewer_id = u.id
+     WHERE sv.story_id = $1
+     ORDER BY sv.viewed_at DESC`,
+    [storyId]
+  );
+  
+  const { rows: likeRows } = await pool.query(
+    `SELECT sl.user_id FROM story_likes sl WHERE sl.story_id = $1`,
+    [storyId]
+  );
+  
+  const likedUserIds = new Set(likeRows.map(r => r.user_id));
+  
+  return rows.map(row => ({
+    userId: row.viewer_id,
+    viewedAt: Number(row.viewed_at),
+    displayName: row.display_name || row.viewer_id,
+    avatar: row.avatar_url || '',
+    username: row.username || '',
+    liked: likedUserIds.has(row.viewer_id)
+  }));
+}
+
+async function deleteStory(storyId, userId) {
+  const story = await getStoryById(storyId);
+  if (!story || story.userId !== userId) return false;
+  
+  await pool.query('DELETE FROM stories WHERE id = $1 AND user_id = $2', [storyId, userId]);
+  await pool.query('DELETE FROM story_views WHERE story_id = $1', [storyId]);
+  await pool.query('DELETE FROM story_likes WHERE story_id = $1', [storyId]);
+  return true;
+}
+
+async function cleanupExpiredStories() {
+  const now = Date.now();
+  const { rows } = await pool.query(
+    'SELECT id FROM stories WHERE expires_at <= $1',
+    [now]
+  );
+  
+  for (const row of rows) {
+    await pool.query('DELETE FROM story_views WHERE story_id = $1', [row.id]);
+    await pool.query('DELETE FROM story_likes WHERE story_id = $1', [row.id]);
+  }
+  
+  await pool.query('DELETE FROM stories WHERE expires_at <= $1', [now]);
+  return rows.length;
+}
+
+async function getActiveStoriesCount(userId) {
+  const now = Date.now();
+  const { rows } = await pool.query(
+    'SELECT COUNT(*) as count FROM stories WHERE user_id = $1 AND expires_at > $2',
+    [userId, now]
+  );
+  return Number(rows[0].count) || 0;
+}
+
+function rowToStory(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    videoUrl: row.video_url,
+    videoMime: row.video_mime || 'video/mp4',
+    durationMs: Number(row.duration_ms) || 0,
+    thumbnailUrl: row.thumbnail_url || '',
+    caption: row.caption || '',
+    createdAt: Number(row.created_at) || 0,
+    expiresAt: Number(row.expires_at) || 0,
+    privacy: row.privacy || 'friends'
+  };
+}
+
 const initMessengerMysql = initMessengerPostgres;
 
 module.exports = {
@@ -556,5 +775,16 @@ module.exports = {
   deleteChatRow,
   setUserOnlineFlags,
   directChatId,
-  addMessageReadBy
+  addMessageReadBy,
+  // Story functions
+  createStory,
+  getStoryById,
+  getStoriesForUser,
+  addStoryView,
+  toggleStoryLike,
+  getStoryViews,
+  deleteStory,
+  cleanupExpiredStories,
+  getActiveStoriesCount,
+  getUserFriends
 };
