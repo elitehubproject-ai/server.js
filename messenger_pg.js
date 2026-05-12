@@ -83,6 +83,8 @@ async function ensureTables() {
       duration_ms INT NOT NULL DEFAULT 0,
       reply_to VARCHAR(100) NOT NULL DEFAULT '',
       forwarded_from VARCHAR(100) NOT NULL DEFAULT '',
+      forwarded_preview JSONB NOT NULL DEFAULT '{}'::jsonb,
+      reactions_json JSONB NOT NULL DEFAULT '{}'::jsonb,
       delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb,
       read_by JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at BIGINT NOT NULL,
@@ -93,6 +95,8 @@ async function ensureTables() {
 
   // На случай уже существующей таблицы (если у вас код обновился, а БД нет).
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS image_mime VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_preview JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions_json JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_see_stories VARCHAR(16) NOT NULL DEFAULT 'friends'`);
@@ -407,6 +411,10 @@ function rowToMessage(row) {
   const isVideoNote = dbType === 'video_note';
   const isVideo = dbType === 'video';
   const createdAt = Number(row.created_at) || 0;
+  const forwardedPreview =
+    row.forwarded_preview && typeof row.forwarded_preview === 'object' ? row.forwarded_preview : {};
+  const reactions =
+    row.reactions_json && typeof row.reactions_json === 'object' ? row.reactions_json : {};
   const base = {
     id: row.id,
     chatId: row.chat_id,
@@ -417,6 +425,8 @@ function rowToMessage(row) {
     messageKind: isVoice ? 'voice' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text',
     replyTo: row.reply_to || '',
     forwardedFromMessageId: row.forwarded_from || '',
+    forwardedPreview,
+    reactions,
     editedAt: Number(row.edited_at) || 0,
     deletedAt: Number(row.deleted_at) || 0,
     mimeType: '',
@@ -462,9 +472,11 @@ async function insertMessage(msg) {
   const createdAt = Number(msg.createdAt || msg.at || Date.now());
   const deliveredBy = Array.isArray(msg.deliveredBy) ? msg.deliveredBy.map(String) : [];
   const readBy = Array.isArray(msg.readBy) ? msg.readBy.map(String) : [];
+  const forwardedPreview = msg.forwardedPreview && typeof msg.forwardedPreview === 'object' ? msg.forwardedPreview : {};
+  const reactions = msg.reactions && typeof msg.reactions === 'object' ? msg.reactions : {};
   await pool.query(
-    `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, delivered_by, read_by, created_at, edited_at, deleted_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15,$16,$17)`,
+    `INSERT INTO messages (id, chat_id, sender_id, recipient_id, text, type, file_url, duration_ms, audio_mime, image_mime, reply_to, forwarded_from, forwarded_preview, reactions_json, delivered_by, read_by, created_at, edited_at, deleted_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18,$19)`,
     [
       msg.id,
       msg.chatId,
@@ -478,6 +490,8 @@ async function insertMessage(msg) {
       imageMimeCol,
       msg.replyTo || '',
       msg.forwardedFromMessageId || msg.forwardedFrom || '',
+      JSON.stringify(forwardedPreview),
+      JSON.stringify(reactions),
       JSON.stringify(deliveredBy),
       JSON.stringify(readBy),
       createdAt,
@@ -535,6 +549,14 @@ async function updateMessageFields(id, patch) {
   if (patch.text !== undefined) {
     sets.push(`text = $${n++}`);
     vals.push(patch.text);
+  }
+  if (patch.forwardedPreview !== undefined) {
+    sets.push(`forwarded_preview = $${n++}::jsonb`);
+    vals.push(JSON.stringify(patch.forwardedPreview || {}));
+  }
+  if (patch.reactions !== undefined) {
+    sets.push(`reactions_json = $${n++}::jsonb`);
+    vals.push(JSON.stringify(patch.reactions || {}));
   }
   if (patch.editedAt !== undefined) {
     sets.push(`edited_at = $${n++}`);
