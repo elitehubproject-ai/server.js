@@ -69,6 +69,39 @@ async function ensureTables() {
     )
   `);
 
+  await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS chat_kind VARCHAR(16) NOT NULL DEFAULT 'direct'`);
+  await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS title VARCHAR(220) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS avatar_url TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS invite_code VARCHAR(120) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS created_by VARCHAR(120) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE chats DROP CONSTRAINT IF EXISTS chats_pair_uniq`);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chats_kind_chk'
+      ) THEN
+        ALTER TABLE chats
+          ADD CONSTRAINT chats_kind_chk CHECK (chat_kind IN ('direct','group'));
+      END IF;
+    END $$;
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_members (
+      chat_id VARCHAR(220) NOT NULL,
+      user_id VARCHAR(120) NOT NULL,
+      role VARCHAR(16) NOT NULL DEFAULT 'member',
+      joined_at BIGINT NOT NULL DEFAULT 0,
+      invited_by VARCHAR(120) NOT NULL DEFAULT '',
+      settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      PRIMARY KEY (chat_id, user_id),
+      CONSTRAINT chat_members_role_chk CHECK (role IN ('owner','admin','member'))
+    )
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id VARCHAR(100) PRIMARY KEY,
@@ -100,12 +133,17 @@ async function ensureTables() {
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_see_stories VARCHAR(16) NOT NULL DEFAULT 'friends'`);
+  await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_join_groups VARCHAR(16) NOT NULL DEFAULT 'friends'`);
 
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
   );
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u1 ON chats(user1_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u2 ON chats(user2_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_kind_updated ON chats(chat_kind, updated_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_invite_code ON chats(invite_code)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members(user_id, joined_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_chat_members_chat ON chat_members(chat_id, joined_at ASC)');
 
   // Stories tables
   await pool.query(`
@@ -220,7 +258,8 @@ function rowToServerProfile(userId, userRow, settingsRow) {
       canWrite: settingsRow?.who_can_write || 'all',
       canCall: settingsRow?.who_can_call || 'all',
       canViewProfile: settingsRow?.who_can_see_profile || 'all',
-      canSeeStories: settingsRow?.who_can_see_stories || 'friends'
+      canSeeStories: settingsRow?.who_can_see_stories || 'friends',
+      canJoinGroups: settingsRow?.who_can_join_groups || 'friends'
     }
   };
 }
@@ -235,7 +274,7 @@ function safeJson(s, def) {
 
 async function getSettingsRow(userId) {
   const { rows } = await pool.query(
-    'SELECT who_can_write, who_can_call, who_can_see_profile, who_can_see_stories FROM settings WHERE user_id = $1 LIMIT 1',
+    'SELECT who_can_write, who_can_call, who_can_see_profile, who_can_see_stories, who_can_join_groups FROM settings WHERE user_id = $1 LIMIT 1',
     [userId]
   );
   return rows[0] || null;
@@ -301,15 +340,17 @@ async function upsertSettings(userId, privacy) {
   const c = privacy.canCall || privacy.whoCanCall || 'all';
   const p = privacy.canViewProfile || privacy.whoCanSeeProfile || 'all';
   const s = privacy.canSeeStories || privacy.whoCanSeeStories || 'friends';
+  const g = privacy.canJoinGroups || privacy.whoCanJoinGroups || 'friends';
   await pool.query(
-    `INSERT INTO settings (user_id, who_can_write, who_can_call, who_can_see_profile, who_can_see_stories)
-     VALUES ($1,$2,$3,$4,$5)
+    `INSERT INTO settings (user_id, who_can_write, who_can_call, who_can_see_profile, who_can_see_stories, who_can_join_groups)
+     VALUES ($1,$2,$3,$4,$5,$6)
      ON CONFLICT (user_id) DO UPDATE SET
        who_can_write = EXCLUDED.who_can_write,
        who_can_call = EXCLUDED.who_can_call,
        who_can_see_profile = EXCLUDED.who_can_see_profile,
-       who_can_see_stories = EXCLUDED.who_can_see_stories`,
-    [userId, w, c, p, s]
+       who_can_see_stories = EXCLUDED.who_can_see_stories,
+       who_can_join_groups = EXCLUDED.who_can_join_groups`,
+    [userId, w, c, p, s, g]
   );
 }
 
@@ -322,10 +363,111 @@ function normalizeStoryPrivacy(privacy) {
   return ['all', 'friends', 'nobody'].includes(privacy) ? privacy : 'friends';
 }
 
+function normalizeGroupPermission(value, fallback = 'owner_admins') {
+  const v = String(value || '').trim();
+  return ['owner', 'owner_admins', 'all'].includes(v) ? v : fallback;
+}
+
+function normalizeInviteCode(value, fallback = '') {
+  const cleaned = String(value || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
+  return cleaned || fallback;
+}
+
+async function generateUniqueInviteCode(preferred = '') {
+  const first = normalizeInviteCode(preferred);
+  if (first) {
+    const exists = await getGroupChatByInviteCode(first);
+    if (!exists) return first;
+  }
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const candidate = `grp_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+    const exists = await getGroupChatByInviteCode(candidate);
+    if (!exists) return candidate;
+  }
+  return `grp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function buildDefaultChatMeta(kind = 'direct', ownerId = '') {
+  const owner = String(ownerId || '').trim();
+  const base = {
+    clearedBy: {},
+    removedBy: {},
+    blockedBy: {},
+    pinnedBy: {},
+    archivedBy: {},
+    mutedBy: {},
+    typingBy: {}
+  };
+  if (kind !== 'group') return base;
+  return {
+    ...base,
+    permissions: {
+      addMembers: 'owner_admins',
+      editInfo: 'owner_admins',
+      moderate: 'owner_admins',
+      linkAccess: 'all',
+      createCalls: 'owner_admins'
+    },
+    ownerId: owner,
+    joinByLink: true
+  };
+}
+
+function normalizeChatMeta(meta, kind = 'direct', ownerId = '') {
+  const src = meta && typeof meta === 'object' ? meta : {};
+  const base = buildDefaultChatMeta(kind, ownerId);
+  const out = {
+    ...base,
+    ...src,
+    clearedBy: src.clearedBy && typeof src.clearedBy === 'object' ? src.clearedBy : {},
+    removedBy: src.removedBy && typeof src.removedBy === 'object' ? src.removedBy : {},
+    blockedBy: src.blockedBy && typeof src.blockedBy === 'object' ? src.blockedBy : {},
+    pinnedBy: src.pinnedBy && typeof src.pinnedBy === 'object' ? src.pinnedBy : {},
+    archivedBy: src.archivedBy && typeof src.archivedBy === 'object' ? src.archivedBy : {},
+    mutedBy: src.mutedBy && typeof src.mutedBy === 'object' ? src.mutedBy : {},
+    typingBy: src.typingBy && typeof src.typingBy === 'object' ? src.typingBy : {}
+  };
+  if (kind === 'group') {
+    const perms = src.permissions && typeof src.permissions === 'object' ? src.permissions : {};
+    out.permissions = {
+      addMembers: normalizeGroupPermission(perms.addMembers, base.permissions.addMembers),
+      editInfo: normalizeGroupPermission(perms.editInfo, base.permissions.editInfo),
+      moderate: normalizeGroupPermission(perms.moderate, base.permissions.moderate),
+      linkAccess: normalizeGroupPermission(perms.linkAccess, base.permissions.linkAccess),
+      createCalls: normalizeGroupPermission(perms.createCalls, base.permissions.createCalls)
+    };
+    out.ownerId = String(src.ownerId || ownerId || '').trim();
+    out.joinByLink = src.joinByLink !== false;
+  }
+  return out;
+}
+
+async function listGroupMembers(chatId) {
+  const { rows } = await pool.query(
+    `SELECT chat_id, user_id, role, joined_at, invited_by, settings_json
+     FROM chat_members
+     WHERE chat_id = $1
+     ORDER BY joined_at ASC, user_id ASC`,
+    [chatId]
+  );
+  return rows.map((row) => ({
+    chatId: row.chat_id,
+    userId: row.user_id,
+    role: ['owner', 'admin', 'member'].includes(String(row.role || '')) ? row.role : 'member',
+    joinedAt: Number(row.joined_at) || 0,
+    invitedBy: row.invited_by || '',
+    settings: parseJsonCol(row.settings_json, {})
+  }));
+}
+
 async function findDirectChat(a, b) {
   const [u1, u2] = sortedPair(String(a), String(b));
   const { rows } = await pool.query(
-    'SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats WHERE user1_id = $1 AND user2_id = $2 LIMIT 1',
+    `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
+            chat_kind, title, description, avatar_url, invite_code, created_by
+     FROM chats
+     WHERE chat_kind = 'direct' AND user1_id = $1 AND user2_id = $2
+     LIMIT 1`,
     [u1, u2]
   );
   if (!rows[0]) return null;
@@ -338,33 +480,33 @@ async function getOrCreateChat(a, b) {
   const [u1, u2] = sortedPair(String(a), String(b));
   const id = directChatId(u1, u2);
   const now = Date.now();
-  const meta = {
-    clearedBy: {},
-    removedBy: {},
-    blockedBy: {},
-    pinnedBy: {},
-    archivedBy: {},
-    mutedBy: {},
-    typingBy: {}
-  };
+  const meta = buildDefaultChatMeta('direct');
   await pool.query(
-    'INSERT INTO chats (id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json) VALUES ($1,$2,$3,NULL,NULL,$4,$5::jsonb)',
+    `INSERT INTO chats (
+       id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
+       chat_kind, title, description, avatar_url, invite_code, created_by
+     ) VALUES ($1,$2,$3,NULL,NULL,$4,$5::jsonb,'direct','','','','','')`,
     [id, u1, u2, now, JSON.stringify(meta)]
   );
-  return { id, members: [u1, u2], meta, lastMessage: null, updatedAt: now };
+  return {
+    id,
+    kind: 'direct',
+    members: [u1, u2],
+    meta,
+    lastMessage: null,
+    updatedAt: now,
+    createdAt: now,
+    title: '',
+    description: '',
+    avatar: '',
+    inviteCode: '',
+    createdBy: ''
+  };
 }
 
 function rowToChat(row, u1, u2) {
-  const meta = parseJsonCol(row.meta_json, {});
-  const m = {
-    clearedBy: meta.clearedBy || {},
-    removedBy: meta.removedBy || {},
-    blockedBy: meta.blockedBy || {},
-    pinnedBy: meta.pinnedBy || {},
-    archivedBy: meta.archivedBy || {},
-    mutedBy: meta.mutedBy || {},
-    typingBy: meta.typingBy || {}
-  };
+  const kind = String(row.chat_kind || '').trim() === 'group' ? 'group' : 'direct';
+  const m = normalizeChatMeta(parseJsonCol(row.meta_json, {}), kind, row.created_by || '');
   let lastMessage = null;
   const preview = row.last_message_preview;
   if (preview && typeof preview === 'object') {
@@ -378,13 +520,67 @@ function rowToChat(row, u1, u2) {
   }
   return {
     id: row.id,
-    kind: 'direct',
-    members: [row.user1_id || u1, row.user2_id || u2],
+    kind,
+    members: kind === 'group' ? [] : [row.user1_id || u1, row.user2_id || u2],
     createdAt: Number(row.updated_at) || Date.now(),
     meta: m,
     lastMessage,
-    updatedAt: Number(row.updated_at) || 0
+    updatedAt: Number(row.updated_at) || 0,
+    title: row.title || '',
+    description: row.description || '',
+    avatar: row.avatar_url || '',
+    inviteCode: row.invite_code || '',
+    createdBy: row.created_by || '',
+    participants: []
   };
+}
+
+async function hydrateChat(chat) {
+  if (!chat || chat.kind !== 'group') return chat;
+  const participants = await listGroupMembers(chat.id);
+  return {
+    ...chat,
+    members: participants.map((item) => item.userId),
+    participants
+  };
+}
+
+async function createGroupChat(input) {
+  const ownerId = String(input?.ownerId || '').trim();
+  if (!ownerId) return null;
+  const title = String(input?.title || '').trim().slice(0, 220);
+  if (!title) return null;
+  const description = String(input?.description || '').trim().slice(0, 4000);
+  const avatar = String(input?.avatar || '').trim();
+  const inviteCode = await generateUniqueInviteCode(input?.inviteCode || '');
+  const memberIds = Array.from(
+    new Set(
+      [ownerId, ...(Array.isArray(input?.memberIds) ? input.memberIds : [])]
+        .map((v) => String(v || '').trim())
+        .filter(Boolean)
+    )
+  );
+  const id = `grp:${inviteCode}`;
+  const now = Date.now();
+  const meta = normalizeChatMeta(input?.meta || {}, 'group', ownerId);
+  await pool.query(
+    `INSERT INTO chats (
+       id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
+       chat_kind, title, description, avatar_url, invite_code, created_by
+     )
+     VALUES ($1,$2,$3,NULL,NULL,$4,$5::jsonb,'group',$6,$7,$8,$9,$10)`,
+    [id, ownerId, ownerId, now, JSON.stringify(meta), title, description, avatar, inviteCode, ownerId]
+  );
+  for (const uid of memberIds) {
+    await pool.query(
+      `INSERT INTO chat_members (chat_id, user_id, role, joined_at, invited_by, settings_json)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [id, uid, uid === ownerId ? 'owner' : 'member', now, ownerId, JSON.stringify({})]
+    );
+  }
+  const raw = await getChatById(id);
+  return raw;
 }
 
 async function updateChatMeta(chatId, meta) {
@@ -422,7 +618,7 @@ function rowToMessage(row) {
     toId: row.recipient_id,
     createdAt,
     text: row.text || '',
-    messageKind: isVoice ? 'voice' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text',
+    messageKind: dbType === 'system' ? 'system' : isVoice ? 'voice' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text',
     replyTo: row.reply_to || '',
     forwardedFromMessageId: row.forwarded_from || '',
     forwardedPreview,
@@ -459,7 +655,8 @@ async function insertMessage(msg) {
   const isImage = mk === 'image';
   const isVideoNote = mk === 'video_note';
   const isVideo = mk === 'video';
-  const type = isVoice ? 'audio' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text';
+  const isSystem = mk === 'system';
+  const type = isSystem ? 'system' : isVoice ? 'audio' : isImage ? 'image' : isVideoNote ? 'video_note' : isVideo ? 'video' : 'text';
   const fileUrl = isVoice
     ? msg.audioBase64 || ''
     : isImage
@@ -573,11 +770,30 @@ async function updateMessageFields(id, patch) {
 
 async function getChatById(chatId) {
   const { rows } = await pool.query(
-    'SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats WHERE id = $1 LIMIT 1',
+    `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
+            chat_kind, title, description, avatar_url, invite_code, created_by
+     FROM chats
+     WHERE id = $1
+     LIMIT 1`,
     [chatId]
   );
   if (!rows[0]) return null;
-  return rowToChat(rows[0]);
+  return hydrateChat(rowToChat(rows[0]));
+}
+
+async function getGroupChatByInviteCode(inviteCode) {
+  const code = normalizeInviteCode(inviteCode);
+  if (!code) return null;
+  const { rows } = await pool.query(
+    `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
+            chat_kind, title, description, avatar_url, invite_code, created_by
+     FROM chats
+     WHERE chat_kind = 'group' AND invite_code = $1
+     LIMIT 1`,
+    [code]
+  );
+  if (!rows[0]) return null;
+  return hydrateChat(rowToChat(rows[0]));
 }
 
 async function loadChatMeta(chatId) {
@@ -588,16 +804,89 @@ async function loadChatMeta(chatId) {
 async function listChatsForUser(userId) {
   const uid = String(userId);
   const { rows } = await pool.query(
-    `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json FROM chats
-     WHERE user1_id = $1 OR user2_id = $1 ORDER BY updated_at DESC`,
+    `SELECT DISTINCT c.id, c.user1_id, c.user2_id, c.last_message_id, c.last_message_preview, c.updated_at, c.meta_json,
+            c.chat_kind, c.title, c.description, c.avatar_url, c.invite_code, c.created_by
+     FROM chats c
+     LEFT JOIN chat_members cm ON cm.chat_id = c.id
+     WHERE (c.chat_kind = 'direct' AND (c.user1_id = $1 OR c.user2_id = $1))
+        OR (c.chat_kind = 'group' AND cm.user_id = $1)
+     ORDER BY c.updated_at DESC`,
     [uid]
   );
-  return rows.map((r) => rowToChat(r));
+  const out = [];
+  for (const row of rows) {
+    out.push(await hydrateChat(rowToChat(row)));
+  }
+  return out;
 }
 
 async function deleteChatRow(chatId) {
   await pool.query('DELETE FROM messages WHERE chat_id = $1', [chatId]);
+  await pool.query('DELETE FROM chat_members WHERE chat_id = $1', [chatId]);
   await pool.query('DELETE FROM chats WHERE id = $1', [chatId]);
+}
+
+async function touchChatUpdatedAt(chatId, updatedAt = Date.now()) {
+  await pool.query('UPDATE chats SET updated_at = $1 WHERE id = $2', [Number(updatedAt) || Date.now(), chatId]);
+}
+
+async function updateGroupChatInfo(chatId, patch = {}) {
+  const sets = [];
+  const vals = [];
+  let n = 1;
+  if (patch.title !== undefined) {
+    sets.push(`title = $${n++}`);
+    vals.push(String(patch.title || '').trim().slice(0, 220));
+  }
+  if (patch.description !== undefined) {
+    sets.push(`description = $${n++}`);
+    vals.push(String(patch.description || '').trim().slice(0, 4000));
+  }
+  if (patch.avatar !== undefined) {
+    sets.push(`avatar_url = $${n++}`);
+    vals.push(String(patch.avatar || '').trim());
+  }
+  if (patch.inviteCode !== undefined) {
+    sets.push(`invite_code = $${n++}`);
+    vals.push(normalizeInviteCode(patch.inviteCode));
+  }
+  if (!sets.length) return getChatById(chatId);
+  sets.push(`updated_at = $${n++}`);
+  vals.push(Date.now());
+  vals.push(chatId);
+  await pool.query(`UPDATE chats SET ${sets.join(', ')} WHERE id = $${n}`, vals);
+  return getChatById(chatId);
+}
+
+async function addGroupMember(chatId, userId, role = 'member', invitedBy = '') {
+  const safeRole = ['owner', 'admin', 'member'].includes(String(role || '')) ? String(role) : 'member';
+  const now = Date.now();
+  await pool.query(
+    `INSERT INTO chat_members (chat_id, user_id, role, joined_at, invited_by, settings_json)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+     ON CONFLICT (chat_id, user_id) DO UPDATE SET
+       role = EXCLUDED.role,
+       invited_by = EXCLUDED.invited_by`,
+    [chatId, String(userId || '').trim(), safeRole, now, String(invitedBy || '').trim(), JSON.stringify({})]
+  );
+  await touchChatUpdatedAt(chatId, now);
+  return getChatById(chatId);
+}
+
+async function setGroupMemberRole(chatId, userId, role) {
+  const safeRole = ['owner', 'admin', 'member'].includes(String(role || '')) ? String(role) : 'member';
+  await pool.query(
+    'UPDATE chat_members SET role = $1 WHERE chat_id = $2 AND user_id = $3',
+    [safeRole, chatId, String(userId || '').trim()]
+  );
+  await touchChatUpdatedAt(chatId);
+  return getChatById(chatId);
+}
+
+async function removeGroupMember(chatId, userId) {
+  await pool.query('DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2', [chatId, String(userId || '').trim()]);
+  await touchChatUpdatedAt(chatId);
+  return getChatById(chatId);
 }
 
 async function setUserOnlineFlags(userId, online) {
@@ -835,10 +1124,18 @@ module.exports = {
   listAllUserIds,
   findDirectChat,
   getOrCreateChat,
+  createGroupChat,
+  listGroupMembers,
   getChatById,
+  getGroupChatByInviteCode,
   loadChatMeta,
   updateChatMeta,
+  updateGroupChatInfo,
+  addGroupMember,
+  setGroupMemberRole,
+  removeGroupMember,
   updateLastMessagePreview,
+  touchChatUpdatedAt,
   insertMessage,
   listMessagesForChat,
   getLatestMessageInChatAfter,
