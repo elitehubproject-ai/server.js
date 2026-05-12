@@ -226,6 +226,62 @@ function enrichMessageWithSender(msg) {
     };
 }
 
+async function refreshChatLastPreview(chatId) {
+    const cid = String(chatId || '').trim();
+    if (!cid || !messengerMysql.isEnabled()) return null;
+    const last = await messengerMysql.getLatestMessageInChatAfter(cid, 0);
+    const preview = last
+        ? {
+              id: last.id,
+              text: last.text,
+              fromId: last.fromId,
+              createdAt: last.createdAt,
+              editedAt: last.editedAt || 0,
+              messageKind: last.messageKind || 'text',
+              audioBase64: ''
+          }
+        : null;
+    await messengerMysql.updateLastMessagePreview(cid, preview, Date.now());
+    return preview;
+}
+
+const MESSENGER_ALLOWED_REACTIONS = [
+    '❤️',
+    '👍',
+    '👎',
+    '😂',
+    '😮',
+    '😢',
+    '😡',
+    '🔥',
+    '🎉',
+    '👏',
+    '😍',
+    '🤔',
+    '🙏',
+    '💯',
+    '😎'
+];
+
+function normalizeReactionEmoji(v) {
+    const s = String(v || '').trim();
+    if (!s) return '';
+    return MESSENGER_ALLOWED_REACTIONS.includes(s) ? s : '';
+}
+
+function normalizeReactionsObject(value) {
+    const out = {};
+    if (!value || typeof value !== 'object') return out;
+    for (const [emoji, users] of Object.entries(value)) {
+        const e = normalizeReactionEmoji(emoji);
+        if (!e) continue;
+        const arr = Array.isArray(users) ? users.map((x) => normalizeAccountId(x)).filter(Boolean) : [];
+        const uniq = Array.from(new Set(arr));
+        if (uniq.length) out[e] = uniq;
+    }
+    return out;
+}
+
 async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) {
     const userId = normalizeAccountId(appUserId);
     if (!userId) return;
@@ -1207,7 +1263,7 @@ wss.on('connection', (ws) => {
                             if (!chat) return;
                             const clientMessageId = normalizeText(data.clientMessageId || '', 100);
                             const messageId = clientMessageId || `msg_${uuidv4()}`;
-                            const text = normalizeText(data.text, 4000);
+                            let text = normalizeText(data.text, 4000);
                             const audioRaw = typeof data.audioBase64 === 'string' ? data.audioBase64 : '';
                             const isVoiceEarly =
                                 audioRaw.replace(/[^a-zA-Z0-9+/=]/g, '').length > 32 &&
@@ -1222,7 +1278,35 @@ wss.on('connection', (ws) => {
                             const isVoice = audioBase64.length > 32 && (data.messageKind === 'voice' || !!data.audioBase64);
                             const isImage = imageBase64.length > 80 && data.messageKind === 'image';
                             const isVideo = videoBase64.length > 80 && data.messageKind === 'video';
-                            if (!text && !isVoice && !isImage && !isVideo) return;
+                            const forwardedFromMessageId = normalizeText(data.forwardedFromMessageId || '', 64);
+                            let forwardedPreview = {};
+                            let forwardOriginal = null;
+                            if (forwardedFromMessageId) {
+                                forwardOriginal = await messengerMysql.getMessageById(forwardedFromMessageId);
+                                if (forwardOriginal && !forwardOriginal.deletedAt) {
+                                    const originChat = await messengerMysql.getChatById(forwardOriginal.chatId);
+                                    const members = Array.isArray(originChat?.members) ? originChat.members : [];
+                                    if (!members.includes(currentAppUserId)) {
+                                        forwardOriginal = null;
+                                    }
+                                } else {
+                                    forwardOriginal = null;
+                                }
+                                if (forwardOriginal) {
+                                    await ensureProfilesLoaded(forwardOriginal.fromId);
+                                    const fmt = getFormattedUser(forwardOriginal.fromId);
+                                    forwardedPreview = {
+                                        fromUserId: forwardOriginal.fromId,
+                                        displayName: fmt.displayName,
+                                        avatar: fmt.avatar,
+                                        initials: fmt.initials,
+                                        text: forwardOriginal.text || '',
+                                        messageKind: forwardOriginal.messageKind || 'text'
+                                    };
+                                }
+                            }
+                            const forwardCloningAllowed = !!forwardOriginal && !isVoice && !isImage && !isVideo;
+                            if (!text && !isVoice && !isImage && !isVideo && !forwardCloningAllowed) return;
                             const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
                             const mimeNorm = String(mimeRaw || '').split(';')[0].trim();
                             const audioMime = /^audio\/(webm|ogg|mp4|mpeg|wav|m4a|x-m4a|aac|x-aac)$/i.test(mimeNorm)
@@ -1234,6 +1318,31 @@ wss.on('connection', (ws) => {
                             if (isVoice) messageKind = 'voice';
                             else if (isImage) messageKind = 'image';
                             else if (isVideo) messageKind = 'video';
+                            let finalAudioBase64 = isVoice ? audioBase64 : '';
+                            let finalImageBase64 = isImage ? imageBase64 : '';
+                            let finalVideoBase64 = isVideo ? videoBase64 : '';
+                            let finalAudioMime = isVoice ? audioMime : '';
+                            let finalImageMime = isImage ? normalizeText(data.mimeType || 'image/jpeg', 80) : '';
+                            let finalVideoMime = isVideo ? videoMime : '';
+                            let finalDurationMs = isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0;
+                            if (forwardCloningAllowed && forwardOriginal) {
+                                if (!text) text = normalizeText(forwardOriginal.text || '', 4000);
+                                const okKind = String(forwardOriginal.messageKind || '').trim();
+                                if (okKind === 'voice' && forwardOriginal.audioBase64) {
+                                    messageKind = 'voice';
+                                    finalAudioBase64 = String(forwardOriginal.audioBase64 || '');
+                                    finalAudioMime = String(forwardOriginal.audioMime || 'audio/webm').slice(0, 80);
+                                    finalDurationMs = Math.min(600000, Math.max(0, Number(forwardOriginal.durationMs || 0)));
+                                } else if (okKind === 'image' && forwardOriginal.imageBase64) {
+                                    messageKind = 'image';
+                                    finalImageBase64 = String(forwardOriginal.imageBase64 || '');
+                                    finalImageMime = String(forwardOriginal.mimeType || forwardOriginal.imageMime || 'image/jpeg').slice(0, 80);
+                                } else if ((okKind === 'video' || okKind === 'video_note') && forwardOriginal.videoBase64) {
+                                    messageKind = 'video';
+                                    finalVideoBase64 = String(forwardOriginal.videoBase64 || '');
+                                    finalVideoMime = String(forwardOriginal.videoMime || 'video/mp4').slice(0, 80);
+                                }
+                            }
                             const storyReplyId = normalizeText(data.storyReplyId || '', 100);
                             const storyReplyCaption = normalizeText(data.storyReplyCaption || '', 4000);
                             const storyReplyThumbnail = normalizeAvatarUrl(data.storyReplyThumbnail || '');
@@ -1249,18 +1358,20 @@ wss.on('connection', (ws) => {
                                     (isVideo ? '🎬 Видео' : '') ||
                                     '',
                                 messageKind,
-                                audioMime: isVoice ? audioMime : '',
-                                audioBase64: isVoice ? audioBase64 : '',
-                                imageBase64: isImage ? imageBase64 : '',
-                                mimeType: isImage ? normalizeText(data.mimeType || 'image/jpeg', 80) : '',
-                                videoBase64: isVideo ? videoBase64 : '',
-                                videoMime: isVideo ? videoMime : '',
-                                durationMs: isVoice ? Math.min(600000, Math.max(0, Number(data.durationMs || 0))) : 0,
+                                audioMime: finalAudioMime,
+                                audioBase64: finalAudioBase64,
+                                imageBase64: finalImageBase64,
+                                mimeType: finalImageMime,
+                                videoBase64: finalVideoBase64,
+                                videoMime: finalVideoMime,
+                                durationMs: finalDurationMs,
                                 createdAt: Date.now(),
                                 editedAt: 0,
                                 deletedAt: 0,
                                 replyTo: normalizeText(data.replyTo || '', 64),
-                                forwardedFromMessageId: normalizeText(data.forwardedFromMessageId || '', 64),
+                                forwardedFromMessageId,
+                                forwardedPreview,
+                                reactions: {},
                                 storyReplyId,
                                 storyReplyCaption,
                                 storyReplyThumbnail,
@@ -1313,11 +1424,14 @@ wss.on('connection', (ws) => {
                         if (!currentAppUserId) return;
                         const toUserId = normalizeAccountId(data.toUserId);
                         if (!toUserId || toUserId === currentAppUserId) return;
+                        const activityRaw = typeof data.activity === 'string' ? data.activity : (typeof data.kind === 'string' ? data.kind : '');
+                        const activity = ['text', 'voice'].includes(String(activityRaw || '').trim()) ? String(activityRaw || '').trim() : 'text';
                         sendToUserSessions(toUserId, {
                             type: 'messenger-typing',
                             fromUserId: currentAppUserId,
                             chatId: createDirectChatId(currentAppUserId, toUserId),
                             isTyping: !!data.isTyping,
+                            activity,
                             ts: Date.now()
                         });
                     }
@@ -1366,6 +1480,18 @@ wss.on('connection', (ws) => {
                             row = enrichMessageWithSender({ ...row, text: nextText, editedAt: Date.now() });
                             const chat = await messengerMysql.getChatById(row.chatId);
                             if (!chat) return;
+                            if (String(chat.lastMessage?.id || '') === String(messageId)) {
+                                const preview = {
+                                    id: row.id,
+                                    text: row.text,
+                                    fromId: row.fromId,
+                                    createdAt: row.createdAt,
+                                    editedAt: row.editedAt || 0,
+                                    messageKind: row.messageKind || 'text',
+                                    audioBase64: ''
+                                };
+                                await messengerMysql.updateLastMessagePreview(row.chatId, preview, Date.now());
+                            }
                             const peerId = chat.members.find((item) => item !== currentAppUserId) || '';
                             const payload = { type: 'messenger-message-updated', chatId: row.chatId, message: row };
                             sendToUserSessions(currentAppUserId, payload);
@@ -1389,8 +1515,42 @@ wss.on('connection', (ws) => {
                             await messengerMysql.deleteMessageByIdHard(messageId);
                             const chat = await messengerMysql.getChatById(chatId);
                             if (!chat) return;
+                            if (String(chat.lastMessage?.id || '') === String(messageId)) {
+                                await refreshChatLastPreview(chatId);
+                            }
                             const peerId = chat.members.find((item) => item !== currentAppUserId) || '';
                             const payload = { type: 'messenger-message-deleted', chatId, messageId };
+                            sendToUserSessions(currentAppUserId, payload);
+                            if (peerId) sendToUserSessions(peerId, payload);
+                        })();
+                    }
+                    break;
+                case 'messenger-react':
+                    {
+                        if (!currentAppUserId) return;
+                        const chatId = normalizeText(data.chatId || '', 220);
+                        const messageId = normalizeText(data.messageId || '', 100);
+                        const emoji = normalizeReactionEmoji(data.emoji);
+                        if (!chatId || !messageId || !emoji) return;
+                        void (async () => {
+                            try {
+                                await mysqlBoot;
+                            } catch (_) {}
+                            if (!messengerMysql.isEnabled()) return;
+                            const chat = await messengerMysql.getChatById(chatId);
+                            if (!chat || !Array.isArray(chat.members) || !chat.members.includes(currentAppUserId)) return;
+                            const row = await messengerMysql.getMessageById(messageId);
+                            if (!row || String(row.chatId || '') !== String(chatId) || row.deletedAt) return;
+                            const reactions = normalizeReactionsObject(row.reactions || {});
+                            const me = normalizeAccountId(currentAppUserId);
+                            const prevUsers = Array.isArray(reactions[emoji]) ? reactions[emoji].map(String) : [];
+                            const had = prevUsers.includes(me);
+                            const nextUsers = had ? prevUsers.filter((u) => u !== me) : [...prevUsers, me];
+                            if (nextUsers.length) reactions[emoji] = Array.from(new Set(nextUsers));
+                            else delete reactions[emoji];
+                            await messengerMysql.updateMessageFields(messageId, { reactions });
+                            const peerId = chat.members.find((m) => m !== currentAppUserId) || '';
+                            const payload = { type: 'messenger-message-reactions', chatId, messageId, reactions };
                             sendToUserSessions(currentAppUserId, payload);
                             if (peerId) sendToUserSessions(peerId, payload);
                         })();
