@@ -201,6 +201,7 @@ function getFormattedUser(userId) {
             displayName: '',
             username: '',
             avatar: '',
+            coverUrl: '',
             initials: '·',
             online: false,
             lastSeenAt: 0,
@@ -213,6 +214,7 @@ function getFormattedUser(userId) {
         ? {
               name: memRow.name,
               avatar: memRow.avatar,
+              coverUrl: memRow.coverUrl || '',
               username: memRow.username,
               statusText: memRow.statusText || '',
               online: !!memRow.online,
@@ -222,6 +224,7 @@ function getFormattedUser(userId) {
     const name = normalizeText(rowChats.name || (friends && friends.name) || '', 120);
     const username = normalizeUsername(rowChats.username || (friends && friends.username) || '');
     const avatar = normalizeAvatarUrl(rowChats.avatar || (friends && friends.avatar) || '');
+    const coverUrl = normalizeAvatarUrl(rowChats.coverUrl || '');
     const statusText = normalizeText(rowChats.statusText || '', 160);
     const online = !!rowChats.online;
     const lastSeenAt = Number(rowChats.lastSeenAt || 0);
@@ -235,6 +238,7 @@ function getFormattedUser(userId) {
         displayName,
         username,
         avatar,
+        coverUrl,
         initials,
         online,
         lastSeenAt,
@@ -251,6 +255,7 @@ function enrichMessageWithSender(msg) {
         ...msg,
         senderDisplayName: fmt.displayName,
         senderAvatar: fmt.avatar,
+        senderCoverUrl: fmt.coverUrl,
         senderInitials: fmt.initials
     };
 }
@@ -327,6 +332,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
             id: userId,
             name: '',
             avatar: '',
+            coverUrl: '',
             username: '',
             statusText: '',
             online: false,
@@ -340,6 +346,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
     const next = {
         name: canOverwriteIdentity && profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
         avatar: canOverwriteIdentity && profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
+        coverUrl: canOverwriteIdentity && profile?.coverUrl != null ? normalizeAvatarUrl(profile.coverUrl) : (prev.coverUrl || ''),
         username: canOverwriteIdentity && profile?.username != null ? normalizeUsername(profile.username) : prev.username,
         statusText: canOverwriteIdentity && profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
         online: profile?.online !== undefined ? !!profile.online : !!prev.online,
@@ -386,6 +393,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
     const saved = await messengerMysql.upsertProfile(userId, {
         name: next.name,
         avatar: next.avatar,
+        coverUrl: next.coverUrl,
         username: next.username,
         statusText: next.statusText,
         blacklist: next.blacklist,
@@ -550,6 +558,7 @@ function broadcastMessengerProfilePatch(targetUserId) {
             name: fmt.name,
             displayName: fmt.displayName,
             avatar: fmt.avatar,
+            coverUrl: fmt.coverUrl || '',
             username: fmt.username,
             statusText: fmt.statusText,
             initials: fmt.initials,
@@ -673,6 +682,7 @@ function getGroupPenaltyState(metaMap, userId) {
         reason: normalizeText(raw.reason || '', 220),
         actorId: normalizeAccountId(raw.actorId || raw.by || ''),
         actorName: normalizeText(raw.actorName || raw.byName || '', 120),
+        actorAvatar: normalizeAvatarUrl(raw.actorAvatar || ''),
         issuedAt: Number(raw.issuedAt || Date.now()) || Date.now()
     };
 }
@@ -783,6 +793,7 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
                 displayName: targetId,
                 initials: computeUserInitials('', targetId),
                 avatar: '',
+                coverUrl: '',
                 username: '',
                 statusText: '',
                 online: false,
@@ -802,6 +813,7 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
                 displayName: fmtB.displayName,
                 initials: fmtB.initials,
                 avatar: fmtB.avatar,
+                coverUrl: fmtB.coverUrl || '',
                 username: fmtB.username,
                 statusText: target.blacklistMeta?.[viewerId] || 'Вас заблокировал этот аккаунт.',
                 online: !!target.online
@@ -816,6 +828,7 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
                 id: targetId,
                 name: 'Профиль закрыт',
                 avatar: '',
+                coverUrl: '',
                 username: '',
                 statusText: 'Пользователь закрыл профиль от публичного доступа.',
                 online: false
@@ -832,6 +845,7 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
             displayName: fmt.displayName,
             initials: fmt.initials,
             avatar: fmt.avatar,
+            coverUrl: fmt.coverUrl || '',
             username: fmt.username,
             statusText: target.statusText || '',
             online: !!target.online,
@@ -921,6 +935,7 @@ async function buildChatListForUserMysql(appUserId) {
                 displayName: fmt.displayName,
                 initials: fmt.initials,
                 avatar: fmt.avatar,
+                coverUrl: fmt.coverUrl || '',
                 username: fmt.username,
                 statusText: fmt.statusText || '',
                 online: !!fmt.online,
@@ -1170,6 +1185,7 @@ async function applyGroupPenalty(chat, actorUserId, targetUserId, kind, duration
         until,
         actorId,
         actorName: actorFmt.displayName,
+        actorAvatar: actorFmt.avatar,
         reason: normalizeText(reason || '', 220),
         issuedAt: Date.now()
     };
@@ -1179,7 +1195,7 @@ async function applyGroupPenalty(chat, actorUserId, targetUserId, kind, duration
         const msg = await insertSystemMessage(
             chat,
             actorId,
-            `${makeSystemUserTag(actorId, actorFmt.displayName)} выдал(а) мут на ${durationText} ${makeSystemUserTag(targetId, targetFmt.displayName)} в чате`
+            `${makeSystemUserTag(actorId, actorFmt.displayName)} выдал(а) мут на ${durationText} ${makeSystemUserTag(targetId, targetFmt.displayName)} в чате${entry.reason ? `. Причина: ${entry.reason}` : ''}`
         );
         return { chat: await sendGroupChatPayloadUpdate(chat.id, 'group-penalty-updated'), message: msg };
     }
@@ -1189,7 +1205,7 @@ async function applyGroupPenalty(chat, actorUserId, targetUserId, kind, duration
         const msg = await insertSystemMessage(
             chat,
             actorId,
-            `${makeSystemUserTag(actorId, actorFmt.displayName)} выдал(а) блокировку чата на ${durationText} ${makeSystemUserTag(targetId, targetFmt.displayName)}`
+            `${makeSystemUserTag(actorId, actorFmt.displayName)} выдал(а) блокировку чата на ${durationText} ${makeSystemUserTag(targetId, targetFmt.displayName)} в чате${entry.reason ? `. Причина: ${entry.reason}` : ''}`
         );
         return { chat: await sendGroupChatPayloadUpdate(chat.id, 'group-penalty-updated'), message: msg };
     }
@@ -1308,6 +1324,7 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
             ? {
                   name: selfProfile.name || '',
                   avatar: selfProfile.avatar || '',
+                  coverUrl: selfProfile.coverUrl || '',
                   username: selfProfile.username || '',
                   statusText: selfProfile.statusText || '',
                   privacy: selfProfile.privacy || { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' },
@@ -2212,7 +2229,8 @@ wss.on('connection', (ws) => {
                                         safeSend(ws, {
                                             type: 'messenger-error',
                                             code: 'write_forbidden',
-                                            message: composeGroupWriteHint(gate)
+                                            message: composeGroupWriteHint(gate),
+                                            clientMessageId: normalizeText(data.clientMessageId || '', 100)
                                         });
                                         return;
                                     }
@@ -2223,7 +2241,8 @@ wss.on('connection', (ws) => {
                                         safeSend(ws, {
                                             type: 'messenger-error',
                                             code: 'write_forbidden',
-                                            message: composeHintFromGate(gate)
+                                            message: composeHintFromGate(gate),
+                                            clientMessageId: normalizeText(data.clientMessageId || '', 100)
                                         });
                                         return;
                                     }
@@ -2235,7 +2254,8 @@ wss.on('connection', (ws) => {
                                     safeSend(ws, {
                                         type: 'messenger-error',
                                         code: 'write_forbidden',
-                                        message: composeHintFromGate(gate)
+                                        message: composeHintFromGate(gate),
+                                        clientMessageId: normalizeText(data.clientMessageId || '', 100)
                                     });
                                     return;
                                 }
@@ -2388,7 +2408,8 @@ wss.on('connection', (ws) => {
                                 safeSend(ws, {
                                     type: 'messenger-error',
                                     code: 'save_failed',
-                                    message: `Не удалось сохранить сообщение: ${String(err?.message || err || '').slice(0, 220)}`
+                                    message: `Не удалось сохранить сообщение: ${String(err?.message || err || '').slice(0, 220)}`,
+                                    clientMessageId
                                     // Для очистки локального pending-сообщения можно будет использовать clientMessageId
                                 });
                                 return;
@@ -2672,9 +2693,18 @@ wss.on('connection', (ws) => {
                         try {
                             await mysqlBoot;
                         } catch (_) {}
+                        const normalizedUsername = normalizeUsername(data.username || '');
+                        if (messengerMysql.isEnabled() && normalizedUsername) {
+                            const availability = await messengerMysql.isUsernameAvailable(normalizedUsername, currentAppUserId);
+                            if (!availability.available) {
+                                safeSend(ws, { type: 'messenger-error', code: 'username_taken', message: 'Этот username уже занят' });
+                                return;
+                            }
+                        }
                         const patch = {
                             name: data.name,
                             avatar: data.avatar,
+                            coverUrl: data.coverUrl,
                             username: data.username,
                             statusText: data.statusText
                         };
@@ -2694,6 +2724,25 @@ wss.on('connection', (ws) => {
                                 emitMessengerSync(peerId, 'peer-profile-updated');
                             }
                         }
+                    })();
+                    break;
+                case 'messenger-check-username':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        const normalizedUsername = normalizeUsername(data.username || '');
+                        if (!messengerMysql.isEnabled()) {
+                            safeSend(ws, { type: 'messenger-username-status', username: normalizedUsername, available: true });
+                            return;
+                        }
+                        const availability = await messengerMysql.isUsernameAvailable(normalizedUsername, currentAppUserId);
+                        safeSend(ws, {
+                            type: 'messenger-username-status',
+                            username: normalizedUsername,
+                            available: !!availability.available
+                        });
                     })();
                     break;
                 case 'messenger-update-privacy':
