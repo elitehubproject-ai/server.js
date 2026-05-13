@@ -444,19 +444,40 @@ function normalizeChatMeta(meta, kind = 'direct', ownerId = '') {
 
 async function listGroupMembers(chatId) {
   const { rows } = await pool.query(
-    `SELECT chat_id, user_id, role, joined_at, invited_by, settings_json
-     FROM chat_members
+    `SELECT cm.chat_id, cm.user_id, cm.role, cm.joined_at, cm.invited_by, cm.settings_json,
+            u.display_name, u.avatar_url, u.username, u.online, u.last_seen
+     FROM chat_members cm
+     LEFT JOIN users u ON u.id = cm.user_id
      WHERE chat_id = $1
-     ORDER BY joined_at ASC, user_id ASC`,
+     ORDER BY cm.joined_at ASC, cm.user_id ASC`,
     [chatId]
   );
+  const makeInitials = (value, fallback = '') => {
+    const raw = String(value || fallback || '').trim();
+    if (!raw) return '';
+    const letters = raw
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0))
+      .join('')
+      .slice(0, 2)
+      .toUpperCase();
+    return letters || raw.slice(0, 2).toUpperCase();
+  };
   return rows.map((row) => ({
     chatId: row.chat_id,
     userId: row.user_id,
     role: ['owner', 'admin', 'member'].includes(String(row.role || '')) ? row.role : 'member',
     joinedAt: Number(row.joined_at) || 0,
     invitedBy: row.invited_by || '',
-    settings: parseJsonCol(row.settings_json, {})
+    settings: parseJsonCol(row.settings_json, {}),
+    displayName: row.display_name || row.user_id || '',
+    name: row.display_name || row.user_id || '',
+    avatar: row.avatar_url || '',
+    username: row.username || '',
+    initials: makeInitials(row.display_name, row.user_id),
+    online: !!row.online,
+    lastSeenAt: Number(row.last_seen) || 0
   }));
 }
 
