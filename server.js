@@ -60,6 +60,21 @@ const messengerProfileMem = new Map();
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || '30000') || 30000;
+setInterval(() => {
+    try {
+        wss.clients.forEach((ws) => {
+            if (!ws) return;
+            if (ws.isAlive === false) {
+                try { ws.terminate(); } catch (_) {}
+                return;
+            }
+            ws.isAlive = false;
+            try { ws.ping(); } catch (_) {}
+        });
+    } catch (_) {}
+}, Math.max(8000, WS_HEARTBEAT_MS));
+
 // Health check сервер - тоже слушаем на 0.0.0.0
 const healthServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -130,6 +145,18 @@ function normalizeUsername(value) {
 function normalizeText(value, max = 4000) {
     if (typeof value !== 'string') return '';
     return value.trim().slice(0, max);
+}
+
+function sanitizeSystemUserLabel(value, max = 120) {
+    const raw = normalizeText(typeof value === 'string' ? value : String(value || ''), max);
+    return raw.replace(/\[\[|\]\]|\|/g, '').trim().slice(0, max);
+}
+
+function makeSystemUserTag(userId, displayName) {
+    const id = normalizeAccountId(userId);
+    if (!id) return sanitizeSystemUserLabel(displayName || '') || 'Пользователь';
+    const label = sanitizeSystemUserLabel(displayName || '') || id;
+    return `[[user:${id}|${label}]]`;
 }
 
 /** Аватары часто data URL (base64) — короткий лимит ломал src и давал «мигание» в чатах. */
@@ -315,8 +342,8 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
         avatar: canOverwriteIdentity && profile?.avatar != null ? normalizeAvatarUrl(profile.avatar) : prev.avatar,
         username: canOverwriteIdentity && profile?.username != null ? normalizeUsername(profile.username) : prev.username,
         statusText: canOverwriteIdentity && profile?.statusText != null ? normalizeText(String(profile.statusText), 160) : prev.statusText,
-        online: profile?.online !== undefined ? !!profile.online : true,
-        lastSeenAt: profile?.lastSeenAt != null ? Number(profile.lastSeenAt) : Date.now(),
+        online: profile?.online !== undefined ? !!profile.online : !!prev.online,
+        lastSeenAt: profile?.lastSeenAt != null ? Number(profile.lastSeenAt) : (Number(prev.lastSeenAt || 0) || Date.now()),
         privacy: {
             canWrite:
                 canOverwritePrivacy && profile?.privacy?.canWrite !== undefined && ['all', 'friends', 'nobody'].includes(profile.privacy.canWrite)
@@ -1149,13 +1176,21 @@ async function applyGroupPenalty(chat, actorUserId, targetUserId, kind, duration
     if (kind === 'mute') {
         meta.mutedBy[targetId] = entry;
         await messengerMysql.updateChatMeta(chat.id, meta);
-        const msg = await insertSystemMessage(chat, actorId, `${actorFmt.displayName} выдал(а) мут на ${durationText} ${targetFmt.displayName} в чате`);
+        const msg = await insertSystemMessage(
+            chat,
+            actorId,
+            `${makeSystemUserTag(actorId, actorFmt.displayName)} выдал(а) мут на ${durationText} ${makeSystemUserTag(targetId, targetFmt.displayName)} в чате`
+        );
         return { chat: await sendGroupChatPayloadUpdate(chat.id, 'group-penalty-updated'), message: msg };
     }
     if (kind === 'ban') {
         meta.blockedBy[targetId] = entry;
         await messengerMysql.updateChatMeta(chat.id, meta);
-        const msg = await insertSystemMessage(chat, actorId, `${actorFmt.displayName} выдал(а) блокировку чата на ${durationText} ${targetFmt.displayName}`);
+        const msg = await insertSystemMessage(
+            chat,
+            actorId,
+            `${makeSystemUserTag(actorId, actorFmt.displayName)} выдал(а) блокировку чата на ${durationText} ${makeSystemUserTag(targetId, targetFmt.displayName)}`
+        );
         return { chat: await sendGroupChatPayloadUpdate(chat.id, 'group-penalty-updated'), message: msg };
     }
     return null;
@@ -1176,11 +1211,11 @@ async function removeGroupPenalty(chat, actorUserId, targetUserId, kind) {
     let text = '';
     if (kind === 'mute' && meta.mutedBy[targetId]) {
         delete meta.mutedBy[targetId];
-        text = `${actorFmt.displayName} снял(а) мут с ${targetFmt.displayName}`;
+        text = `${makeSystemUserTag(actorId, actorFmt.displayName)} снял(а) мут с ${makeSystemUserTag(targetId, targetFmt.displayName)}`;
     }
     if (kind === 'ban' && meta.blockedBy[targetId]) {
         delete meta.blockedBy[targetId];
-        text = `${actorFmt.displayName} снял(а) блокировку чата с ${targetFmt.displayName}`;
+        text = `${makeSystemUserTag(actorId, actorFmt.displayName)} снял(а) блокировку чата с ${makeSystemUserTag(targetId, targetFmt.displayName)}`;
     }
     if (!text) return null;
     await messengerMysql.updateChatMeta(chat.id, meta);
@@ -1648,6 +1683,11 @@ wss.on('connection', (ws) => {
     let userName = '';
     let currentAppUserId = '';
 
+    ws.isAlive = true;
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
@@ -1792,13 +1832,21 @@ wss.on('connection', (ws) => {
                                 return;
                             }
                             const actorFmt = getFormattedUser(currentAppUserId);
-                            const createdMsg = await insertSystemMessage(group, currentAppUserId, `${actorFmt.displayName} создал(а) чат`);
+                            const createdMsg = await insertSystemMessage(
+                                group,
+                                currentAppUserId,
+                                `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} создал(а) чат`
+                            );
                             if (createdMsg) {
                                 sendToManyUserSessions(group.members, { type: 'messenger-message', chatId: group.id, message: createdMsg });
                             }
                             for (const memberId of memberIds) {
                                 const targetFmt = getFormattedUser(memberId);
-                                const sys = await insertSystemMessage(group, currentAppUserId, `${actorFmt.displayName} добавил(а) ${targetFmt.displayName} в чат`);
+                                const sys = await insertSystemMessage(
+                                    group,
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} добавил(а) ${makeSystemUserTag(memberId, targetFmt.displayName)} в чат`
+                                );
                                 if (sys) {
                                     sendToManyUserSessions(group.members, { type: 'messenger-message', chatId: group.id, message: sys });
                                 }
@@ -1830,7 +1878,11 @@ wss.on('connection', (ws) => {
                                 }
                                 await messengerMysql.removeGroupMember(chat.id, currentAppUserId);
                                 chat = await messengerMysql.getChatById(chat.id);
-                                const msg = await insertSystemMessage({ ...chat, id: data.chatId, kind: 'group', members: [currentAppUserId, ...(chat?.members || [])] }, currentAppUserId, `${actorFmt.displayName} вышел(а) из чата`);
+                                const msg = await insertSystemMessage(
+                                    { ...chat, id: data.chatId, kind: 'group', members: [currentAppUserId, ...(chat?.members || [])] },
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вышел(а) из чата`
+                                );
                                 if (msg && chat) {
                                     sendToManyUserSessions([currentAppUserId, ...(chat.members || [])], { type: 'messenger-message', chatId: data.chatId, message: msg });
                                 }
@@ -1882,7 +1934,11 @@ wss.on('connection', (ws) => {
                                 await messengerMysql.updateGroupChatInfo(chat.id, patch);
                             }
                             chat = await messengerMysql.getChatById(chat.id);
-                            const msg = await insertSystemMessage(chat, currentAppUserId, `${actorFmt.displayName} обновил(а) информацию чата`);
+                            const msg = await insertSystemMessage(
+                                chat,
+                                currentAppUserId,
+                                `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} обновил(а) информацию чата`
+                            );
                             if (msg) {
                                 sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: msg });
                             }
@@ -1921,7 +1977,11 @@ wss.on('connection', (ws) => {
                             chat = await messengerMysql.getChatById(chat.id);
                             for (const memberId of addedIds) {
                                 const targetFmt = getFormattedUser(memberId);
-                                const sys = await insertSystemMessage(chat, currentAppUserId, `${actorFmt.displayName} добавил(а) ${targetFmt.displayName} в чат`);
+                                const sys = await insertSystemMessage(
+                                    chat,
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} добавил(а) ${makeSystemUserTag(memberId, targetFmt.displayName)} в чат`
+                                );
                                 if (sys) sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: sys });
                             }
                             await emitGroupChatUpdated(chat, 'group-members-added');
@@ -1957,8 +2017,8 @@ wss.on('connection', (ws) => {
                                 await messengerMysql.setGroupMemberRole(chat.id, targetUserId, nextRole);
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const text = nextRole === 'admin'
-                                    ? `${actorFmt.displayName} назначил(а) ${targetFmt.displayName} администратором`
-                                    : `${actorFmt.displayName} разжаловал(а) администратора ${targetFmt.displayName}`;
+                                    ? `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} назначил(а) ${makeSystemUserTag(targetUserId, targetFmt.displayName)} администратором`
+                                    : `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} разжаловал(а) администратора ${makeSystemUserTag(targetUserId, targetFmt.displayName)}`;
                                 const sys = await insertSystemMessage(chat, currentAppUserId, text);
                                 if (sys) sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: sys });
                                 await emitGroupChatUpdated(chat, 'group-role-updated');
@@ -1971,7 +2031,11 @@ wss.on('connection', (ws) => {
                             if (action === 'kick') {
                                 await messengerMysql.removeGroupMember(chat.id, targetUserId);
                                 chat = await messengerMysql.getChatById(chat.id);
-                                const sys = await insertSystemMessage({ ...chat, id: data.chatId, kind: 'group', members: [targetUserId, ...(chat?.members || [])] }, currentAppUserId, `${actorFmt.displayName} исключил(а) ${targetFmt.displayName} из чата`);
+                                const sys = await insertSystemMessage(
+                                    { ...chat, id: data.chatId, kind: 'group', members: [targetUserId, ...(chat?.members || [])] },
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} исключил(а) ${makeSystemUserTag(targetUserId, targetFmt.displayName)} из чата`
+                                );
                                 if (sys && chat) {
                                     sendToManyUserSessions([targetUserId, ...(chat.members || [])], { type: 'messenger-message', chatId: data.chatId, message: sys });
                                 }
@@ -2044,7 +2108,11 @@ wss.on('connection', (ws) => {
                                 await messengerMysql.addGroupMember(chat.id, currentAppUserId, 'member', currentAppUserId);
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const actorFmt = getFormattedUser(currentAppUserId);
-                                const sys = await insertSystemMessage(chat, currentAppUserId, `${actorFmt.displayName} присоединился(ась) по ссылке в чат`);
+                                const sys = await insertSystemMessage(
+                                    chat,
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} присоединился(ась) по ссылке в чат`
+                                );
                                 if (sys) sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: sys });
                                 await emitGroupChatUpdated(chat, 'group-joined-by-link');
                             }
