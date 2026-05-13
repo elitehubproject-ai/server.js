@@ -31,6 +31,7 @@ async function ensureTables() {
       username VARCHAR(64) NOT NULL DEFAULT '',
       display_name VARCHAR(200) NOT NULL DEFAULT '',
       avatar_url TEXT NOT NULL DEFAULT '',
+      cover_url TEXT NOT NULL DEFAULT '',
       password_hash TEXT,
       status VARCHAR(500) NOT NULL DEFAULT '',
       last_seen BIGINT NOT NULL DEFAULT 0,
@@ -134,10 +135,12 @@ async function ensureTables() {
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_see_stories VARCHAR(16) NOT NULL DEFAULT 'friends'`);
   await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_join_groups VARCHAR(16) NOT NULL DEFAULT 'friends'`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cover_url TEXT NOT NULL DEFAULT ''`);
 
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
   );
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique ON users (LOWER(username)) WHERE username <> ''`);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u1 ON chats(user1_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_u2 ON chats(user2_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chats_kind_updated ON chats(chat_kind, updated_at DESC)');
@@ -247,6 +250,7 @@ function rowToServerProfile(userId, userRow, settingsRow) {
     id: userId,
     name: userRow.display_name || '',
     avatar: userRow.avatar_url || '',
+    coverUrl: userRow.cover_url || '',
     username: userRow.username || '',
     statusText: userRow.status || '',
     blacklist: Array.isArray(bl) ? bl : [],
@@ -293,6 +297,7 @@ async function upsertProfile(userId, patch) {
   const merged = {
     name: patch.name != null ? patch.name : existing?.name || '',
     avatar: patch.avatar != null ? patch.avatar : existing?.avatar || '',
+    coverUrl: patch.coverUrl != null ? patch.coverUrl : existing?.coverUrl || '',
     username: patch.username != null ? patch.username : existing?.username || '',
     statusText: patch.statusText != null ? patch.statusText : existing?.statusText || '',
     blacklist: patch.blacklist != null ? patch.blacklist : existing?.blacklist || [],
@@ -302,12 +307,13 @@ async function upsertProfile(userId, patch) {
     lastSeenAt: patch.lastSeenAt != null ? patch.lastSeenAt : existing?.lastSeenAt || 0
   };
   await pool.query(
-    `INSERT INTO users (id, username, display_name, avatar_url, password_hash, status, last_seen, blacklist_json, blacklist_meta_json, friend_ids_json, online, updated_at)
-     VALUES ($1,$2,$3,$4,NULL,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11)
+    `INSERT INTO users (id, username, display_name, avatar_url, cover_url, password_hash, status, last_seen, blacklist_json, blacklist_meta_json, friend_ids_json, online, updated_at)
+     VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12)
      ON CONFLICT (id) DO UPDATE SET
        username = EXCLUDED.username,
        display_name = EXCLUDED.display_name,
        avatar_url = EXCLUDED.avatar_url,
+       cover_url = EXCLUDED.cover_url,
        status = EXCLUDED.status,
        last_seen = EXCLUDED.last_seen,
        blacklist_json = EXCLUDED.blacklist_json,
@@ -320,6 +326,7 @@ async function upsertProfile(userId, patch) {
       merged.username,
       merged.name,
       merged.avatar,
+      merged.coverUrl,
       merged.statusText,
       merged.lastSeenAt,
       JSON.stringify(merged.blacklist),
@@ -333,6 +340,24 @@ async function upsertProfile(userId, patch) {
     await upsertSettings(userId, patch.privacy);
   }
   return getProfile(userId);
+}
+
+async function isUsernameAvailable(username, excludeUserId = '') {
+  const normalized = String(username || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!normalized) return { ok: true, available: true, username: '' };
+  const exclude = String(excludeUserId || '').trim();
+  const { rows } = await pool.query(
+    'SELECT id FROM users WHERE LOWER(username) = $1 LIMIT 1',
+    [normalized]
+  );
+  if (!rows[0]) return { ok: true, available: true, username: normalized };
+  const ownerId = String(rows[0].id || '').trim();
+  return {
+    ok: true,
+    available: !!exclude && ownerId === exclude,
+    username: normalized,
+    ownerId
+  };
 }
 
 async function upsertSettings(userId, privacy) {
@@ -1141,6 +1166,7 @@ module.exports = {
   isEnabled,
   getProfile,
   upsertProfile,
+  isUsernameAvailable,
   upsertSettings,
   listAllUserIds,
   findDirectChat,
