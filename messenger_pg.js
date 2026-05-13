@@ -301,11 +301,12 @@ async function upsertProfile(userId, patch) {
     .toLowerCase()
     .replace(/[^a-z0-9_]/g, '')
     .slice(0, 32);
+  const finalUsername = normalizedUsername || fallbackUsername;
   const merged = {
     name: patch.name != null ? patch.name : existing?.name || '',
     avatar: patch.avatar != null ? patch.avatar : existing?.avatar || '',
     coverUrl: patch.coverUrl != null ? patch.coverUrl : existing?.coverUrl || '',
-    username: normalizedUsername || fallbackUsername,
+    username: finalUsername,
     statusText: patch.statusText != null ? patch.statusText : existing?.statusText || '',
     blacklist: patch.blacklist != null ? patch.blacklist : existing?.blacklist || [],
     blacklistMeta: patch.blacklistMeta != null ? patch.blacklistMeta : existing?.blacklistMeta || {},
