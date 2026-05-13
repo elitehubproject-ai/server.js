@@ -1720,7 +1720,8 @@ wss.on('connection', (ws) => {
                                 chat = await messengerMysql.getChatById(chatIdRequested);
                                 if (!chat || !Array.isArray(chat.members) || !chat.members.includes(currentAppUserId)) return;
                             } else {
-                                chat = await messengerMysql.findDirectChat(currentAppUserId, withUserId);
+                                // Для прямых чатов используем getOrCreateChat, чтобы гарантировать наличие записи
+                                chat = await messengerMysql.getOrCreateChat(currentAppUserId, withUserId);
                                 chatId = chat?.id || createDirectChatId(currentAppUserId, withUserId);
                                 if (!chatId) return;
                             }
