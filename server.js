@@ -139,7 +139,19 @@ function normalizeAccountId(value) {
 }
 
 function normalizeUsername(value) {
-    return typeof value === 'string' ? value.trim().replace(/^@+/, '').slice(0, 64) : '';
+    if (typeof value !== 'string') return '';
+    return value
+        .trim()
+        .replace(/^@+/, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, '')
+        .slice(0, 32);
+}
+
+function buildGeneratedUsername(accountId) {
+    const id = normalizeAccountId(accountId).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const suffix = (id.slice(-8) || '00000000').padStart(8, '0');
+    return `user${suffix}`.slice(0, 32);
 }
 
 function normalizeText(value, max = 4000) {
@@ -390,6 +402,9 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
               ? prev.friendIds
               : []
     };
+    if (!next.username) {
+        next.username = buildGeneratedUsername(userId);
+    }
     const saved = await messengerMysql.upsertProfile(userId, {
         name: next.name,
         avatar: next.avatar,
@@ -797,7 +812,8 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
                 username: '',
                 statusText: '',
                 online: false,
-                lastSeenAt: 0
+                lastSeenAt: 0,
+                canJoinGroups: 'friends'
             }
         };
     }
@@ -816,7 +832,8 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
                 coverUrl: fmtB.coverUrl || '',
                 username: fmtB.username,
                 statusText: target.blacklistMeta?.[viewerId] || 'Вас заблокировал этот аккаунт.',
-                online: !!target.online
+                online: !!target.online,
+                canJoinGroups: target.privacy?.canJoinGroups || 'friends'
             }
         };
     }
@@ -831,7 +848,8 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
                 coverUrl: '',
                 username: '',
                 statusText: 'Пользователь закрыл профиль от публичного доступа.',
-                online: false
+                online: false,
+                canJoinGroups: target.privacy?.canJoinGroups || 'friends'
             }
         };
     }
@@ -849,7 +867,8 @@ function buildProfileViewFor(viewerUserId, targetUserId) {
             username: fmt.username,
             statusText: target.statusText || '',
             online: !!target.online,
-            lastSeenAt: Number(target.lastSeenAt || 0)
+            lastSeenAt: Number(target.lastSeenAt || 0),
+            canJoinGroups: target.privacy?.canJoinGroups || 'friends'
         }
     };
 }
