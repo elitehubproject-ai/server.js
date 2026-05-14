@@ -165,6 +165,26 @@ async function ensureTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members(user_id, joined_at DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_chat_members_chat ON chat_members(chat_id, joined_at ASC)');
 
+  // Friendships table - replaces JSON storage
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS friendships (
+      id VARCHAR(100) PRIMARY KEY,
+      user1_id VARCHAR(120) NOT NULL,
+      user2_id VARCHAR(120) NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'accepted',
+      requested_by VARCHAR(120) NOT NULL DEFAULT '',
+      requested_at BIGINT NOT NULL DEFAULT 0,
+      accepted_at BIGINT NOT NULL DEFAULT 0,
+      created_at BIGINT NOT NULL DEFAULT 0,
+      CONSTRAINT friendships_status_chk CHECK (status IN ('requested','accepted','blocked')),
+      CONSTRAINT friendships_pair_uniq UNIQUE (user1_id, user2_id)
+    )
+  `);
+
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_friendships_user1 ON friendships(user1_id, status)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_friendships_user2 ON friendships(user2_id, status)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_friendships_status ON friendships(status, created_at DESC)');
+
   // Stories tables
   await pool.query(`
     CREATE TABLE IF NOT EXISTS stories (
@@ -1058,8 +1078,126 @@ async function getStoriesForUser(userId, viewerId = null) {
 }
 
 async function getUserFriends(userId) {
-  const profile = await getProfile(userId);
-  return profile?.friendIds || [];
+  const { rows } = await pool.query(
+    `SELECT DISTINCT CASE 
+      WHEN user1_id = $1 THEN user2_id 
+      ELSE user1_id 
+    END as friend_id
+     FROM friendships 
+     WHERE (user1_id = $1 OR user2_id = $1) AND status = 'accepted'`,
+    [userId]
+  );
+  return rows.map(r => r.friend_id).filter(Boolean);
+}
+
+async function addFriend(user1Id, user2Id) {
+  const [u1, u2] = sortedPair(user1Id, user2Id);
+  const id = `fr:${u1}::${u2}`;
+  const now = Date.now();
+  
+  await pool.query(
+    `INSERT INTO friendships (id, user1_id, user2_id, status, requested_by, requested_at, created_at)
+     VALUES ($1,$2,$3,'requested',$4,$5,$6)
+     ON CONFLICT (user1_id, user2_id) DO UPDATE SET
+       status = CASE WHEN status = 'blocked' THEN 'blocked' ELSE 'requested' END,
+       requested_by = EXCLUDED.requested_by,
+       requested_at = EXCLUDED.requested_at`,
+    [id, u1, u2, user1Id, now, now]
+  );
+  return { ok: true };
+}
+
+async function acceptFriend(user1Id, user2Id) {
+  const [u1, u2] = sortedPair(user1Id, user2Id);
+  const now = Date.now();
+  
+  await pool.query(
+    `UPDATE friendships 
+     SET status = 'accepted', accepted_at = $1
+     WHERE user1_id = $2 AND user2_id = $3 AND status = 'requested'`,
+    [now, u1, u2]
+  );
+  return { ok: true };
+}
+
+async function removeFriend(user1Id, user2Id) {
+  const [u1, u2] = sortedPair(user1Id, user2Id);
+  
+  await pool.query(
+    `DELETE FROM friendships 
+     WHERE user1_id = $1 AND user2_id = $2`,
+    [u1, u2]
+  );
+  return { ok: true };
+}
+
+async function blockUser(blockerId, blockedUserId) {
+  const [u1, u2] = sortedPair(blockerId, blockedUserId);
+  const id = `fr:${u1}::${u2}`;
+  const now = Date.now();
+  
+  await pool.query(
+    `INSERT INTO friendships (id, user1_id, user2_id, status, requested_by, created_at)
+     VALUES ($1,$2,$3,'blocked',$4,$5)
+     ON CONFLICT (user1_id, user2_id) DO UPDATE SET
+       status = 'blocked'`,
+    [id, u1, u2, blockerId, now]
+  );
+  return { ok: true };
+}
+
+async function unblockUser(blockerId, blockedUserId) {
+  const [u1, u2] = sortedPair(blockerId, blockedUserId);
+  
+  await pool.query(
+    `DELETE FROM friendships 
+     WHERE user1_id = $1 AND user2_id = $2 AND status = 'blocked'`,
+    [u1, u2]
+  );
+  return { ok: true };
+}
+
+async function getFriendshipStatus(user1Id, user2Id) {
+  const [u1, u2] = sortedPair(user1Id, user2Id);
+  
+  const { rows } = await pool.query(
+    `SELECT status, requested_by FROM friendships 
+     WHERE user1_id = $1 AND user2_id = $2`,
+    [u1, u2]
+  );
+  
+  if (!rows[0]) return null;
+  
+  return {
+    status: rows[0].status,
+    requestedBy: rows[0].requested_by,
+    isInitiator: rows[0].requested_by === user1Id
+  };
+}
+
+async function getFriendRequests(userId) {
+  const { rows } = await pool.query(
+    `SELECT CASE 
+      WHEN user1_id = $1 THEN user2_id 
+      ELSE user1_id 
+    END as user_id, requested_by, requested_at
+     FROM friendships 
+     WHERE (user1_id = $1 OR user2_id = $1) AND status = 'requested' AND requested_by != $1
+     ORDER BY requested_at DESC`,
+    [userId]
+  );
+  
+  const userIds = rows.map(r => r.user_id);
+  if (userIds.length === 0) return [];
+  
+  const profiles = await Promise.all(userIds.map(id => getProfile(id)));
+  return profiles.filter(Boolean).map((p, i) => ({
+    id: p.id,
+    name: p.name,
+    avatar: p.avatar,
+    username: p.username,
+    requestedAt: rows[i].requested_at
+  }));
 }
 
 async function addStoryView(storyId, viewerId) {
@@ -1242,6 +1380,15 @@ module.exports = {
   setUserOnlineFlags,
   directChatId,
   addMessageReadBy,
+  // Friendship functions
+  getUserFriends,
+  addFriend,
+  acceptFriend,
+  removeFriend,
+  blockUser,
+  unblockUser,
+  getFriendshipStatus,
+  getFriendRequests,
   // Story functions
   createStory,
   getStoryById,
@@ -1254,6 +1401,5 @@ module.exports = {
   getStoryViews,
   deleteStory,
   cleanupExpiredStories,
-  getActiveStoriesCount,
-  getUserFriends
+  getActiveStoriesCount
 };
