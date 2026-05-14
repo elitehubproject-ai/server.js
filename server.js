@@ -144,7 +144,7 @@ function normalizeUsername(value) {
         .trim()
         .replace(/^@+/, '')
         .toLowerCase()
-        .replace(/[^a-z0-9_]/g, '')
+        .replace(/[^a-z0-9]/g, '')
         .slice(0, 32);
 }
 
@@ -1794,6 +1794,10 @@ wss.on('connection', (ws) => {
                             let composeHint = '';
                             if (chatIdRequested) {
                                 chat = await messengerMysql.getChatById(chatIdRequested);
+                                if (!chat && withUserId && withUserId !== currentAppUserId) {
+                                    chat = await messengerMysql.getOrCreateChat(currentAppUserId, withUserId);
+                                    chatId = chat?.id || chatIdRequested;
+                                }
                                 if (!chat || !Array.isArray(chat.members) || !chat.members.includes(currentAppUserId)) return;
                             } else {
                                 // Для прямых чатов используем getOrCreateChat, чтобы гарантировать наличие записи
@@ -2241,6 +2245,9 @@ wss.on('connection', (ws) => {
                             let recipientUserId = toUserId;
                             if (chatIdRequested) {
                                 chat = await messengerMysql.getChatById(chatIdRequested);
+                                if (!chat && toUserId && toUserId !== currentAppUserId) {
+                                    chat = await messengerMysql.getOrCreateChat(currentAppUserId, toUserId);
+                                }
                                 if (!chat || !Array.isArray(chat.members) || !chat.members.includes(currentAppUserId)) return;
                                 if (chat.kind === 'group') {
                                     const gate = canSendToGroupChat(chat, currentAppUserId);
