@@ -1090,22 +1090,26 @@ async function getUserFriends(userId) {
   return rows.map(r => r.friend_id).filter(Boolean);
 }
 
-async function addFriend(user1Id, user2Id) {
-  const [u1, u2] = sortedPair(user1Id, user2Id);
-  const id = `fr:${u1}::${u2}`;
-  const now = Date.now();
-  
-  await pool.query(
-    `INSERT INTO friendships (id, user1_id, user2_id, status, requested_by, requested_at, created_at)
-     VALUES ($1,$2,$3,'requested',$4,$5,$6)
-     ON CONFLICT (user1_id, user2_id) DO UPDATE SET
-       status = CASE WHEN status = 'blocked' THEN 'blocked' ELSE 'requested' END,
-       requested_by = EXCLUDED.requested_by,
-       requested_at = EXCLUDED.requested_at`,
-    [id, u1, u2, user1Id, now, now]
-  );
-  return { ok: true };
-}
+ async function addFriend(user1Id, user2Id) {
+   const [u1, u2] = sortedPair(user1Id, user2Id);
+   const id = `fr:${u1}::${u2}`;
+   const now = Date.now();
+
+   await pool.query(
+     `INSERT INTO friendships (id, user1_id, user2_id, status, requested_by, requested_at, created_at)
+      VALUES ($1,$2,$3,'requested',$4,$5,$6)
+      ON CONFLICT (id) DO UPDATE SET
+        status = CASE 
+          WHEN friendships.status = 'blocked' THEN 'blocked' 
+          WHEN friendships.status = 'accepted' THEN 'accepted'  -- Keep accepted
+          ELSE 'requested' 
+        END,
+        requested_by = EXCLUDED.requested_by,
+        requested_at = EXCLUDED.requested_at`,
+     [id, u1, u2, user1Id, now, now]
+   );
+   return { ok: true };
+ }
 
 async function acceptFriend(user1Id, user2Id) {
   const [u1, u2] = sortedPair(user1Id, user2Id);
