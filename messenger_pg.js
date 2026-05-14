@@ -135,7 +135,24 @@ async function ensureTables() {
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_by JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_see_stories VARCHAR(16) NOT NULL DEFAULT 'friends'`);
   await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS who_can_join_groups VARCHAR(16) NOT NULL DEFAULT 'friends'`);
+  await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS ui_theme VARCHAR(16) NOT NULL DEFAULT 'classic'`);
+  await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS chat_wallpaper TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE settings ADD COLUMN IF NOT EXISTS chat_wallpaper_blur BOOLEAN NOT NULL DEFAULT true`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cover_url TEXT NOT NULL DEFAULT ''`);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'settings_theme_chk'
+      ) THEN
+        ALTER TABLE settings
+          ADD CONSTRAINT settings_theme_chk CHECK (ui_theme IN ('classic','dark'));
+      END IF;
+    END $$;
+  `);
 
   await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at) WHERE deleted_at = 0'
@@ -264,6 +281,11 @@ function rowToServerProfile(userId, userRow, settingsRow) {
       canViewProfile: settingsRow?.who_can_see_profile || 'all',
       canSeeStories: settingsRow?.who_can_see_stories || 'friends',
       canJoinGroups: settingsRow?.who_can_join_groups || 'friends'
+    },
+    appearance: {
+      theme: String(settingsRow?.ui_theme || '').trim() === 'dark' ? 'dark' : 'classic',
+      chatWallpaper: settingsRow?.chat_wallpaper || '',
+      chatWallpaperBlur: settingsRow?.chat_wallpaper_blur !== false
     }
   };
 }
@@ -278,7 +300,7 @@ function safeJson(s, def) {
 
 async function getSettingsRow(userId) {
   const { rows } = await pool.query(
-    'SELECT who_can_write, who_can_call, who_can_see_profile, who_can_see_stories, who_can_join_groups FROM settings WHERE user_id = $1 LIMIT 1',
+    'SELECT who_can_write, who_can_call, who_can_see_profile, who_can_see_stories, who_can_join_groups, ui_theme, chat_wallpaper, chat_wallpaper_blur FROM settings WHERE user_id = $1 LIMIT 1',
     [userId]
   );
   return rows[0] || null;
@@ -347,6 +369,9 @@ async function upsertProfile(userId, patch) {
   if (patch.privacy) {
     await upsertSettings(userId, patch.privacy);
   }
+  if (patch.appearance) {
+    await upsertAppearanceSettings(userId, patch.appearance);
+  }
   return getProfile(userId);
 }
 
@@ -384,6 +409,21 @@ async function upsertSettings(userId, privacy) {
        who_can_see_stories = EXCLUDED.who_can_see_stories,
        who_can_join_groups = EXCLUDED.who_can_join_groups`,
     [userId, w, c, p, s, g]
+  );
+}
+
+async function upsertAppearanceSettings(userId, appearance) {
+  const theme = String(appearance?.theme || '').trim() === 'dark' ? 'dark' : 'classic';
+  const chatWallpaper = typeof appearance?.chatWallpaper === 'string' ? String(appearance.chatWallpaper || '') : '';
+  const chatWallpaperBlur = appearance?.chatWallpaperBlur !== undefined ? !!appearance.chatWallpaperBlur : true;
+  await pool.query(
+    `INSERT INTO settings (user_id, ui_theme, chat_wallpaper, chat_wallpaper_blur)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (user_id) DO UPDATE SET
+       ui_theme = EXCLUDED.ui_theme,
+       chat_wallpaper = EXCLUDED.chat_wallpaper,
+       chat_wallpaper_blur = EXCLUDED.chat_wallpaper_blur`,
+    [userId, theme, chatWallpaper, chatWallpaperBlur]
   );
 }
 
