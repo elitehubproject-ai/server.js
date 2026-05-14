@@ -350,10 +350,27 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
             online: false,
             lastSeenAt: 0,
             privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' },
+            appearance: { theme: 'classic', chatWallpaper: '', chatWallpaperBlur: true },
             blacklist: [],
             blacklistMeta: {},
             friendIds: []
         };
+
+    const prevAppearance =
+        prev && typeof prev.appearance === 'object' && prev.appearance
+            ? prev.appearance
+            : { theme: 'classic', chatWallpaper: '', chatWallpaperBlur: true };
+    const appearancePatch =
+        profile && typeof profile.appearance === 'object' && profile.appearance
+            ? profile.appearance
+            : null;
+    const nextAppearance = appearancePatch
+        ? {
+              theme: String(appearancePatch.theme || prevAppearance.theme || 'classic').trim() === 'dark' ? 'dark' : 'classic',
+              chatWallpaper: typeof appearancePatch.chatWallpaper === 'string' ? String(appearancePatch.chatWallpaper || '').trim() : String(prevAppearance.chatWallpaper || '').trim(),
+              chatWallpaperBlur: appearancePatch.chatWallpaperBlur !== undefined ? !!appearancePatch.chatWallpaperBlur : (prevAppearance.chatWallpaperBlur !== false)
+          }
+        : prevAppearance;
 
     const next = {
         name: canOverwriteIdentity && profile?.name != null ? normalizeText(String(profile.name), 120) : prev.name,
@@ -385,6 +402,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
                     ? profile.privacy.canJoinGroups
                     : prev.privacy?.canJoinGroups || 'friends'
         },
+        appearance: nextAppearance,
         blacklist: Array.isArray(profile?.blacklist)
             ? profile.blacklist.map((v) => normalizeAccountId(v)).filter(Boolean)
             : Array.isArray(prev.blacklist)
@@ -405,7 +423,7 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
     if (!next.username) {
         next.username = buildGeneratedUsername(userId);
     }
-    const saved = await messengerMysql.upsertProfile(userId, {
+    const savePayload = {
         name: next.name,
         avatar: next.avatar,
         coverUrl: next.coverUrl,
@@ -417,7 +435,11 @@ async function upsertUserPresenceProfileMysql(appUserId, profile, options = {}) 
         online: next.online,
         lastSeenAt: next.lastSeenAt,
         privacy: next.privacy
-    });
+    };
+    if (appearancePatch) {
+        savePayload.appearance = next.appearance;
+    }
+    const saved = await messengerMysql.upsertProfile(userId, savePayload);
     messengerProfileMem.set(userId, saved);
 }
 
@@ -472,7 +494,8 @@ function getUserProfileFromFriendsStore(targetUserId) {
         lastSeenAt: 0,
         blacklist: [],
         blacklistMeta: {},
-        privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' }
+        privacy: { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' },
+        appearance: { theme: 'classic', chatWallpaper: '', chatWallpaperBlur: true }
     };
 }
 
@@ -1347,7 +1370,8 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
                   username: selfProfile.username || '',
                   statusText: selfProfile.statusText || '',
                   privacy: selfProfile.privacy || { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' },
-                  blacklist: Array.isArray(selfProfile.blacklist) ? selfProfile.blacklist : []
+                  blacklist: Array.isArray(selfProfile.blacklist) ? selfProfile.blacklist : [],
+                  appearance: selfProfile.appearance || { theme: 'classic', chatWallpaper: '', chatWallpaperBlur: true }
               }
             : null
     });
@@ -2750,6 +2774,40 @@ wss.on('connection', (ws) => {
                                 emitMessengerSync(peerId, 'peer-profile-updated');
                             }
                         }
+                    })();
+                    break;
+                case 'messenger-update-appearance':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) return;
+                        const appearancePatch = {};
+                        if (Object.prototype.hasOwnProperty.call(data, 'theme')) {
+                            appearancePatch.theme = String(data.theme || '').trim() === 'dark' ? 'dark' : 'classic';
+                        }
+                        if (Object.prototype.hasOwnProperty.call(data, 'chatWallpaper')) {
+                            const raw = typeof data.chatWallpaper === 'string' ? String(data.chatWallpaper || '').trim() : '';
+                            if (!raw) {
+                                appearancePatch.chatWallpaper = '';
+                            } else if (/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(raw) && raw.length <= 3500000) {
+                                appearancePatch.chatWallpaper = raw;
+                            } else {
+                                safeSend(ws, { type: 'messenger-error', code: 'wallpaper_invalid', message: 'Неверный формат обоев' });
+                                return;
+                            }
+                        }
+                        if (Object.prototype.hasOwnProperty.call(data, 'chatWallpaperBlur')) {
+                            appearancePatch.chatWallpaperBlur = !!data.chatWallpaperBlur;
+                        }
+                        if (!Object.keys(appearancePatch).length) return;
+                        await upsertUserPresenceProfileMysql(
+                            currentAppUserId,
+                            { appearance: appearancePatch },
+                            { overwriteExistingIdentity: false, overwriteExistingPrivacy: false }
+                        );
+                        emitMessengerSync(currentAppUserId, 'appearance-updated');
                     })();
                     break;
                 case 'messenger-check-username':
