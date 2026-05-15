@@ -12,6 +12,29 @@ function env(name, def = '') {
   return t.length ? t : def;
 }
 
+// Автоматический перезапуск подключения при падении
+let reconnectTimer = null;
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    console.log('[messenger_pg] attempting reconnect...');
+    try {
+      const ok = await initMessengerPostgres();
+      if (ok) {
+        console.log('[messenger_pg] reconnected OK');
+        // Сообщаем всем пользователям о готовности хранилища
+        try {
+          const { emitMessengerSync } = require('./server');
+          // emitMessengerSync будет вызван при успешном переподключении
+        } catch (_) {}
+      }
+    } catch (e) {
+      console.error('[messenger_pg] reconnect failed:', e && e.message);
+    }
+  }, 3000);
+}
+
 function sortedPair(a, b) {
   const x = String(a);
   const y = String(b);
@@ -241,9 +264,12 @@ async function initMessengerPostgres() {
   try {
     const poolOpts = {
       connectionString: conn,
-      max: Number(env('PG_POOL_MAX', '10')) || 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '20000')) || 20000
+      max: Number(env('PG_POOL_MAX', '5')) || 5,
+      idleTimeoutMillis: 15000,
+      connectionTimeoutMillis: Number(env('PG_CONNECT_TIMEOUT_MS', '15000')) || 15000,
+      // Автоматически переподключаться при разрыве
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000
     };
     if (env('DATABASE_SSL') === '0') {
       poolOpts.ssl = false;
@@ -254,6 +280,10 @@ async function initMessengerPostgres() {
       }
     }
     pool = new Pool(poolOpts);
+    // Обработчик ошибок пула — не падаем, а переподключаемся
+    pool.on('error', (err) => {
+      console.error('[messenger_pg] pool error:', err && err.message);
+    });
     await pool.query('SELECT 1');
     await ensureTables();
     enabled = true;
@@ -261,8 +291,9 @@ async function initMessengerPostgres() {
     return true;
   } catch (err) {
     console.error('[messenger_pg] init failed:', err && err.message);
+    scheduleReconnect();
     try {
-      if (pool) await pool.end();
+      if (pool) await pool.end().catch(() => {});
     } catch (_) {}
     pool = null;
     enabled = false;
