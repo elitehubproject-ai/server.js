@@ -333,6 +333,23 @@ async function getProfile(userId) {
   return rowToServerProfile(userId, userRow, s);
 }
 
+async function getProfileByUsername(username) {
+  const key = String(username || '')
+    .trim()
+    .replace(/^@+/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '')
+    .slice(0, 32);
+  if (!key) return null;
+  const { rows } = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1', [key]);
+  const userRow = rows[0] || null;
+  if (!userRow) return null;
+  const userId = String(userRow.id || '').trim();
+  if (!userId) return null;
+  const s = await getSettingsRow(userId);
+  return rowToServerProfile(userId, userRow, s);
+}
+
 async function upsertProfile(userId, patch) {
   const now = Date.now();
   const existing = await getProfile(userId);
@@ -535,6 +552,15 @@ function normalizeChatMeta(meta, kind = 'direct', ownerId = '') {
   return out;
 }
 
+function normalizeGroupMemberSettings(settings) {
+  const src = settings && typeof settings === 'object' ? settings : {};
+  const leftAt = Math.max(0, Number(src.leftAt || 0)) || 0;
+  return {
+    leftAt,
+    leftBySelf: !!src.leftBySelf
+  };
+}
+
 async function listGroupMembers(chatId) {
   const { rows } = await pool.query(
     `SELECT cm.chat_id, cm.user_id, cm.role, cm.joined_at, cm.invited_by, cm.settings_json,
@@ -557,21 +583,26 @@ async function listGroupMembers(chatId) {
       .toUpperCase();
     return letters || raw.slice(0, 2).toUpperCase();
   };
-  return rows.map((row) => ({
-    chatId: row.chat_id,
-    userId: row.user_id,
-    role: ['owner', 'admin', 'member'].includes(String(row.role || '')) ? row.role : 'member',
-    joinedAt: Number(row.joined_at) || 0,
-    invitedBy: row.invited_by || '',
-    settings: parseJsonCol(row.settings_json, {}),
-    displayName: row.display_name || row.user_id || '',
-    name: row.display_name || row.user_id || '',
-    avatar: row.avatar_url || '',
-    username: row.username || '',
-    initials: makeInitials(row.display_name, row.user_id),
-    online: !!row.online,
-    lastSeenAt: Number(row.last_seen) || 0
-  }));
+  return rows.map((row) => {
+    const settings = normalizeGroupMemberSettings(parseJsonCol(row.settings_json, {}));
+    return {
+      chatId: row.chat_id,
+      userId: row.user_id,
+      role: ['owner', 'admin', 'member'].includes(String(row.role || '')) ? row.role : 'member',
+      joinedAt: Number(row.joined_at) || 0,
+      invitedBy: row.invited_by || '',
+      settings,
+      leftAt: settings.leftAt,
+      isLeft: settings.leftAt > 0,
+      displayName: row.display_name || row.user_id || '',
+      name: row.display_name || row.user_id || '',
+      avatar: row.avatar_url || '',
+      username: row.username || '',
+      initials: makeInitials(row.display_name, row.user_id),
+      online: !!row.online,
+      lastSeenAt: Number(row.last_seen) || 0
+    };
+  });
 }
 
 async function findDirectChat(a, b) {
@@ -980,7 +1011,8 @@ async function addGroupMember(chatId, userId, role = 'member', invitedBy = '') {
      VALUES ($1,$2,$3,$4,$5,$6::jsonb)
      ON CONFLICT (chat_id, user_id) DO UPDATE SET
        role = EXCLUDED.role,
-       invited_by = EXCLUDED.invited_by`,
+       invited_by = EXCLUDED.invited_by,
+       settings_json = EXCLUDED.settings_json`,
     [chatId, String(userId || '').trim(), safeRole, now, String(invitedBy || '').trim(), JSON.stringify({})]
   );
   await touchChatUpdatedAt(chatId, now);
@@ -992,6 +1024,26 @@ async function setGroupMemberRole(chatId, userId, role) {
   await pool.query(
     'UPDATE chat_members SET role = $1 WHERE chat_id = $2 AND user_id = $3',
     [safeRole, chatId, String(userId || '').trim()]
+  );
+  await touchChatUpdatedAt(chatId);
+  return getChatById(chatId);
+}
+
+async function updateGroupMemberSettings(chatId, userId, settingsPatch) {
+  const normalizedUserId = String(userId || '').trim();
+  const { rows } = await pool.query(
+    'SELECT settings_json FROM chat_members WHERE chat_id = $1 AND user_id = $2 LIMIT 1',
+    [chatId, normalizedUserId]
+  );
+  if (!rows[0]) return getChatById(chatId);
+  const prev = normalizeGroupMemberSettings(parseJsonCol(rows[0].settings_json, {}));
+  const next = normalizeGroupMemberSettings({
+    ...prev,
+    ...(settingsPatch && typeof settingsPatch === 'object' ? settingsPatch : {})
+  });
+  await pool.query(
+    'UPDATE chat_members SET settings_json = $1::jsonb WHERE chat_id = $2 AND user_id = $3',
+    [JSON.stringify(next), chatId, normalizedUserId]
   );
   await touchChatUpdatedAt(chatId);
   return getChatById(chatId);
@@ -1039,6 +1091,22 @@ async function createStory(story) {
 async function getStoryById(storyId) {
   const { rows } = await pool.query('SELECT * FROM stories WHERE id = $1 LIMIT 1', [storyId]);
   return rows[0] ? rowToStory(rows[0]) : null;
+}
+
+async function listActiveStoriesForUser(userId) {
+  const now = Date.now();
+  const { rows } = await pool.query(
+    `SELECT * FROM stories WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at ASC`,
+    [userId, now]
+  );
+
+  const owner = await getProfile(userId);
+  return rows.map((row) => ({
+    ...rowToStory(row),
+    userDisplayName: owner?.displayName || owner?.name || userId,
+    userAvatar: owner?.avatar || '',
+    userInitials: owner?.initials || ''
+  }));
 }
 
 async function getStoriesForUser(userId, viewerId = null) {
@@ -1355,6 +1423,7 @@ module.exports = {
   initMessengerMysql,
   isEnabled,
   getProfile,
+  getProfileByUsername,
   upsertProfile,
   isUsernameAvailable,
   upsertSettings,
@@ -1370,6 +1439,7 @@ module.exports = {
   updateGroupChatInfo,
   addGroupMember,
   setGroupMemberRole,
+  updateGroupMemberSettings,
   removeGroupMember,
   updateLastMessagePreview,
   touchChatUpdatedAt,
@@ -1396,6 +1466,7 @@ module.exports = {
   // Story functions
   createStory,
   getStoryById,
+  listActiveStoriesForUser,
   getStoriesForUser,
   addStoryView,
   addStoryComment,
