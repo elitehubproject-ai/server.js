@@ -48,6 +48,15 @@ const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     if (!ok && needDb && exitOnFail) {
         process.exit(1);
     }
+    if (ok) {
+        setTimeout(() => {
+            try {
+                for (const uid of userSessions.keys()) {
+                    emitMessengerSync(uid, 'storage-ready');
+                }
+            } catch (_) {}
+        }, 0);
+    }
     return ok;
 }).catch((err) => {
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
@@ -63,11 +72,18 @@ console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || '30000') || 30000;
 setInterval(() => {
     try {
+        const now = Date.now();
         wss.clients.forEach((ws) => {
             if (!ws) return;
             if (ws.isAlive === false) {
-                try { ws.terminate(); } catch (_) {}
-                return;
+                const miss = Number(ws.__hbMiss || 0) + 1;
+                ws.__hbMiss = miss;
+                const lastSeenAt = Number(ws.__lastSeenAt || 0);
+                const stale = !lastSeenAt || (now - lastSeenAt) > Math.max(WS_HEARTBEAT_MS * 3, 60000);
+                if (miss >= 2 && stale) {
+                    try { ws.terminate(); } catch (_) {}
+                    return;
+                }
             }
             ws.isAlive = false;
             try { ws.ping(); } catch (_) {}
@@ -520,6 +536,22 @@ function areFriendsForMessenger(userA, userB) {
     return af.includes(b) || bf.includes(a);
 }
 
+function canViewerSeeStoriesOfOwner(ownerProfile, ownerId, viewerId) {
+    const policy = ownerProfile?.privacy?.canSeeStories || 'friends';
+    if (policy === 'all') return true;
+    if (policy === 'nobody') return false;
+    return areFriendsForMessenger(ownerId, viewerId);
+}
+
+function canViewerSeeStory(ownerProfile, ownerId, viewerId, storyPrivacy) {
+    if (String(ownerId || '') === String(viewerId || '')) return true;
+    if (!canViewerSeeStoriesOfOwner(ownerProfile, ownerId, viewerId)) return false;
+    const p = ['all', 'friends', 'nobody'].includes(storyPrivacy) ? storyPrivacy : 'friends';
+    if (p === 'all') return true;
+    if (p === 'nobody') return false;
+    return areFriendsForMessenger(ownerId, viewerId);
+}
+
 /** Кто может писать кому: ЧС с обеих сторон + политика получателя + друзья из friends_store / friendIds на сервере. */
 function directMessageGate(fromUserId, toUserId) {
     const fromId = normalizeAccountId(fromUserId);
@@ -648,19 +680,28 @@ function getGroupParticipantRole(chat, userId) {
     if (!chat || chat.kind !== 'group') return '';
     const uid = normalizeAccountId(userId);
     if (!uid) return '';
-    const participant = Array.isArray(chat.participants)
-        ? chat.participants.find((item) => normalizeAccountId(item?.userId) === uid)
-        : null;
-    return participant && typeof participant.role === 'string' ? participant.role : '';
+    const participant = getGroupParticipant(chat, uid);
+    if (!participant || participant.isLeft) return '';
+    return typeof participant.role === 'string' ? participant.role : '';
 }
 
 function getGroupParticipant(chat, userId) {
     if (!chat || chat.kind !== 'group') return null;
     const uid = normalizeAccountId(userId);
     if (!uid) return null;
-    return Array.isArray(chat.participants)
-        ? chat.participants.find((item) => normalizeAccountId(item?.userId) === uid) || null
+    const participant = Array.isArray(chat.participants)
+        ? chat.participants.find((item) => normalizeAccountId(item?.userId) === uid)
         : null;
+    return participant || null;
+}
+
+function buildGroupLeaveState(chat, userId) {
+    const participant = getGroupParticipant(chat, userId);
+    if (!participant || !participant.isLeft) return null;
+    return {
+        leftAt: Math.max(0, Number(participant.leftAt || participant.settings?.leftAt || 0)) || 0,
+        leftBySelf: participant.settings?.leftBySelf !== false
+    };
 }
 
 function groupRoleRank(role) {
@@ -750,6 +791,10 @@ function canUserBeAddedToGroup(actorUserId, targetUserId) {
 }
 
 function buildGroupRestriction(chat, userId) {
+    const leftState = buildGroupLeaveState(chat, userId);
+    if (leftState) {
+        return { type: 'left', ...leftState };
+    }
     const blocked = getGroupPenaltyState(chat?.meta?.blockedBy, userId);
     if (blocked && blocked.active) {
         return { type: 'banned', ...blocked };
@@ -766,6 +811,9 @@ function canSendToGroupChat(chat, userId) {
     if (!chat || chat.kind !== 'group' || !uid) return { ok: false, code: 'invalid' };
     if (!Array.isArray(chat.members) || !chat.members.includes(uid)) return { ok: false, code: 'not_member' };
     const restriction = buildGroupRestriction(chat, uid);
+    if (restriction?.type === 'left') {
+        return { ok: false, code: 'left', restriction };
+    }
     if (restriction?.type === 'banned') {
         return { ok: false, code: 'banned', restriction };
     }
@@ -777,6 +825,7 @@ function canSendToGroupChat(chat, userId) {
 
 function composeGroupWriteHint(gate) {
     if (!gate || gate.ok) return '';
+    if (gate.code === 'left') return 'Вы вышли из чата. Нажмите "Вернуться", чтобы снова писать';
     if (gate.code === 'muted') {
         const duration = gate.restriction?.forever ? 'навсегда' : formatPenaltyDuration(gate.restriction?.until);
         return `У вас мут в этом чате${duration ? `: ${duration}` : ''}`;
@@ -788,11 +837,12 @@ function composeGroupWriteHint(gate) {
 
 function groupStatusLine(chat) {
     if (!chat || chat.kind !== 'group') return '';
-    const count = Array.isArray(chat.members) ? chat.members.length : 0;
+    const activeParticipants = Array.isArray(chat.participants)
+        ? chat.participants.filter((item) => !item?.isLeft)
+        : [];
+    const count = activeParticipants.length;
     if (!count) return 'Групповой чат';
-    const modCount = Array.isArray(chat.participants)
-        ? chat.participants.filter((item) => item?.role === 'owner' || item?.role === 'admin').length
-        : 0;
+    const modCount = activeParticipants.filter((item) => item?.role === 'owner' || item?.role === 'admin').length;
     if (modCount > 1) return `${count} участников, ${modCount} админа`;
     if (modCount === 1) return `${count} участников, 1 админ`;
     return `${count} участников`;
@@ -932,6 +982,7 @@ async function buildChatListForUserMysql(appUserId) {
         }
         if (chat.kind === 'group') {
             const title = normalizeText(chat.title || 'Групповой чат', 220);
+            const leftState = buildGroupLeaveState(chat, userId);
             out.push({
                 id: chat.id,
                 kind: 'group',
@@ -942,7 +993,7 @@ async function buildChatListForUserMysql(appUserId) {
                     initials: computeUserInitials(title, title),
                     avatar: normalizeAvatarUrl(chat.avatar || ''),
                     username: '',
-                    statusText: groupStatusLine(chat),
+                    statusText: leftState ? 'Вы вышли из чата' : groupStatusLine(chat),
                     online: false,
                     lastSeenAt: 0
                 },
@@ -955,6 +1006,7 @@ async function buildChatListForUserMysql(appUserId) {
                     joinByLink: chat.meta?.joinByLink !== false,
                     permissions: chat.meta?.permissions || {},
                     restriction: buildGroupRestriction(chat, userId),
+                    leftState,
                     activeCall: serializeGroupCallState(chat.id),
                     members: Array.isArray(chat.members) ? [...chat.members] : [],
                     participants: Array.isArray(chat.participants) ? chat.participants : [],
@@ -1056,6 +1108,7 @@ function serializeGroupChatForClient(chat, viewerUserId = '') {
     const myId = normalizeAccountId(viewerUserId);
     const participants = Array.isArray(chat.participants) ? chat.participants : [];
     const restriction = buildGroupRestriction(chat, myId);
+    const leftState = buildGroupLeaveState(chat, myId);
     return {
         id: chat.id,
         kind: 'group',
@@ -1067,6 +1120,7 @@ function serializeGroupChatForClient(chat, viewerUserId = '') {
         joinByLink: chat.meta?.joinByLink !== false,
         permissions: chat.meta?.permissions || {},
         restriction,
+        leftState,
         activeCall: serializeGroupCallState(chat.id),
         members: Array.isArray(chat.members) ? [...chat.members] : [],
         myRole: getGroupParticipantRole(chat, myId),
@@ -1087,7 +1141,9 @@ function serializeGroupChatForClient(chat, viewerUserId = '') {
                 statusText: fmt.statusText || '',
                 online: !!fmt.online,
                 lastSeenAt: Number(fmt.lastSeenAt || 0),
-                restriction: participantRestriction
+                restriction: participantRestriction,
+                leftAt: Math.max(0, Number(participant?.leftAt || participant?.settings?.leftAt || 0)) || 0,
+                isLeft: !!participant?.isLeft
             };
         })
     };
@@ -1132,11 +1188,14 @@ async function insertSystemMessage(chat, actorUserId, text, extras = {}) {
 async function insertGroupEventBlock(chat, actorUserId, payload = {}) {
     if (!chat || !chat.id) return null;
     const actorId = normalizeAccountId(actorUserId);
+    const actorFmt = getFormattedUser(actorId);
     const createdAt = Date.now();
     const body = {
         type: payload.type || 'group-event',
         title: normalizeText(payload.title || '', 200),
         roomId: normalizeText(payload.roomId || '', 120),
+        actorUserId: actorId,
+        actorName: normalizeText(payload.actorName || actorFmt.displayName || '', 120),
         durationSec: Math.max(0, Number(payload.durationSec || 0)),
         participants: Array.isArray(payload.participants)
             ? payload.participants.slice(0, 4).map((item) => ({
@@ -1551,6 +1610,17 @@ function findParticipantIdByReconnectKey(room, reconnectKey) {
     return null;
 }
 
+function findParticipantIdByAppUserId(room, appUserId) {
+    if (!room || !appUserId) return null;
+    const aid = normalizeAccountId(appUserId);
+    if (!aid) return null;
+    for (const [id, participant] of room.participants.entries()) {
+        const pa = normalizeAccountId(participant?.appUserId || '');
+        if (pa && pa === aid) return id;
+    }
+    return null;
+}
+
 function isInvitedFriendForRoom(room, appUserId) {
     if (!room || !room.isFriendCall) return false;
     const invited = typeof room.friendTargetAppUserId === 'string' ? room.friendTargetAppUserId.trim() : '';
@@ -1744,17 +1814,23 @@ wss.on('connection', (ws) => {
     let currentAppUserId = '';
 
     ws.isAlive = true;
+    ws.__hbMiss = 0;
+    ws.__lastSeenAt = Date.now();
     ws.on('pong', () => {
         ws.isAlive = true;
+        ws.__hbMiss = 0;
+        ws.__lastSeenAt = Date.now();
     });
 
     ws.on('message', (message) => {
         try {
+            ws.__lastSeenAt = Date.now();
             const data = JSON.parse(message);
             const senderId = ws.__participantId || clientId;
 
             switch (data.type) {
                 case 'ping':
+                    ws.__hbMiss = 0;
                     safeSend(ws, { type: 'pong', ts: Date.now() });
                     break;
                 case 'messenger-register':
@@ -1819,15 +1895,18 @@ wss.on('connection', (ws) => {
                             if (chatIdRequested) {
                                 chat = await messengerMysql.getChatById(chatIdRequested);
                                 if (!chat && withUserId && withUserId !== currentAppUserId) {
-                                    chat = await messengerMysql.getOrCreateChat(currentAppUserId, withUserId);
-                                    chatId = chat?.id || chatIdRequested;
+                                    const computed = createDirectChatId(currentAppUserId, withUserId);
+                                    if (computed && computed !== chatIdRequested) {
+                                        chat = await messengerMysql.getChatById(computed);
+                                        chatId = chat?.id || chatIdRequested;
+                                    }
                                 }
-                                if (!chat || !Array.isArray(chat.members) || !chat.members.includes(currentAppUserId)) return;
+                                if (chat && (!Array.isArray(chat.members) || !chat.members.includes(currentAppUserId))) return;
                             } else {
-                                // Для прямых чатов используем getOrCreateChat, чтобы гарантировать наличие записи
-                                chat = await messengerMysql.getOrCreateChat(currentAppUserId, withUserId);
-                                chatId = chat?.id || createDirectChatId(currentAppUserId, withUserId);
+                                // ВАЖНО: не создаём запись чата при простом просмотре (иначе появляются "пустые" ЛС в сайдбаре).
+                                chatId = createDirectChatId(currentAppUserId, withUserId);
                                 if (!chatId) return;
+                                chat = await messengerMysql.getChatById(chatId);
                             }
                             const clearedAt = chat ? Number(chat.meta?.clearedBy?.[currentAppUserId] || 0) : 0;
                             const rawMsgs = chat ? await messengerMysql.listMessagesForChat(chat.id, clearedAt, 250) : [];
@@ -1933,26 +2012,49 @@ wss.on('connection', (ws) => {
                             const action = normalizeText(data.action || 'update', 40);
                             const actorFmt = getFormattedUser(currentAppUserId);
                             if (action === 'leave') {
-                                const myRole = getGroupParticipantRole(chat, currentAppUserId);
-                                if (myRole === 'owner' && chat.members.length > 1) {
-                                    const nextOwnerId = chat.members.find((uid) => uid !== currentAppUserId) || '';
-                                    if (nextOwnerId) {
-                                        await messengerMysql.setGroupMemberRole(chat.id, nextOwnerId, 'owner');
-                                    }
+                                const leftState = buildGroupLeaveState(chat, currentAppUserId);
+                                if (leftState) {
+                                    safeSend(ws, { type: 'messenger-group-left', chatId: data.chatId });
+                                    return;
                                 }
-                                await messengerMysql.removeGroupMember(chat.id, currentAppUserId);
+                                await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
+                                    leftAt: Date.now(),
+                                    leftBySelf: true
+                                });
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const msg = await insertSystemMessage(
-                                    { ...chat, id: data.chatId, kind: 'group', members: [currentAppUserId, ...(chat?.members || [])] },
+                                    chat,
                                     currentAppUserId,
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вышел(а) из чата`
                                 );
                                 if (msg && chat) {
-                                    sendToManyUserSessions([currentAppUserId, ...(chat.members || [])], { type: 'messenger-message', chatId: data.chatId, message: msg });
+                                    sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: data.chatId, message: msg });
                                 }
                                 if (chat) await emitGroupChatUpdated(chat, 'group-member-left');
                                 emitMessengerSync(currentAppUserId, 'group-left');
                                 safeSend(ws, { type: 'messenger-group-left', chatId: data.chatId });
+                                return;
+                            }
+                            if (action === 'rejoin') {
+                                await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
+                                    leftAt: 0,
+                                    leftBySelf: false
+                                });
+                                chat = await messengerMysql.getChatById(chat.id);
+                                const msg = await insertSystemMessage(
+                                    chat,
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вернулся(ась) в чат`
+                                );
+                                if (msg && chat) {
+                                    sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: msg });
+                                }
+                                if (chat) await emitGroupChatUpdated(chat, 'group-member-rejoined');
+                                emitMessengerSync(currentAppUserId, 'group-rejoined');
+                                safeSend(ws, {
+                                    type: 'messenger-group-joined',
+                                    chat: chat ? serializeGroupChatForClient(chat, currentAppUserId) : null
+                                });
                                 return;
                             }
                             const canEditInfo = hasGroupPermission(chat, currentAppUserId, 'editInfo');
@@ -2405,9 +2507,9 @@ wss.on('connection', (ws) => {
                                 toId: chat.kind === 'group' ? chat.id : recipientUserId,
                                 text:
                                     text ||
-                                    (isVoice ? 'Голосовое сообщение' : '') ||
-                                    (isImage ? '📷 Фото' : '') ||
-                                    (isVideo ? '🎬 Видео' : '') ||
+                                    (isVoice ? 'Голосовое' : '') ||
+                                    (isImage ? 'Фото' : '') ||
+                                    (isVideo ? 'Видео' : '') ||
                                     '',
                                 messageKind,
                                 audioMime: finalAudioMime,
@@ -2829,6 +2931,43 @@ wss.on('connection', (ws) => {
                         });
                     })();
                     break;
+                case 'messenger-resolve-username':
+                    if (!currentAppUserId) return;
+                    void (async () => {
+                        try {
+                            await mysqlBoot;
+                        } catch (_) {}
+                        if (!messengerMysql.isEnabled()) {
+                            safeSend(ws, { type: 'messenger-username-resolved', username: normalizeUsername(data.username || ''), userId: '', profile: null });
+                            return;
+                        }
+                        const uname = normalizeUsername(data.username || '');
+                        if (!uname) {
+                            safeSend(ws, { type: 'messenger-username-resolved', username: '', userId: '', profile: null });
+                            return;
+                        }
+                        let prof = null;
+                        try {
+                            prof = await messengerMysql.getProfileByUsername(uname);
+                        } catch (_) {}
+                        if (!prof?.id) {
+                            safeSend(ws, { type: 'messenger-username-resolved', username: uname, userId: '', profile: null });
+                            return;
+                        }
+                        messengerProfileMem.set(prof.id, prof);
+                        const displayName = normalizeText(prof.name || '', 220) || prof.id;
+                        const payload = {
+                            id: prof.id,
+                            name: displayName,
+                            displayName,
+                            avatar: normalizeAvatarUrl(prof.avatar || ''),
+                            initials: computeUserInitials(displayName, prof.id),
+                            username: normalizeUsername(prof.username || uname),
+                            statusText: normalizeText(prof.statusText || '', 220)
+                        };
+                        safeSend(ws, { type: 'messenger-username-resolved', username: uname, userId: prof.id, profile: payload });
+                    })();
+                    break;
                 case 'messenger-update-privacy':
                     if (!currentAppUserId) return;
                     void (async () => {
@@ -2921,8 +3060,19 @@ wss.on('connection', (ws) => {
                         
                         const targetUserId = normalizeAccountId(data.targetUserId);
                         if (!targetUserId) return;
-                        
-                        const stories = await messengerMysql.getStoriesForUser(targetUserId, currentAppUserId);
+
+                        let ownerProfile = getUserProfile(targetUserId);
+                        if (!ownerProfile) {
+                            try {
+                                ownerProfile = await messengerMysql.getProfile(targetUserId);
+                                if (ownerProfile) messengerProfileMem.set(targetUserId, ownerProfile);
+                            } catch (_) {}
+                        }
+
+                        const rawStories = await messengerMysql.listActiveStoriesForUser(targetUserId);
+                        const stories = rawStories.filter((story) => {
+                            return canViewerSeeStory(ownerProfile, targetUserId, currentAppUserId, String(story?.privacy || 'friends'));
+                        });
                         safeSend(ws, { 
                             type: 'messenger-stories', 
                             targetUserId,
@@ -2965,10 +3115,15 @@ wss.on('connection', (ws) => {
 
                         const story = await messengerMysql.getStoryById(storyId);
                         if (!story) return;
-                        const visibleStories = await messengerMysql.getStoriesForUser(story.userId, currentAppUserId);
-                        const canAccess = String(story.userId || '') === String(currentAppUserId || '')
-                            || visibleStories.some((item) => String(item.id || '') === storyId);
-                        if (!canAccess) {
+
+                        let ownerProfile = getUserProfile(story.userId);
+                        if (!ownerProfile) {
+                            try {
+                                ownerProfile = await messengerMysql.getProfile(story.userId);
+                                if (ownerProfile) messengerProfileMem.set(story.userId, ownerProfile);
+                            } catch (_) {}
+                        }
+                        if (!canViewerSeeStory(ownerProfile, story.userId, currentAppUserId, String(story.privacy || 'friends'))) {
                             safeSend(ws, { type: 'error', message: 'Доступ к истории запрещен' });
                             return;
                         }
@@ -2991,10 +3146,15 @@ wss.on('connection', (ws) => {
 
                         const story = await messengerMysql.getStoryById(storyId);
                         if (!story) return;
-                        const visibleStories = await messengerMysql.getStoriesForUser(story.userId, currentAppUserId);
-                        const canAccess = String(story.userId || '') === String(currentAppUserId || '')
-                            || visibleStories.some((item) => String(item.id || '') === storyId);
-                        if (!canAccess) {
+
+                        let ownerProfile = getUserProfile(story.userId);
+                        if (!ownerProfile) {
+                            try {
+                                ownerProfile = await messengerMysql.getProfile(story.userId);
+                                if (ownerProfile) messengerProfileMem.set(story.userId, ownerProfile);
+                            } catch (_) {}
+                        }
+                        if (!canViewerSeeStory(ownerProfile, story.userId, currentAppUserId, String(story.privacy || 'friends'))) {
                             safeSend(ws, { type: 'error', message: 'Доступ к истории запрещен' });
                             return;
                         }
@@ -3025,10 +3185,15 @@ wss.on('connection', (ws) => {
 
                         const story = await messengerMysql.getStoryById(storyId);
                         if (!story) return;
-                        const visibleStories = await messengerMysql.getStoriesForUser(story.userId, currentAppUserId);
-                        const canAccess = String(story.userId || '') === String(currentAppUserId || '')
-                            || visibleStories.some((item) => String(item.id || '') === storyId);
-                        if (!canAccess) {
+
+                        let ownerProfile = getUserProfile(story.userId);
+                        if (!ownerProfile) {
+                            try {
+                                ownerProfile = await messengerMysql.getProfile(story.userId);
+                                if (ownerProfile) messengerProfileMem.set(story.userId, ownerProfile);
+                            } catch (_) {}
+                        }
+                        if (!canViewerSeeStory(ownerProfile, story.userId, currentAppUserId, String(story.privacy || 'friends'))) {
                             safeSend(ws, { type: 'error', message: 'Доступ к истории запрещен' });
                             return;
                         }
@@ -3168,7 +3333,10 @@ wss.on('connection', (ws) => {
                         room.allowedAppUserIds = groupCallAllowedUserIds;
                     }
                     cancelRoomEmptyCleanup(currentRoom);
-                    const reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
+                    let reconnectTargetId = findParticipantIdByReconnectKey(room, reconnectKey);
+                    if (!reconnectTargetId && appUserId) {
+                        reconnectTargetId = findParticipantIdByAppUserId(room, appUserId);
+                    }
                     if (room.groupChatId && appUserId && Array.isArray(room.allowedAppUserIds) && room.allowedAppUserIds.length && !room.allowedAppUserIds.includes(appUserId) && !reconnectTargetId) {
                         safeSend(ws, { type: 'error', message: 'Этот групповой звонок доступен только участникам чата' });
                         return;
@@ -3196,6 +3364,21 @@ wss.on('connection', (ws) => {
                         }
                         const shouldQueueJoinRequest = !room.isFriendCall || !invitedFriend;
                         if (shouldQueueJoinRequest) {
+                            if (appUserId) {
+                                for (const [rid, req] of room.joinRequests.entries()) {
+                                    if (!req) continue;
+                                    const ra = normalizeAccountId(req.appUserId || '');
+                                    if (ra && ra === normalizeAccountId(appUserId)) {
+                                        room.joinRequests.delete(rid);
+                                        try {
+                                            if (req.ws && req.ws !== ws) {
+                                                req.ws.__superseded = true;
+                                                req.ws.close();
+                                            }
+                                        } catch (_) {}
+                                    }
+                                }
+                            }
                             const request = {
                                 id: clientId,
                                 ws,
