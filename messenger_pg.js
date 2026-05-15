@@ -889,11 +889,22 @@ async function getLatestMessageInChatAfter(chatId, clearedAfterTs = 0) {
 async function listMessagesForChat(chatId, clearedAfterTs = 0, limit = 500) {
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 2000);
   const cleared = Math.max(0, Number(clearedAfterTs) || 0);
-  const { rows } = await pool.query(
-    `SELECT * FROM messages WHERE chat_id = $1 AND deleted_at = 0 AND created_at >= $2 ORDER BY created_at ASC LIMIT $3`,
-    [chatId, cleared, lim]
-  );
-  return rows.map(rowToMessage);
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM messages WHERE chat_id = $1 AND deleted_at = 0 AND created_at >= $2 ORDER BY created_at ASC LIMIT $3`,
+      [chatId, cleared, lim]
+    );
+    return rows.map(rowToMessage);
+  } catch (err) {
+    console.error('[messenger_pg] listMessagesForChat error:', err && err.message);
+    // При разрыве соединения пробуем переподключиться и повторить один раз
+    if (pool && pool.query.length > 0) {
+      try { await pool.end().catch(() => {}); } catch (_) {}
+      pool = null;
+      scheduleReconnect();
+    }
+    return [];
+  }
 }
 
 async function getMessageById(id) {
@@ -948,16 +959,21 @@ async function updateMessageFields(id, patch) {
 }
 
 async function getChatById(chatId) {
-  const { rows } = await pool.query(
-    `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
-            chat_kind, title, description, avatar_url, invite_code, created_by
-     FROM chats
-     WHERE id = $1
-     LIMIT 1`,
-    [chatId]
-  );
-  if (!rows[0]) return null;
-  return hydrateChat(rowToChat(rows[0]));
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, user1_id, user2_id, last_message_id, last_message_preview, updated_at, meta_json,
+              chat_kind, title, description, avatar_url, invite_code, created_by
+       FROM chats
+       WHERE id = $1
+       LIMIT 1`,
+      [chatId]
+    );
+    if (!rows[0]) return null;
+    return hydrateChat(rowToChat(rows[0]));
+  } catch (err) {
+    console.error('[messenger_pg] getChatById error:', err && err.message);
+    return null;
+  }
 }
 
 async function getGroupChatByInviteCode(inviteCode) {
