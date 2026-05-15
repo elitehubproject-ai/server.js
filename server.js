@@ -4,6 +4,17 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
+// Увеличиваем лимит памяти для обработки больших медиа (видео/фото) и предотвращения OOM
+try {
+  const maxHeap = parseInt(process.env.NODE_MAX_HEAP_MB || '0', 10);
+  if (maxHeap > 0) {
+    const flag = `--max-old-space-size=${maxHeap}`;
+    if (!process.env.NODE_OPTIONS || !process.env.NODE_OPTIONS.includes(flag)) {
+      process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS || ''} ${flag}`.trim();
+    }
+  }
+} catch (_) {}
+
 // Увеличиваем лимит памяти для обработки больших медиа (видео/фото)
 try {
   const maxHeap = parseInt(process.env.NODE_MAX_HEAP_MB || '0', 10);
@@ -50,7 +61,7 @@ const messengerMysql = require('./messenger_pg');
 const durakEngine = require('./durak_engine');
 // Для медиа-сообщений ограничиваем длину base64-строки на сервере.
 // Ориентир: 50MB файл => ~67MB base64 символов.
-const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '75000000');
+const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '50000000');
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
@@ -2353,8 +2364,18 @@ wss.on('connection', (ws) => {
                             try {
                                 await mysqlBoot;
                             } catch (_) {}
-                            if (messengerMysql.isEnabled()) {
+                            if (!messengerMysql.isEnabled()) {
+                                safeSend(ws, {
+                                    type: 'messenger-error',
+                                    code: 'storage_unavailable',
+                                    message: 'Messenger недоступен (нет PostgreSQL / DATABASE_URL)'
+                                });
+                                return;
+                            }
+                            try {
                                 await upsertUserPresenceProfileMysql(currentAppUserId, { friendIds: ids });
+                            } catch (err) {
+                                console.error('[messenger] upsert friends error:', err && err.message);
                             }
                         })();
                     }
