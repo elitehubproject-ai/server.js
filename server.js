@@ -91,6 +91,14 @@ const messengerProfileMem = new Map();
 
 console.log(`✅ WebSocket server running on ws://0.0.0.0:${PORT}`);
 
+// Глобальный обработчик необработанных отклонений — не падаем, только логируем
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+
 const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || '30000') || 30000;
 setInterval(() => {
     try {
@@ -1429,33 +1437,43 @@ async function emitMessengerSyncAsync(appUserId, reason = 'update') {
         });
         return;
     }
-    await ensureProfilesLoaded(id);
-    let selfProfile = getUserProfile(id);
-    if (!selfProfile) {
+    try {
+        await ensureProfilesLoaded(id);
+        let selfProfile = getUserProfile(id);
+        if (!selfProfile) {
+            try {
+                selfProfile = await messengerMysql.getProfile(id);
+                if (selfProfile) messengerProfileMem.set(id, selfProfile);
+            } catch (_) {}
+        }
+        const chats = await buildChatListForUserMysql(id);
+        sendToUserSessions(id, {
+            type: 'messenger-sync',
+            reason,
+            userId: id,
+            chats,
+            selfProfile: selfProfile
+                ? {
+                      name: selfProfile.name || '',
+                      avatar: selfProfile.avatar || '',
+                      coverUrl: selfProfile.coverUrl || '',
+                      username: selfProfile.username || '',
+                      statusText: selfProfile.statusText || '',
+                      privacy: selfProfile.privacy || { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' },
+                      blacklist: Array.isArray(selfProfile.blacklist) ? selfProfile.blacklist : [],
+                      appearance: selfProfile.appearance || { theme: 'classic', chatWallpaper: '', chatWallpaperBlur: true }
+                  }
+                : null
+        });
+    } catch (err) {
+        console.error('[messenger] emitMessengerSyncAsync error:', err && err.message);
+        // При ошибке БД пробуем переподключиться
         try {
-            selfProfile = await messengerMysql.getProfile(id);
-            if (selfProfile) messengerProfileMem.set(id, selfProfile);
+            if (messengerMysql && messengerMysql.scheduleReconnect) {
+                messengerMysql.scheduleReconnect();
+            }
         } catch (_) {}
     }
-    const chats = await buildChatListForUserMysql(id);
-    sendToUserSessions(id, {
-        type: 'messenger-sync',
-        reason,
-        userId: id,
-        chats,
-        selfProfile: selfProfile
-            ? {
-                  name: selfProfile.name || '',
-                  avatar: selfProfile.avatar || '',
-                  coverUrl: selfProfile.coverUrl || '',
-                  username: selfProfile.username || '',
-                  statusText: selfProfile.statusText || '',
-                  privacy: selfProfile.privacy || { canWrite: 'all', canCall: 'all', canViewProfile: 'all', canSeeStories: 'friends', canJoinGroups: 'friends' },
-                  blacklist: Array.isArray(selfProfile.blacklist) ? selfProfile.blacklist : [],
-                  appearance: selfProfile.appearance || { theme: 'classic', chatWallpaper: '', chatWallpaperBlur: true }
-              }
-            : null
-    });
 }
 
 function sanitizeIceServer(item) {
