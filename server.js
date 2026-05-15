@@ -2459,7 +2459,7 @@ wss.on('connection', (ws) => {
                                     };
                                 }
                             }
-                            const forwardCloningAllowed = !!forwardOriginal && !isVoice && !isImage && !isVideo;
+                            const forwardCloningAllowed = !!forwardOriginal;
                             if (!text && !isVoice && !isImage && !isVideo && !forwardCloningAllowed) return;
                             const mimeRaw = typeof data.mimeType === 'string' ? data.mimeType : 'audio/webm';
                             const mimeNorm = String(mimeRaw || '').split(';')[0].trim();
@@ -2482,17 +2482,17 @@ wss.on('connection', (ws) => {
                             if (forwardCloningAllowed && forwardOriginal) {
                                 if (!text) text = normalizeText(forwardOriginal.text || '', 4000);
                                 const okKind = String(forwardOriginal.messageKind || '').trim();
-                                if (okKind === 'voice' && forwardOriginal.audioBase64) {
-                                    messageKind = 'voice';
+                                if ((okKind === 'voice' || !finalAudioBase64) && forwardOriginal.audioBase64) {
+                                    if (!finalAudioBase64) messageKind = 'voice';
                                     finalAudioBase64 = String(forwardOriginal.audioBase64 || '');
                                     finalAudioMime = String(forwardOriginal.audioMime || 'audio/webm').slice(0, 80);
                                     finalDurationMs = Math.min(600000, Math.max(0, Number(forwardOriginal.durationMs || 0)));
-                                } else if (okKind === 'image' && forwardOriginal.imageBase64) {
-                                    messageKind = 'image';
+                                } else if ((okKind === 'image' || !finalImageBase64) && forwardOriginal.imageBase64) {
+                                    if (!finalImageBase64) messageKind = 'image';
                                     finalImageBase64 = String(forwardOriginal.imageBase64 || '');
                                     finalImageMime = String(forwardOriginal.mimeType || forwardOriginal.imageMime || 'image/jpeg').slice(0, 80);
-                                } else if ((okKind === 'video' || okKind === 'video_note') && forwardOriginal.videoBase64) {
-                                    messageKind = 'video';
+                                } else if ((okKind === 'video' || okKind === 'video_note' || !finalVideoBase64) && forwardOriginal.videoBase64) {
+                                    if (!finalVideoBase64) messageKind = 'video';
                                     finalVideoBase64 = String(forwardOriginal.videoBase64 || '');
                                     finalVideoMime = String(forwardOriginal.videoMime || 'video/mp4').slice(0, 80);
                                 }
