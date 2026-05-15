@@ -1145,34 +1145,42 @@ async function getStoryById(storyId) {
 
 async function listActiveStoriesForUser(userId) {
   const now = Date.now();
-  const { rows } = await pool.query(
-    `SELECT * FROM stories WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at ASC`,
-    [userId, now]
-  );
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM stories WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at ASC`,
+      [userId, now]
+    );
 
-  const owner = await getProfile(userId);
-  return rows.map((row) => ({
-    ...rowToStory(row),
-    userDisplayName: owner?.displayName || owner?.name || userId,
-    userAvatar: owner?.avatar || '',
-    userInitials: owner?.initials || ''
-  }));
+    const owner = await getProfile(userId);
+    return rows.map((row) => ({
+      ...rowToStory(row),
+      userDisplayName: owner?.displayName || owner?.name || userId,
+      userAvatar: owner?.avatar || '',
+      userInitials: owner?.initials || ''
+    }));
+  } catch (err) {
+    console.error('[messenger_pg] listActiveStoriesForUser error:', err && err.message);
+    if (pool) { try { await pool.end().catch(() => {}); } catch (_) {} pool = null; }
+    scheduleReconnect();
+    return [];
+  }
 }
 
 async function getStoriesForUser(userId, viewerId = null) {
   const now = Date.now();
-  const { rows } = await pool.query(
-    `SELECT * FROM stories WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at ASC`,
-    [userId, now]
-  );
-  
-  const owner = await getProfile(userId);
-  const stories = rows.map(row => ({
-    ...rowToStory(row),
-    userDisplayName: owner?.displayName || owner?.name || userId,
-    userAvatar: owner?.avatar || '',
-    userInitials: owner?.initials || ''
-  }));
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM stories WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at ASC`,
+      [userId, now]
+    );
+    
+    const owner = await getProfile(userId);
+    const stories = rows.map(row => ({
+      ...rowToStory(row),
+      userDisplayName: owner?.displayName || owner?.name || userId,
+      userAvatar: owner?.avatar || '',
+      userInitials: owner?.initials || ''
+    }));
   
   // Filter by privacy if viewer is specified
   if (viewerId && viewerId !== userId) {
@@ -1192,7 +1200,13 @@ async function getStoriesForUser(userId, viewerId = null) {
     });
   }
   
-  return stories;
+   return stories;
+  } catch (err) {
+    console.error('[messenger_pg] getStoriesForUser error:', err && err.message);
+    if (pool) { try { await pool.end().catch(() => {}); } catch (_) {} pool = null; }
+    scheduleReconnect();
+    return [];
+  }
 }
 
 async function getUserFriends(userId) {
