@@ -249,6 +249,9 @@ async function initMessengerPostgres() {
       poolOpts.ssl = false;
     } else if (/sslmode=require|sslmode=verify-full/i.test(conn) || env('PG_SSL') === '1') {
       poolOpts.ssl = { rejectUnauthorized: env('PG_SSL_REJECT_UNAUTHORIZED') === '1' };
+      if (!poolOpts.ssl.rejectUnauthorized && !poolOpts.ssl.ca) {
+        poolOpts.ssl = { rejectUnauthorized: false };
+      }
     }
     pool = new Pool(poolOpts);
     await pool.query('SELECT 1');
