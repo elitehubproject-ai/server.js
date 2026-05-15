@@ -4,6 +4,17 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
+// Увеличиваем лимит памяти для обработки больших медиа (видео/фото)
+try {
+  const maxHeap = parseInt(process.env.NODE_MAX_HEAP_MB || '0', 10);
+  if (maxHeap > 0) {
+    const flag = `--max-old-space-size=${maxHeap}`;
+    if (!process.env.NODE_OPTIONS || !process.env.NODE_OPTIONS.includes(flag)) {
+      process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS || ''} ${flag}`.trim();
+    }
+  }
+} catch (_) {}
+
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const DEFAULT_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
