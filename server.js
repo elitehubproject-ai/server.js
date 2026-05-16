@@ -2136,10 +2136,22 @@ wss.on('connection', (ws) => {
                                 return;
                             }
                             if (action === 'rejoin') {
+                                // Восстанавливаем участника
+                                const meta = chat.meta || {};
+                                const prevOwnerId = meta.previousOwnerId || '';
+                                const isRestoringOwner = prevOwnerId === currentAppUserId;
                                 await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
                                     leftAt: 0,
-                                    leftBySelf: false
+                                    leftBySelf: false,
+                                    role: isRestoringOwner ? 'owner' : 'member'
                                 });
+                                // Очищаем previousOwnerId после восстановления
+                                if (isRestoringOwner) {
+                                    delete meta.previousOwnerId;
+                                    try {
+                                        await messengerMysql.updateGroupChatMeta(chat.id, meta);
+                                    } catch (_) {}
+                                }
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const msg = await insertSystemMessage(
                                     chat,
