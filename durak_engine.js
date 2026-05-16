@@ -623,8 +623,7 @@ function canNeighborTossDuringDefend(game, pid) {
   if (!getDoneEligiblePids(game).includes(pid)) return false;
   const block = b.tossBlockPid;
   if (block && block === pid) return false;
-  syncMaxTableCardsFromDefenderHand(game);
-  return maxTossAllowed(game) > 0;
+  return true;
 }
 
 function getNeighborTossEligiblePids(game) {
@@ -1229,6 +1228,9 @@ function processAction(game, pid, action) {
       if (parsed.length !== cardIds.length) return { ok: false, error: 'Неверная карта' };
       const rank0 = parsed[0].rank;
       if (!parsed.every((p) => p.rank === rank0)) return { ok: false, error: 'Одинаковый ранг' };
+      // When attacking multiple cards as a single action, remove cards first
+      // then re-sync the cap (since dHand changed), so the computed true limit
+      // — not the pre-removal stale limit — governs this and every following toss.
       const removed = [];
       for (const cid of cardIds) {
         if (!removeCardFromHand(game.hands, pid, cid)) {
@@ -1239,8 +1241,16 @@ function processAction(game, pid, action) {
         removed.push(cid);
       }
       b.leadingRank = rank0;
+      syncMaxTableCardsFromDefenderHand(game);
+      const cardCap = b.maxAttackCards || Number.MAX_SAFE_INTEGER;
+      if (removed.length > cardCap) {
+        // Throwback removed cards because they would exceed the defender's actual capacity
+        for (const r of removed) game.hands.get(pid).push(r);
+        game.hands.set(pid, sortHand(game.hands.get(pid), game.trump));
+        return { ok: false, error: 'Превышен лимит карт в отбое' };
+      }
       if (!b.table.length) b.firstAttackerPid = pid;
-      for (const cid of cardIds) {
+      for (const cid of removed) {
         b.table.push({ attack: cid, defense: null, beatType: 'attack', transferStack: [] });
       }
       b.tossBlockPid = null;
