@@ -2106,8 +2106,8 @@ wss.on('connection', (ws) => {
                                 return;
                             }
                             if (action === 'removeSelf') {
-                                // Выход из чата — удаляем из активных участников, но сохраняем роль владельца в БД
-                                // Если был владельцем — передаём владельца другому
+                                // Выход из чата — только отмечаем leftAt, НЕ удаляем из участников
+                                // Владелец остаётся владельцем, просто уходит неактивным
                                 const isOwner = getGroupParticipantRole(chat, currentAppUserId) === 'owner';
                                 await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
                                     leftAt: Date.now(),
@@ -2120,14 +2120,6 @@ wss.on('connection', (ws) => {
                                         metaToUpdate.previousOwnerId = currentAppUserId;
                                         await messengerMysql.updateGroupChatMeta(chat.id, metaToUpdate);
                                     } catch (_) {}
-                                }
-                                // Если был владельцем — назначаем нового владельца или оставляем старого
-                                if (isOwner) {
-                                    chat = await messengerMysql.getChatById(chat.id);
-                                    const remaining = (chat?.members || []).filter(uid => uid !== currentAppUserId);
-                                    if (remaining.length > 0) {
-                                        await messengerMysql.updateGroupMemberSettings(chat.id, remaining[0], { role: 'owner' });
-                                    }
                                 }
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const msg = await insertSystemMessage(
