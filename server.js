@@ -124,13 +124,6 @@ async function pgKeepalive() {
   } catch (_) {}
 }
 
-// Периодически пингуем PostgreSQL каждые 30 секунд
-if (process.env.RENDER && pool) {
-  setInterval(() => {
-    void pgKeepalive();
-  }, 30000);
-}
-
 if (process.env.RENDER || process.env.NODE_ENV === 'production' || !process.env.LOCAL_DEV) {
   setInterval(forceGcIfNeeded, 30000);
   setTimeout(forceGcIfNeeded, 5000);
