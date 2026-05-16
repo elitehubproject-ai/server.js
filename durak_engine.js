@@ -322,7 +322,7 @@ function checkGameEnd(game) {
   }
   const active = game.players.filter((pid) => (game.hands.get(pid) || []).length > 0);
   const empty = game.players.filter((pid) => (game.hands.get(pid) || []).length === 0);
-  if (active.length <= 1) {
+  if (active.length <= 1 && game.stockEmpty) {
     game.winnerId = empty.length ? empty[empty.length - 1] : active[0] || null;
     game.phase = 'ended';
     game.turnDeadline = 0;
@@ -501,29 +501,20 @@ function battleAttackCardsCap(game, defenderIdx) {
   return Math.max(1, Math.min(hardCap, handN, unbeatenCardsOnTable));
 }
 
-/** Лимит карт в текущем отбое: min(5|6, рука защитника). Обновлять при смене защитника (перевод). */
+/** Лимит карт в текущем отборе: защитник может отбить максимум столько, сколько у него в руке. */
 function syncMaxTableCardsFromDefenderHand(game) {
   const b = game.battle;
   if (!b) return;
   const dPid = game.players[game.defenderIndex];
   const dHand = (game.hands.get(dPid) || []).length;
-  
+
   if (game.firstDealRules) {
-    // Pervyy otboy: zashitnik mozhet otbit' ne bol'she chem min(5, dHand) kart
-    const hardCap = 5;
-    const maxDefendable = Math.min(hardCap, dHand);
-    
-    // Uchityvaem tol'ko NE OTBITYE karty na stole
-    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
-    
-    // MaxAttackCards - eto maksimalnoe kolichestvo kart, kotorye mogut byt' na stole v otboe
-    // Ne bol'she chem maxDefendable (skol'ko zashitnik mozhet otbit')
-    b.maxAttackCards = Math.max(1, Math.min(maxDefendable, unbeatenOnTable + maxDefendable));
+    // Первый отбор: не более min(5, карт в руке защитника)
+    const hardCap = Math.min(5, dHand);
+    b.maxAttackCards = Math.max(1, hardCap);
   } else {
-    // Posleduyushchiy otboy: zashitnik mozhet otbit' stol'ko kart, skol'ko u nego v ruke
-    // NO ne bol'she chem uzhe NE OTBITYkh kart na stole + novye podkidnye
-    const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
-    b.maxAttackCards = Math.max(1, Math.min(dHand, unbeatenOnTable + dHand));
+    // Последующие отборы: не более количества карт у защитника
+    b.maxAttackCards = Math.max(1, dHand);
   }
 }
 
@@ -1292,16 +1283,22 @@ function processAction(game, pid, action) {
       if (!removeCardFromHand(game.hands, pid, cardId)) return { ok: false, error: 'Нет карты' };
 
       const applyTransfer = (row) => {
-        b.tossBlockPid = null;
-        ensureTransferStack(row);
-        row.transferStack.push({ card: cardId, defense: null });
-        row.beatType = 'transfer';
-        let ni = nextIndex(game.defenderIndex, n);
+        // Проверяем, что у следующего защитника достаточно карт для отбоя
+        const ni = nextIndex(game.defenderIndex, n);
         let steps = 0;
         while (steps < n && (game.hands.get(game.players[ni]) || []).length === 0) {
           ni = nextIndex(ni, n);
           steps++;
         }
+        const nextDefenderCardsCount = (game.hands.get(game.players[ni]) || []).length;
+        const unbeatenOnTable = countUnbeatenAttackSlotsOnTable(b);
+        if (nextDefenderCardsCount < unbeatenOnTable) {
+          return { ok: false, error: 'У следующего защитника слишком мало карт для отбоя' };
+        }
+        b.tossBlockPid = null;
+        ensureTransferStack(row);
+        row.transferStack.push({ card: cardId, defense: null });
+        row.beatType = 'transfer';
         game.defenderIndex = ni;
         b.defenderPid = game.players[game.defenderIndex];
         b.attackerPid = game.players[game.attackerIndex];
