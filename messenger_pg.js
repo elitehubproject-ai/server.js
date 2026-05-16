@@ -288,6 +288,16 @@ async function initMessengerPostgres() {
     await ensureTables();
     enabled = true;
     console.log('[messenger_pg] connected (PostgreSQL)');
+    
+    // Периодически пингуем PostgreSQL, чтобы не разрывало при простое (Render free tier)
+    if (process.env.RENDER && pool) {
+      setInterval(() => {
+        pool.query('SELECT 1').catch(() => {
+          // Игнорируем ошибки пинга — переподключение будет при следующем запросе
+        });
+      }, 30000);
+    }
+    
     return true;
   } catch (err) {
     console.error('[messenger_pg] init failed:', err && err.message);
