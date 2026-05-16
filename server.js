@@ -61,7 +61,7 @@ const messengerMysql = require('./messenger_pg');
 const durakEngine = require('./durak_engine');
 // Для медиа-сообщений ограничиваем длину base64-строки на сервере.
 // Ориентир: 50MB файл => ~67MB base64 символов.
-const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '50000000');
+const MAX_MEDIA_B64_LEN = Number(process.env.MAX_MEDIA_B64_LEN || '25000000');
 const mysqlBoot = messengerMysql.initMessengerMysql().then((ok) => {
     console.log('[messenger] storage backend:', ok ? 'postgres' : 'unavailable');
     const e = (k) => (process.env[k] != null && String(process.env[k]).trim() !== '' ? String(process.env[k]).trim() : '');
@@ -98,6 +98,43 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err && err.stack ? err.stack : err);
 });
+
+// Если на Render, периодически принудительно очищаем память и держим PostgreSQL Alive
+function forceGcIfNeeded() {
+  try {
+    // На Render свободной памяти обычно много, общее ограничение ~1 GB
+    const used = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (used > 400) { // Если используем больше 400 MB — срочно чистим
+      console.warn(`[oom] High memory: ${Math.round(used)}MB, forcing cleanup...`);
+      global.gc && global.gc();
+      // Чистим кэш профилям — они часто занимают много
+      messengerProfileMem.clear();
+      // Чищаем пул PostgreSQL, чтобы не держать лишние соединения
+      if (pool && typeof pool.drain === 'function') {
+        try { pool.drain(); } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+
+// Держим PostgreSQL соединение активным, чтобы не разрывалось при простое (Render)
+async function pgKeepalive() {
+  try {
+    await messengerMysql.query('SELECT 1');
+  } catch (_) {}
+}
+
+// Периодически пингуем PostgreSQL каждые 30 секунд
+if (process.env.RENDER && pool) {
+  setInterval(() => {
+    void pgKeepalive();
+  }, 30000);
+}
+
+if (process.env.RENDER || process.env.NODE_ENV === 'production' || !process.env.LOCAL_DEV) {
+  setInterval(forceGcIfNeeded, 30000);
+  setTimeout(forceGcIfNeeded, 5000);
+}
 
 const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || '30000') || 30000;
 setInterval(() => {
@@ -2075,6 +2112,44 @@ wss.on('connection', (ws) => {
                                 safeSend(ws, { type: 'messenger-group-left', chatId: data.chatId });
                                 return;
                             }
+                            if (action === 'removeSelf') {
+                                // Выход из чата — удаляем из активных участников, но сохраняем роль владельца в БД
+                                // Если был владельцем — передаём владельца другому
+                                const isOwner = getGroupParticipantRole(chat, currentAppUserId) === 'owner';
+                                await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
+                                    leftAt: Date.now(),
+                                    leftBySelf: true
+                                });
+                                // Запоминаем, что пользователь был владельцем — для восстановления роли при возврате
+                                if (isOwner) {
+                                    try {
+                                        const metaToUpdate = { ...(chat.meta || {}) };
+                                        metaToUpdate.previousOwnerId = currentAppUserId;
+                                        await messengerMysql.updateGroupChatMeta(chat.id, metaToUpdate);
+                                    } catch (_) {}
+                                }
+                                // Если был владельцем — назначаем нового владельца или оставляем старого
+                                if (isOwner) {
+                                    chat = await messengerMysql.getChatById(chat.id);
+                                    const remaining = (chat?.members || []).filter(uid => uid !== currentAppUserId);
+                                    if (remaining.length > 0) {
+                                        await messengerMysql.updateGroupMemberSettings(chat.id, remaining[0], { role: 'owner' });
+                                    }
+                                }
+                                chat = await messengerMysql.getChatById(chat.id);
+                                const msg = await insertSystemMessage(
+                                    chat,
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вышел(а) из чата`
+                                );
+                                if (msg && chat) {
+                                    sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: data.chatId, message: msg });
+                                }
+                                if (chat) await emitGroupChatUpdated(chat, 'group-member-left');
+                                emitMessengerSync(currentAppUserId, 'group-left');
+                                safeSend(ws, { type: 'messenger-group-left', chatId: data.chatId });
+                                return;
+                            }
                             if (action === 'rejoin') {
                                 await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
                                     leftAt: 0,
@@ -2311,7 +2386,18 @@ wss.on('connection', (ws) => {
                                 return;
                             }
                             if (!chat.members.includes(currentAppUserId)) {
-                                await messengerMysql.addGroupMember(chat.id, currentAppUserId, 'member', currentAppUserId);
+                                // Проверяем, был ли пользователь владельцем раньше (при выходе записываем в meta)
+                                const meta = chat.meta || {};
+                                const prevOwnerId = meta.previousOwnerId || '';
+                                const role = (prevOwnerId === currentAppUserId) ? 'owner' : 'member';
+                                await messengerMysql.addGroupMember(chat.id, currentAppUserId, role, currentAppUserId);
+                                // Очищаем previousOwnerId после восстановления
+                                if (role === 'owner') {
+                                    delete meta.previousOwnerId;
+                                    try {
+                                        await messengerMysql.updateGroupChatMeta(chat.id, meta);
+                                    } catch (_) {}
+                                }
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const actorFmt = getFormattedUser(currentAppUserId);
                                 const sys = await insertSystemMessage(
