@@ -2180,10 +2180,23 @@ wss.on('connection', (ws) => {
                                     leftAt: Date.now(),
                                     leftBySelf: true
                                 });
+                                await messengerMysql.updateChatMeta(chat.id, {
+                                    ...(chat.meta || {}),
+                                    removedBy: {
+                                        ...((chat.meta && chat.meta.removedBy) || {}),
+                                        [currentAppUserId]: true
+                                    }
+                                });
                                 // Запоминаем, что пользователь был владельцем — для восстановления роли при возврате
                                 if (isOwner) {
                                     try {
-                                        const metaToUpdate = { ...(chat.meta || {}) };
+                                        const metaToUpdate = {
+                                            ...(chat.meta || {}),
+                                            removedBy: {
+                                                ...((chat.meta && chat.meta.removedBy) || {}),
+                                                [currentAppUserId]: true
+                                            }
+                                        };
                                         metaToUpdate.previousOwnerId = currentAppUserId;
                                         await messengerMysql.updateGroupChatMeta(chat.id, metaToUpdate);
                                     } catch (_) {}
