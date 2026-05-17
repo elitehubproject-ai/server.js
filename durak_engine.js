@@ -118,6 +118,7 @@ function createEmptyGame(mode) {
     finishOrder: [],
     winnerId: null,
     turnDeadline: 0,
+    resultDeadline: 0,
     turnSeconds: 60,
     lobbyDeadline: 0,
     lobbyAutoSec: 60,
@@ -323,10 +324,13 @@ function checkGameEnd(game) {
   const active = game.players.filter((pid) => (game.hands.get(pid) || []).length > 0);
   const empty = game.players.filter((pid) => (game.hands.get(pid) || []).length === 0);
   if (active.length <= 1 && game.stockEmpty) {
-    game.winnerId = empty.length ? empty[empty.length - 1] : active[0] || null;
-    game.phase = 'ended';
-    game.turnDeadline = 0;
-    game.version++;
+    if (game.phase !== 'showdown') {
+      game.winnerId = empty.length ? empty[empty.length - 1] : active[0] || null;
+      game.phase = 'showdown';
+      game.turnDeadline = 0;
+      game.resultDeadline = Date.now() + 30000;
+      game.version++;
+    }
     return true;
   }
   return false;
@@ -621,8 +625,6 @@ function canNeighborTossDuringDefend(game, pid) {
   const defPid = game.players[game.defenderIndex];
   if (pid === defPid) return false;
   if (!getDoneEligiblePids(game).includes(pid)) return false;
-  const block = b.tossBlockPid;
-  if (block && block === pid) return false;
   return true;
 }
 
@@ -646,10 +648,7 @@ function applyTossPlay(game, pid, cardIds, fromTakeToss) {
     }
     removed.push(cid);
   }
-  const allNeighbors = defenderNeighborPids(game);
-  // Blokiruem tol'ko esli vsego odin sosed (igra 2kh igrokov)
-  // Inache oba soseda mogut podkinut' karty
-  b.tossBlockPid = allNeighbors.length === 1 ? allNeighbors[0] : null;
+  b.tossBlockPid = null;
   for (const cid of cardIds) {
     b.table.push({
       attack: cid,
@@ -953,6 +952,7 @@ function exportGamePublic(game, viewerId) {
     stockEmpty: game.stockEmpty,
     winnerId: game.winnerId,
     turnDeadline: game.turnDeadline,
+    resultDeadline: game.resultDeadline || 0,
     turnSeconds: game.turnSeconds,
     lobbyDeadline: game.lobbyDeadline,
     cardPack: game.cardPack || 'classic',
@@ -1029,6 +1029,7 @@ function endGameByModerator(game) {
   game.phase = 'ended';
   game.winnerId = null;
   game.turnDeadline = 0;
+  game.resultDeadline = 0;
   game.version++;
   return { ok: true };
 }
@@ -1107,6 +1108,7 @@ function endGameTooFewPlayers(game) {
   game.phase = 'ended';
   game.winnerId = game.players.length === 1 ? game.players[0] : null;
   game.turnDeadline = 0;
+  game.resultDeadline = 0;
   game.lastPlay = null;
   if (game.battle) {
     game.battle.table = [];
@@ -1134,6 +1136,7 @@ function playingLeave(game, pid) {
     game.phase = 'ended';
     game.winnerId = null;
     game.turnDeadline = 0;
+    game.resultDeadline = 0;
     game.version++;
     return { ok: true, empty: true };
   }
@@ -1176,6 +1179,7 @@ function playingLeave(game, pid) {
 function processAction(game, pid, action) {
   const type = action?.type;
   if (game.phase === 'lobby') return { ok: false, error: 'Игра не началась' };
+  if (game.phase === 'showdown') return { ok: false, error: 'Итог партии уже показан' };
   if (game.phase === 'ended') return { ok: false, error: 'Игра окончена' };
   if (game.phase === 'playing' && game.players.length < 2) {
     endGameTooFewPlayers(game);
@@ -1391,6 +1395,19 @@ function processAction(game, pid, action) {
 }
 
 function tickTurnTimer(game) {
+  if (game.phase === 'showdown') {
+    if (!game.resultDeadline || Date.now() < game.resultDeadline) return null;
+    game.phase = 'ended';
+    game.turnDeadline = 0;
+    game.resultDeadline = 0;
+    game.lastPlay = null;
+    if (game.battle) {
+      game.battle.table = [];
+      game.battle.subPhase = 'attack';
+    }
+    game.version++;
+    return { ok: true, ended: true, clear: true };
+  }
   if (game.phase !== 'playing') return null;
   if (game.players.length < 2) {
     endGameTooFewPlayers(game);
