@@ -1052,9 +1052,16 @@ async function buildChatListForUserMysql(appUserId) {
         const removed = !!chat.meta?.removedBy?.[userId];
         if (removed) continue;
         const clearedAt = Number(chat.meta?.clearedBy?.[userId] || 0);
+        const leftState = chat.kind === 'group' ? buildGroupLeaveState(chat, userId) : null;
+        const frozenAt = Math.max(0, Number(leftState?.frozenAt || leftState?.leftAt || 0)) || 0;
         let lastMessage = null;
         const cached = chat.lastMessage;
-        if (cached && cached.id && Number(cached.createdAt || cached.at || 0) >= clearedAt) {
+        if (
+            cached
+            && cached.id
+            && Number(cached.createdAt || cached.at || 0) >= clearedAt
+            && (!frozenAt || Number(cached.createdAt || cached.at || 0) <= frozenAt)
+        ) {
             lastMessage = {
                 id: cached.id,
                 text: cached.text || '',
@@ -1065,7 +1072,11 @@ async function buildChatListForUserMysql(appUserId) {
                 audioBase64: cached.audioBase64 || ''
             };
         } else {
-            const last = await messengerMysql.getLatestMessageInChatAfter(chat.id, clearedAt);
+            const last = frozenAt
+                ? (await messengerMysql.listMessagesForChat(chat.id, clearedAt, 500))
+                    .filter((msg) => Number(msg?.createdAt || 0) <= frozenAt)
+                    .slice(-1)[0]
+                : await messengerMysql.getLatestMessageInChatAfter(chat.id, clearedAt);
             if (last) {
                 lastMessage = {
                     id: last.id,
@@ -1080,7 +1091,6 @@ async function buildChatListForUserMysql(appUserId) {
         }
         if (chat.kind === 'group') {
             const title = normalizeText(chat.title || 'Групповой чат', 220);
-            const leftState = buildGroupLeaveState(chat, userId);
             out.push({
                 id: chat.id,
                 kind: 'group',
@@ -1110,7 +1120,9 @@ async function buildChatListForUserMysql(appUserId) {
                     participants: Array.isArray(chat.participants) ? chat.participants : [],
                     myRole: getGroupParticipantRole(chat, userId)
                 },
-                updatedAt: Number(chat.updatedAt || chat.createdAt || Date.now()),
+                updatedAt: frozenAt
+                    ? Math.min(Number(chat.updatedAt || chat.createdAt || Date.now()), frozenAt)
+                    : Number(chat.updatedAt || chat.createdAt || Date.now()),
                 lastMessage
             });
             continue;
@@ -2034,7 +2046,6 @@ wss.on('connection', (ws) => {
                                 ...(chat && Array.isArray(chat.members) ? chat.members : [withUserId]),
                                 ...rawMsgs.map((m) => m.fromId).filter(Boolean)
                             );
-                            const messages = rawMsgs.map(enrichMessageWithSender);
                             if (chat && chat.kind === 'group') {
                                 const gate = canSendToGroupChat(chat, currentAppUserId);
                                 composeBlocked = !gate.ok;
@@ -2050,6 +2061,7 @@ wss.on('connection', (ws) => {
                                 composeBlocked = !gate.ok;
                                 composeHint = composeHintFromGate(gate);
                             }
+                            const messages = rawMsgs.map(enrichMessageWithSender);
                             safeSend(ws, {
                                 type: 'messenger-chat-history',
                                 chatId,
