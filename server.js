@@ -760,8 +760,46 @@ function buildGroupLeaveState(chat, userId) {
     if (!participant || !participant.isLeft) return null;
     return {
         leftAt: Math.max(0, Number(participant.leftAt || participant.settings?.leftAt || 0)) || 0,
-        leftBySelf: participant.settings?.leftBySelf !== false
+        leftBySelf: participant.settings?.leftBySelf !== false,
+        frozenAt: Math.max(0, Number(participant.leftAt || participant.settings?.leftAt || 0)) || 0
     };
+}
+
+function getGroupParticipantStoredRole(chat, userId) {
+    const participant = getGroupParticipant(chat, userId);
+    if (!participant) return '';
+    return typeof participant.role === 'string' ? participant.role : '';
+}
+
+function isChatRemovedForUser(chat, userId) {
+    const uid = normalizeAccountId(userId);
+    if (!chat || !uid) return false;
+    return !!chat.meta?.removedBy?.[uid];
+}
+
+function canReceiveGroupLiveEvents(chat, userId, options = {}) {
+    const uid = normalizeAccountId(userId);
+    if (!chat || chat.kind !== 'group' || !uid) return false;
+    if (!Array.isArray(chat.members) || !chat.members.includes(uid)) return false;
+    if (isChatRemovedForUser(chat, uid)) return false;
+    if (options.includeUserId && uid === normalizeAccountId(options.includeUserId)) return true;
+    return !buildGroupLeaveState(chat, uid);
+}
+
+function listGroupLiveRecipientIds(chat, options = {}) {
+    if (!chat || chat.kind !== 'group' || !Array.isArray(chat.members)) return [];
+    return chat.members.filter((uid) => canReceiveGroupLiveEvents(chat, uid, options));
+}
+
+async function clearChatRemovedFlagForUser(chat, userId) {
+    const uid = normalizeAccountId(userId);
+    if (!chat || !uid || !chat.meta?.removedBy?.[uid]) return chat;
+    const meta = { ...(chat.meta || {}) };
+    const nextRemovedBy = { ...(meta.removedBy || {}) };
+    delete nextRemovedBy[uid];
+    meta.removedBy = nextRemovedBy;
+    await messengerMysql.updateChatMeta(chat.id, meta);
+    return messengerMysql.getChatById(chat.id);
 }
 
 function groupRoleRank(role) {
@@ -1183,7 +1221,7 @@ function serializeGroupChatForClient(chat, viewerUserId = '') {
         leftState,
         activeCall: serializeGroupCallState(chat.id),
         members: Array.isArray(chat.members) ? [...chat.members] : [],
-        myRole: getGroupParticipantRole(chat, myId),
+        myRole: getGroupParticipantStoredRole(chat, myId),
         participants: participants.map((participant) => {
             const userId = normalizeAccountId(participant?.userId);
             const fmt = getFormattedUser(userId);
@@ -1299,14 +1337,15 @@ async function insertGroupEventBlock(chat, actorUserId, payload = {}) {
 async function emitGroupChatUpdated(chat, reason = 'group-updated') {
     if (!chat || chat.kind !== 'group' || !Array.isArray(chat.members)) return;
     await ensureProfilesLoaded(...chat.members);
-    chat.members.forEach((uid) => {
+    const liveRecipients = listGroupLiveRecipientIds(chat);
+    liveRecipients.forEach((uid) => {
         sendToUserSessions(uid, {
             type: 'messenger-group-updated',
             reason,
             chat: serializeGroupChatForClient(chat, uid)
         });
     });
-    chat.members.forEach((uid) => emitMessengerSync(uid, reason));
+    liveRecipients.forEach((uid) => emitMessengerSync(uid, reason));
 }
 
 async function sendGroupChatPayloadUpdate(chatId, reason = 'group-updated') {
@@ -1432,10 +1471,10 @@ async function finalizeGroupCallRoom(room, closedById = '', closedByName = '') {
             participants: participantUsers
         });
         if (endBlock) {
-            sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: endBlock });
+            sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: endBlock });
         }
         await emitGroupChatUpdated(chat, 'group-call-ended');
-        sendToManyUserSessions(chat.members || [], {
+        sendToManyUserSessions(listGroupLiveRecipientIds(chat), {
             type: 'messenger-group-call-ended',
             chatId: chat.id,
             roomId: room.id,
@@ -1663,9 +1702,13 @@ function tickDurakRooms() {
         if (g.phase === 'lobby') {
             const started = durakEngine.lobbyTick(g);
             if (started && started.ok) broadcastDurak(room);
-        } else if (g.phase === 'playing') {
+        } else if (g.phase === 'playing' || g.phase === 'showdown') {
             const t = durakEngine.tickTurnTimer(g);
-            if (t && t.ok) broadcastDurak(room);
+            if (t && t.ok) {
+                if (t.clear) room.durak = null;
+                broadcastDurak(room);
+                if (t.clear) broadcastRoomState(room);
+            }
         }
     });
 }
@@ -1979,7 +2022,7 @@ wss.on('connection', (ws) => {
                                 chat = await messengerMysql.getChatById(chatId);
                             }
                             const clearedAt = chat ? Number(chat.meta?.clearedBy?.[currentAppUserId] || 0) : 0;
-                            const rawMsgs = chat ? await messengerMysql.listMessagesForChat(chat.id, clearedAt, 250) : [];
+                            let rawMsgs = chat ? await messengerMysql.listMessagesForChat(chat.id, clearedAt, 250) : [];
                             await ensureProfilesLoaded(
                                 currentAppUserId,
                                 ...(chat && Array.isArray(chat.members) ? chat.members : [withUserId]),
@@ -1990,6 +2033,12 @@ wss.on('connection', (ws) => {
                                 const gate = canSendToGroupChat(chat, currentAppUserId);
                                 composeBlocked = !gate.ok;
                                 composeHint = composeGroupWriteHint(gate);
+                                if (gate.code === 'left') {
+                                    const frozenAt = Number(gate.restriction?.leftAt || gate.restriction?.frozenAt || 0);
+                                    if (frozenAt > 0) {
+                                        rawMsgs = rawMsgs.filter((msg) => Number(msg?.createdAt || 0) <= frozenAt);
+                                    }
+                                }
                             } else {
                                 const gate = directMessageGate(currentAppUserId, withUserId);
                                 composeBlocked = !gate.ok;
@@ -2051,7 +2100,7 @@ wss.on('connection', (ws) => {
                                 `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} создал(а) чат`
                             );
                             if (createdMsg) {
-                                sendToManyUserSessions(group.members, { type: 'messenger-message', chatId: group.id, message: createdMsg });
+                                sendToManyUserSessions(listGroupLiveRecipientIds(group), { type: 'messenger-message', chatId: group.id, message: createdMsg });
                             }
                             for (const memberId of memberIds) {
                                 const targetFmt = getFormattedUser(memberId);
@@ -2061,10 +2110,10 @@ wss.on('connection', (ws) => {
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} добавил(а) ${makeSystemUserTag(memberId, targetFmt.displayName)} в чат`
                                 );
                                 if (sys) {
-                                    sendToManyUserSessions(group.members, { type: 'messenger-message', chatId: group.id, message: sys });
+                                    sendToManyUserSessions(listGroupLiveRecipientIds(group), { type: 'messenger-message', chatId: group.id, message: sys });
                                 }
                             }
-                            sendToManyUserSessions(group.members, { type: 'messenger-group-created', chat: serializeGroupChatForClient(group, currentAppUserId) });
+                            sendToManyUserSessions(listGroupLiveRecipientIds(group), { type: 'messenger-group-created', chat: serializeGroupChatForClient(group, currentAppUserId) });
                             group.members.forEach((uid) => emitMessengerSync(uid, 'group-created'));
                         })();
                     }
@@ -2098,7 +2147,7 @@ wss.on('connection', (ws) => {
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вышел(а) из чата`
                                 );
                                 if (msg && chat) {
-                                    sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: data.chatId, message: msg });
+                                    sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: data.chatId, message: msg });
                                 }
                                 if (chat) await emitGroupChatUpdated(chat, 'group-member-left');
                                 emitMessengerSync(currentAppUserId, 'group-left');
@@ -2128,7 +2177,7 @@ wss.on('connection', (ws) => {
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вышел(а) из чата`
                                 );
                                 if (msg && chat) {
-                                    sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: data.chatId, message: msg });
+                                    sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: data.chatId, message: msg });
                                 }
                                 if (chat) await emitGroupChatUpdated(chat, 'group-member-left');
                                 emitMessengerSync(currentAppUserId, 'group-left');
@@ -2152,6 +2201,7 @@ wss.on('connection', (ws) => {
                                         await messengerMysql.updateGroupChatMeta(chat.id, meta);
                                     } catch (_) {}
                                 }
+                                chat = await clearChatRemovedFlagForUser(chat, currentAppUserId);
                                 chat = await messengerMysql.getChatById(chat.id);
                                 const msg = await insertSystemMessage(
                                     chat,
@@ -2159,7 +2209,7 @@ wss.on('connection', (ws) => {
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вернулся(ась) в чат`
                                 );
                                 if (msg && chat) {
-                                    sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: msg });
+                                    sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: msg });
                                 }
                                 if (chat) await emitGroupChatUpdated(chat, 'group-member-rejoined');
                                 emitMessengerSync(currentAppUserId, 'group-rejoined');
@@ -2218,7 +2268,7 @@ wss.on('connection', (ws) => {
                                 `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} обновил(а) информацию чата`
                             );
                             if (msg) {
-                                sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: msg });
+                                sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: msg });
                             }
                             await emitGroupChatUpdated(chat, 'group-updated');
                         })();
@@ -2260,7 +2310,7 @@ wss.on('connection', (ws) => {
                                     currentAppUserId,
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} добавил(а) ${makeSystemUserTag(memberId, targetFmt.displayName)} в чат`
                                 );
-                                if (sys) sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: sys });
+                                if (sys) sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: sys });
                             }
                             await emitGroupChatUpdated(chat, 'group-members-added');
                         })();
@@ -2298,7 +2348,7 @@ wss.on('connection', (ws) => {
                                     ? `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} назначил(а) ${makeSystemUserTag(targetUserId, targetFmt.displayName)} администратором`
                                     : `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} разжаловал(а) администратора ${makeSystemUserTag(targetUserId, targetFmt.displayName)}`;
                                 const sys = await insertSystemMessage(chat, currentAppUserId, text);
-                                if (sys) sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: sys });
+                                if (sys) sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: sys });
                                 await emitGroupChatUpdated(chat, 'group-role-updated');
                                 return;
                             }
@@ -2358,7 +2408,7 @@ wss.on('connection', (ws) => {
                                 type: 'messenger-group-invite-preview',
                                 inviteCode,
                                 chat: serializeGroupChatForClient(chat, currentAppUserId),
-                                canJoin: !chat.members.includes(currentAppUserId) && chat.meta?.joinByLink !== false
+                                canJoin: (!chat.members.includes(currentAppUserId) || !!buildGroupLeaveState(chat, currentAppUserId)) && chat.meta?.joinByLink !== false
                             });
                         })();
                     }
@@ -2382,6 +2432,7 @@ wss.on('connection', (ws) => {
                                 safeSend(ws, { type: 'messenger-error', code: 'invite_disabled', message: 'Вступление по ссылке отключено' });
                                 return;
                             }
+                            const leftState = buildGroupLeaveState(chat, currentAppUserId);
                             if (!chat.members.includes(currentAppUserId)) {
                                 // Проверяем, был ли пользователь владельцем раньше (при выходе записываем в meta)
                                 const meta = chat.meta || {};
@@ -2402,9 +2453,37 @@ wss.on('connection', (ws) => {
                                     currentAppUserId,
                                     `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} присоединился(ась) по ссылке в чат`
                                 );
-                                if (sys) sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: sys });
+                                if (sys) sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: sys });
+                                await emitGroupChatUpdated(chat, 'group-joined-by-link');
+                            } else if (leftState) {
+                                const meta = chat.meta || {};
+                                const prevOwnerId = meta.previousOwnerId || '';
+                                const restoreRole = prevOwnerId === currentAppUserId
+                                    ? 'owner'
+                                    : (getGroupParticipantStoredRole(chat, currentAppUserId) || 'member');
+                                await messengerMysql.updateGroupMemberSettings(chat.id, currentAppUserId, {
+                                    leftAt: 0,
+                                    leftBySelf: false,
+                                    role: restoreRole
+                                });
+                                if (prevOwnerId === currentAppUserId) {
+                                    delete meta.previousOwnerId;
+                                    try {
+                                        await messengerMysql.updateGroupChatMeta(chat.id, meta);
+                                    } catch (_) {}
+                                }
+                                chat = await messengerMysql.getChatById(chat.id);
+                                const actorFmt = getFormattedUser(currentAppUserId);
+                                const sys = await insertSystemMessage(
+                                    chat,
+                                    currentAppUserId,
+                                    `${makeSystemUserTag(currentAppUserId, actorFmt.displayName)} вернулся(ась) в чат по ссылке`
+                                );
+                                if (sys) sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: sys });
                                 await emitGroupChatUpdated(chat, 'group-joined-by-link');
                             }
+                            chat = await clearChatRemovedFlagForUser(chat, currentAppUserId);
+                            chat = await messengerMysql.getChatById(chat.id);
                             safeSend(ws, { type: 'messenger-group-joined', chat: serializeGroupChatForClient(chat, currentAppUserId) });
                         })();
                     }
@@ -2443,10 +2522,10 @@ wss.on('connection', (ws) => {
                                 roomId
                             });
                             if (block) {
-                                sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: block });
+                                sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: block });
                             }
                             await emitGroupChatUpdated(chat, 'group-call-created');
-                            sendToManyUserSessions(chat.members || [], {
+                            sendToManyUserSessions(listGroupLiveRecipientIds(chat), {
                                 type: 'messenger-group-call-created',
                                 chatId,
                                 roomId,
@@ -2701,9 +2780,9 @@ wss.on('connection', (ws) => {
                             }
                             const msgOut = enrichMessageWithSender(message);
                             sendToUserSessions(currentAppUserId, { type: 'messenger-message', chatId: chat.id, message: msgOut });
-                            sendToManyUserSessions(chat.members || [], { type: 'messenger-message', chatId: chat.id, message: msgOut }, currentAppUserId);
+                            sendToManyUserSessions(listGroupLiveRecipientIds(chat), { type: 'messenger-message', chatId: chat.id, message: msgOut }, currentAppUserId);
                             emitMessengerSync(currentAppUserId, 'new-message');
-                            (chat.members || []).forEach((uid) => {
+                            listGroupLiveRecipientIds(chat).forEach((uid) => {
                                 if (uid !== currentAppUserId) emitMessengerSync(uid, 'new-message');
                             });
                         })();
@@ -2724,7 +2803,8 @@ wss.on('connection', (ws) => {
                                 if (!messengerMysql.isEnabled()) return;
                                 const chat = await messengerMysql.getChatById(chatId);
                                 if (!chat || !Array.isArray(chat.members) || !chat.members.includes(currentAppUserId)) return;
-                                sendToManyUserSessions(chat.members || [], {
+                                if (!canReceiveGroupLiveEvents(chat, currentAppUserId)) return;
+                                sendToManyUserSessions(listGroupLiveRecipientIds(chat), {
                                     type: 'messenger-typing',
                                     fromUserId: currentAppUserId,
                                     chatId,
@@ -2804,7 +2884,7 @@ wss.on('connection', (ws) => {
                             }
                             const payload = { type: 'messenger-message-updated', chatId: row.chatId, message: row };
                             sendToUserSessions(currentAppUserId, payload);
-                            sendToManyUserSessions(chat.members || [], payload, currentAppUserId);
+                            sendToManyUserSessions(chat.kind === 'group' ? listGroupLiveRecipientIds(chat) : (chat.members || []), payload, currentAppUserId);
                         })();
                     }
                     break;
@@ -2829,7 +2909,7 @@ wss.on('connection', (ws) => {
                             }
                             const payload = { type: 'messenger-message-deleted', chatId, messageId };
                             sendToUserSessions(currentAppUserId, payload);
-                            sendToManyUserSessions(chat.members || [], payload, currentAppUserId);
+                            sendToManyUserSessions(chat.kind === 'group' ? listGroupLiveRecipientIds(chat) : (chat.members || []), payload, currentAppUserId);
                         })();
                     }
                     break;
@@ -2859,7 +2939,7 @@ wss.on('connection', (ws) => {
                             await messengerMysql.updateMessageFields(messageId, { reactions });
                             const payload = { type: 'messenger-message-reactions', chatId, messageId, reactions };
                             sendToUserSessions(currentAppUserId, payload);
-                            sendToManyUserSessions(chat.members || [], payload, currentAppUserId);
+                            sendToManyUserSessions(chat.kind === 'group' ? listGroupLiveRecipientIds(chat) : (chat.members || []), payload, currentAppUserId);
                         })();
                     }
                     break;
