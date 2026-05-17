@@ -930,6 +930,13 @@ function exportGamePublic(game, viewerId) {
         neighborTossEligiblePids: getNeighborTossEligiblePids(game)
       }
     : null;
+  const showdownHands =
+    game.phase === 'showdown' || game.phase === 'ended'
+      ? game.players.map((id) => ({
+          id,
+          cards: [...(game.hands.get(id) || [])]
+        }))
+      : [];
   const out = {
     mode: game.mode,
     phase: game.phase,
@@ -958,6 +965,7 @@ function exportGamePublic(game, viewerId) {
     cardPack: game.cardPack || 'classic',
     version: game.version,
     names: { ...(game.playerNames || {}) },
+    showdownHands,
     playSeq: game.playSeq || 0,
     lastPlay: game.lastPlay
       ? {
