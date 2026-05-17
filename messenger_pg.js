@@ -397,13 +397,13 @@ async function getProfileByUsername(username) {
 async function upsertProfile(userId, patch) {
   const now = Date.now();
   const existing = await getProfile(userId);
-  const fallbackUsername = `user${String(userId || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(-8).padStart(8, '0')}`.slice(0, 32);
+  const fallbackUsername = `user${String(userId || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(-8).padStart(8, '0')}`.slice(0, 50);
   const normalizedUsername = String(patch.username != null ? patch.username : existing?.username || '')
     .trim()
     .replace(/^@+/, '')
     .toLowerCase()
     .replace(/[^a-z0-9_]/g, '')
-    .slice(0, 32);
+    .slice(0, 50);
   const finalUsername = normalizedUsername || fallbackUsername;
   const merged = {
     name: patch.name != null ? patch.name : existing?.name || '',
@@ -457,7 +457,7 @@ async function upsertProfile(userId, patch) {
 }
 
 async function isUsernameAvailable(username, excludeUserId = '') {
-  const normalized = String(username || '').trim().replace(/^@+/, '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 32);
+  const normalized = String(username || '').trim().replace(/^@+/, '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 50);
   if (!normalized) return { ok: true, available: true, username: '' };
   const exclude = String(excludeUserId || '').trim();
   const { rows } = await pool.query(
