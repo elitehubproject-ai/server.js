@@ -221,7 +221,7 @@ function normalizeUsername(value) {
         .replace(/^@+/, '')
         .toLowerCase()
         .replace(/[^a-z0-9]/g, '')
-        .slice(0, 32);
+        .slice(0, 50);
 }
 
 function buildGeneratedUsername(accountId) {
@@ -1448,9 +1448,16 @@ async function finalizeGroupCallRoom(room, closedById = '', closedByName = '') {
     try {
         const chat = await messengerMysql.getChatById(chatId);
         if (!chat || chat.kind !== 'group') return;
-        const participantUsers = Array.from(room.participants.values())
+        const actorId = normalizeAccountId(closedById || meta.createdBy || '');
+        const chatMemberIds = Array.isArray(chat.members)
+            ? [...new Set(chat.members.map((item) => normalizeAccountId(item)).filter(Boolean))]
+            : [];
+        const participantIds = [...new Set(Array.from(room.participants.values())
             .map((participant) => normalizeAccountId(participant?.appUserId || ''))
             .filter(Boolean)
+            .filter((uid) => !chatMemberIds.length || chatMemberIds.includes(uid)))];
+        await ensureProfilesLoaded(actorId, ...chatMemberIds, ...participantIds);
+        const participantUsers = participantIds
             .slice(0, 4)
             .map((uid) => {
                 const fmt = getFormattedUser(uid);
@@ -1462,7 +1469,6 @@ async function finalizeGroupCallRoom(room, closedById = '', closedByName = '') {
                 };
             });
         const durationSec = Math.max(0, Math.floor((Date.now() - Number(meta.createdAt || Date.now())) / 1000));
-        const actorId = normalizeAccountId(closedById || meta.createdBy || '');
         const actorName = normalizeText(closedByName || '', 120) || getFormattedUser(actorId).displayName || 'Система';
         const endBlock = await insertGroupEventBlock(chat, actorId, {
             type: 'group-call-ended',
