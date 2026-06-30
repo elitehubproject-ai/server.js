@@ -256,35 +256,32 @@ async function ensureTables() {
 }
 
 async function initMessengerPostgres() {
-  // Поддержка как DATABASE_URL так и Supabase переменных
+  // Поддержка нескольких источников строки подключения
   let conn = env('DATABASE_URL');
   
-  // Если DATABASE_URL не установлен, пробуем собрать из Supabase переменных
+  // Если DATABASE_URL не установлен, пробуем POSTGRES_URL (готовая строка от Supabase)
   if (!conn) {
-    const supabaseUrl = env('NEXT_PUBLIC_SUPABASE_URL') || env('SUPABASE_URL');
-    const supabaseKey = env('SUPABASE_SERVICE_ROLE_KEY') || env('SUPABASE_ANON_KEY') || env('SUPABASE_PUBLISHABLE_KEY');
+    conn = env('POSTGRES_URL');
+    if (conn) {
+      console.log('[messenger_pg] Using POSTGRES_URL from Supabase');
+    }
+  }
+  
+  // Если POSTGRES_URL тоже нет, пробуем собрать из отдельных переменных
+  if (!conn) {
+    const host = env('POSTGRES_HOST');
+    const user = env('POSTGRES_USER');
+    const password = env('POSTGRES_PASSWORD');
+    const database = env('POSTGRES_DATABASE') || 'postgres';
     
-    if (supabaseUrl && supabaseKey) {
-      // Формируем DATABASE_URL из Supabase переменных
-      // Supabase URL обычно: https://xxx.supabase.co
-      // Нужно преобразовать в: postgresql://postgres.xxx:[password]@db.xxx.supabase.co:5432/postgres
-      try {
-        const url = new URL(supabaseUrl);
-        const projectId = url.hostname.replace('.supabase.co', '');
-        const dbHost = `db.${url.hostname}`;
-        const dbUser = `postgres.${projectId}`;
-        const dbPassword = supabaseKey;
-        const dbName = env('POSTGRES_DATABASE') || 'postgres';
-        conn = `postgresql://${dbUser}:${dbPassword}@${dbHost}:5432/${dbName}?sslmode=require`;
-        console.log('[messenger_pg] Built connection from Supabase env vars');
-      } catch (e) {
-        console.error('[messenger_pg] Failed to build connection from Supabase vars:', e.message);
-      }
+    if (host && user && password) {
+      conn = `postgresql://${user}:${password}@${host}:5432/${database}?sslmode=require`;
+      console.log('[messenger_pg] Built connection from POSTGRES_* variables');
     }
   }
   
   if (!conn) {
-    console.warn('[messenger_pg] DATABASE_URL or Supabase variables not set');
+    console.warn('[messenger_pg] DATABASE_URL, POSTGRES_URL or POSTGRES_* variables not set');
     return false;
   }
   try {
