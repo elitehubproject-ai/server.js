@@ -264,6 +264,13 @@ async function initMessengerPostgres() {
     conn = env('POSTGRES_URL');
     if (conn) {
       console.log('[messenger_pg] Using POSTGRES_URL from Supabase');
+      // Добавляем sslmode=no-verify для Supabase (самоподписанный сертификат)
+      if (!conn.includes('sslmode=')) {
+        conn += '&sslmode=no-verify';
+      } else {
+        conn = conn.replace(/sslmode=require/i, 'sslmode=no-verify');
+        conn = conn.replace(/sslmode=verify-full/i, 'sslmode=no-verify');
+      }
     }
   }
   
@@ -275,7 +282,7 @@ async function initMessengerPostgres() {
     const database = env('POSTGRES_DATABASE') || 'postgres';
     
     if (host && user && password) {
-      conn = `postgresql://${user}:${password}@${host}:5432/${database}?sslmode=require`;
+      conn = `postgresql://${user}:${password}@${host}:5432/${database}?sslmode=no-verify`;
       console.log('[messenger_pg] Built connection from POSTGRES_* variables');
     }
   }
