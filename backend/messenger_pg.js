@@ -256,9 +256,35 @@ async function ensureTables() {
 }
 
 async function initMessengerPostgres() {
-  const conn = env('DATABASE_URL');
+  // Поддержка как DATABASE_URL так и Supabase переменных
+  let conn = env('DATABASE_URL');
+  
+  // Если DATABASE_URL не установлен, пробуем собрать из Supabase переменных
   if (!conn) {
-    console.warn('[messenger_pg] DATABASE_URL not set');
+    const supabaseUrl = env('NEXT_PUBLIC_SUPABASE_URL') || env('SUPABASE_URL');
+    const supabaseKey = env('SUPABASE_SERVICE_ROLE_KEY') || env('SUPABASE_ANON_KEY') || env('SUPABASE_PUBLISHABLE_KEY');
+    
+    if (supabaseUrl && supabaseKey) {
+      // Формируем DATABASE_URL из Supabase переменных
+      // Supabase URL обычно: https://xxx.supabase.co
+      // Нужно преобразовать в: postgresql://postgres.xxx:[password]@db.xxx.supabase.co:5432/postgres
+      try {
+        const url = new URL(supabaseUrl);
+        const projectId = url.hostname.replace('.supabase.co', '');
+        const dbHost = `db.${url.hostname}`;
+        const dbUser = `postgres.${projectId}`;
+        const dbPassword = supabaseKey;
+        const dbName = env('POSTGRES_DATABASE') || 'postgres';
+        conn = `postgresql://${dbUser}:${dbPassword}@${dbHost}:5432/${dbName}?sslmode=require`;
+        console.log('[messenger_pg] Built connection from Supabase env vars');
+      } catch (e) {
+        console.error('[messenger_pg] Failed to build connection from Supabase vars:', e.message);
+      }
+    }
+  }
+  
+  if (!conn) {
+    console.warn('[messenger_pg] DATABASE_URL or Supabase variables not set');
     return false;
   }
   try {
@@ -289,8 +315,8 @@ async function initMessengerPostgres() {
     enabled = true;
     console.log('[messenger_pg] connected (PostgreSQL)');
     
-    // Периодически пингуем PostgreSQL, чтобы не разрывало при простое (Render free tier)
-    if (process.env.RENDER && pool) {
+    // Периодически пингуем PostgreSQL, чтобы не разрывало при простое (Render/Vercel free tier)
+    if (process.env.RENDER || process.env.VERCEL) {
       setInterval(() => {
         pool.query('SELECT 1').catch(() => {
           // Игнорируем ошибки пинга — переподключение будет при следующем запросе
