@@ -1,0 +1,39 @@
+{
+    "users": [
+        {
+            "id": "ubfa0efaa051fe1b4",
+            "name": "Мисс Вселенная",
+            "avatar": "https:\/\/seych-call.gt.tc\/backend\/vk_proxy.php?avatar=1&url=https%3A%2F%2Flh3.googleusercontent.com%2Fa%2FACg8ocJMuwETuVldDNJ9-ftKgxm7VCv2dEG8CoFfeuMkc6wpNPYBDg%3Ds96-c",
+            "username": "missvselennaa15@gmail.com",
+            "external_key": "google:115709654603504531443",
+            "active_tab": false,
+            "presence_updated_at": 1778033956,
+            "last_seen": 1778026010
+        }
+    ],
+    "requests": [],
+    "friends": [],
+    "calls": [],
+    "push_subscriptions": {
+        "ubfa0efaa051fe1b4": [
+            {
+                "endpoint": "https:\/\/fcm.googleapis.com\/fcm\/send\/dtQ8sGuCDWU:APA91bGH5O6TpUXCmHtq5xuEkmSg3LsnrYJsaxXI51XEeGj-FnjNkhx0PDrGRdZflkcLuB66WOeBZ4ffD8vYoHRmd-qqdHsrmXHOb6X7yaFjoaIG29O5cVCTUlk6wMiwCNCo-yfXBEPM",
+                "keys": {
+                    "auth": "_h8Qt1MyRbl2lDW1nXL6xA",
+                    "p256dh": "BHObQwZzFCoWBH9VsQS-EHNWK4b-0qdagIWF_t3Knf5D3v3mF0rwRpBeC1EEJZS002AXdZ13kvyIMBnrk2Z5Af8"
+                },
+                "contentEncoding": "",
+                "created_at": 1778026011,
+                "updated_at": 1778026011
+            }
+        ]
+    },
+    "push_vapid": {
+        "public_key": "BFMnUSYEKlyEz-sKljicJyfR-3Viw4Efy7qVADlSs4CZppqpO__7LiLD-cSDw63TpVEf_HX2tl9e0GfW01IFAmc",
+        "private_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8NRGtxAgc0A4S4Et\nNhgwf3SYmVPdLwExRG\/bPkXzPHahRANCAARTJ1EmBCpchM\/rCpY4nCcn0ft1YsOB\nH8u6lQA5UrOAmaaaqTv\/+y4iw\/nEg8Ot06VRH\/x19rZfXtBn1tNSBQJn\n-----END PRIVATE KEY-----\n"
+    },
+    "account_links": {
+        "google:115709654603504531443": "ubfa0efaa051fe1b4",
+        "google_email:missvselennaa15@gmail.com": "ubfa0efaa051fe1b4"
+    }
+}
