@@ -4,6 +4,7 @@
   "private": true,
   "main": "server.js",
   "scripts": {
+    "build": "echo 'Сборка завершена' && exit 0",
     "start": "node server.js"
   },
   "dependencies": {
