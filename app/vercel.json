@@ -1,1 +1,6 @@
-{"cleanUrls": true, "rewrites": [{ "source": "/", "destination": "/app.js" }]} 
+{
+  "cleanUrls": true,
+  "rewrites": [
+    { "source": "/", "destination": "/app.js" }
+  ]
+}
